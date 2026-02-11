@@ -38,13 +38,13 @@ These hold at all times, without exception.
 | **Prod** | The upstream production database. Read-only from Mori's perspective. This is the source of truth for all unmodified data. |
 | **Shadow** | A local database instance (same engine and version as Prod) that holds all local mutations. Starts schema-only with zero rows. Think of it as a transparent overlay on top of Prod. |
 | **Proxy** | The Mori process itself. It intercepts wire protocol traffic between the application and the databases. It classifies queries, routes them, merges results, and manages state. |
-| **Taint Map** | A set of `(table, primary_key)` pairs identifying rows that have been locally modified (inserted into Shadow via hydration + update). When a row is tainted, Shadow holds the authoritative version and Prod's version is ignored for that row. |
+| **Delta Map** | A set of `(table, primary_key)` pairs identifying rows that have been locally modified (inserted into Shadow via hydration + update). When a row is delta, Shadow holds the authoritative version and Prod's version is ignored for that row. |
 | **Tombstone Set** | A set of `(table, primary_key)` pairs identifying rows that have been locally deleted. Tombstoned rows are filtered out of Prod results so the app sees them as deleted. |
 | **Schema Registry** | A record of structural differences between Shadow and Prod schemas, introduced by local DDL. Tracks added columns, dropped columns, renames, and type changes per table. Used to adapt Prod rows to match Shadow's schema during reads. |
 | **Hydration** | The act of copying a row from Prod into Shadow so it can be mutated locally. This happens transparently when the app tries to UPDATE or DELETE a row that only exists in Prod. The row is fetched from Prod, adapted for any schema differences, inserted into Shadow, and then the mutation is applied. |
 | **Classification** | The process of parsing an incoming SQL statement to determine its operation type (READ, WRITE, DDL, TRANSACTION), affected tables, and extractable primary key values. |
-| **Routing** | The decision of where to execute a classified statement — Prod, Shadow, or both — based on the operation type and current taint/tombstone state. |
-| **Merged Read** | A read operation where results from both Prod and Shadow are combined, with tainted/tombstoned rows filtered from Prod results. This occurs when a SELECT touches a table that has local mutations. |
+| **Routing** | The decision of where to execute a classified statement — Prod, Shadow, or both — based on the operation type and current delta/tombstone state. |
+| **Merged Read** | A read operation where results from both Prod and Shadow are combined, with delta/tombstoned rows filtered from Prod results. This occurs when a SELECT touches a table that has local mutations. |
 
 ---
 
@@ -71,10 +71,10 @@ These hold at all times, without exception.
 │  └────────────┘  └────────────┘  │ Shadow Delete     │  │
 │                                   │ Shadow DDL        │  │
 │  ┌────────────┐  ┌────────────┐  │ Transaction Ctrl  │  │
-│  │   Taint    │  │  Schema    │  └───────────────────┘  │
+│  │   Delta    │  │  Schema    │  └───────────────────┘  │
 │  │  Manager   │  │ Registry   │                          │
 │  │            │  │            │  ┌───────────────────┐  │
-│  │ taint_map  │  │ added_cols │  │   Merge Engine    │  │
+│  │ delta_map  │  │ added_cols │  │   Merge Engine    │  │
 │  │ tombstones │  │ dropped    │  │                   │  │
 │  │ staging    │  │ renamed    │  │ single_table      │  │
 │  └────────────┘  │ type_casts │  │ join_patch        │  │
@@ -115,29 +115,29 @@ Takes a parsed query and determines:
 The classifier does lightweight syntactic analysis — it parses the query structure but does not plan or optimize. It needs to be fast, as it sits in the hot path of every query.
 
 **Router**
-Takes the classifier output + current taint/tombstone state and selects an execution strategy. This is the core decision point — it determines whether a query goes to Prod, Shadow, or triggers a merge operation. The routing table is defined in §5.3.
+Takes the classifier output + current delta/tombstone state and selects an execution strategy. This is the core decision point — it determines whether a query goes to Prod, Shadow, or triggers a merge operation. The routing table is defined in §5.3.
 
-**Taint Manager**
+**Delta Manager**
 Maintains two data structures:
-- **Taint Map**: `(table, pk) → tainted` — rows with local modifications in Shadow
+- **Delta Map**: `(table, pk) → delta` — rows with local modifications in Shadow
 - **Tombstone Set**: `(table, pk) → deleted` — rows locally deleted
 
-Both support **transaction staging**: within a transaction, additions are staged. On COMMIT, staged entries promote to persistent state. On ROLLBACK, they're discarded. This prevents phantom taints from failed transactions.
+Both support **transaction staging**: within a transaction, additions are staged. On COMMIT, staged entries promote to persistent state. On ROLLBACK, they're discarded. This prevents phantom deltas from failed transactions.
 
 **Schema Registry**
 Tracks per-table schema divergence between Shadow and Prod. When the app runs DDL (ALTER TABLE, CREATE TABLE, etc.) on Shadow, the registry records what changed. This metadata is used to adapt Prod rows during reads (inject NULLs for new columns, strip dropped columns, rename, cast types) and during hydration.
 
 **Transaction Manager**
-Manages per-connection transaction state. Coordinates transactions across Prod (read-only) and Shadow (read-write). Ensures taint/tombstone staging semantics (promote on commit, discard on rollback). Enforces isolation on Prod reads within a transaction.
+Manages per-connection transaction state. Coordinates transactions across Prod (read-only) and Shadow (read-write). Ensures delta/tombstone staging semantics (promote on commit, discard on rollback). Enforces isolation on Prod reads within a transaction.
 
 **Engine Manager**
 Manages connection pools to both Prod and Shadow. Each application connection to Mori gets one dedicated Prod connection (read-only) and one dedicated Shadow connection (read-write). Handles connection lifecycle, health checks, and reconnection.
 
 **Merge Engine**
-Implements the logic for combining Prod and Shadow results during reads. Handles single-table merged reads, JOIN patching, over-fetching for LIMIT queries, row filtering (taint/tombstone), and schema adaptation. This is where the core complexity lives.
+Implements the logic for combining Prod and Shadow results during reads. Handles single-table merged reads, JOIN patching, over-fetching for LIMIT queries, row filtering (delta/tombstone), and schema adaptation. This is where the core complexity lives.
 
 **Write Engine**
-Implements mutation paths: INSERT (Shadow-only), UPDATE (hydrate from Prod if needed, then Shadow), DELETE (Shadow + tombstone). Coordinates with Taint Manager to update state on every mutation.
+Implements mutation paths: INSERT (Shadow-only), UPDATE (hydrate from Prod if needed, then Shadow), DELETE (Shadow + tombstone). Coordinates with Delta Manager to update state on every mutation.
 
 ---
 
@@ -145,13 +145,13 @@ Implements mutation paths: INSERT (Shadow-only), UPDATE (hydrate from Prod if ne
 
 ### 5.1 The Happy Path (No Local Mutations)
 
-When Shadow has zero rows and no taint/tombstone entries, Mori is a pure pass-through proxy:
+When Shadow has zero rows and no delta/tombstone entries, Mori is a pure pass-through proxy:
 
 ```
 App → Query → Proxy → Prod → Result → App
 ```
 
-Every query goes to Prod, results come back unmodified. The overhead is the Proxy hop — parsing the wire protocol message, classifying the query (fast, no taint state to check), and forwarding. This baseline overhead should be minimal.
+Every query goes to Prod, results come back unmodified. The overhead is the Proxy hop — parsing the wire protocol message, classifying the query (fast, no delta state to check), and forwarding. This baseline overhead should be minimal.
 
 ### 5.2 Classification
 
@@ -187,17 +187,17 @@ For parameterized queries (where real values are bound separately from the SQL t
 
 | Operation | Condition | Strategy |
 |-----------|-----------|----------|
-| `SELECT` (single table) | Table has no taints/tombstones | **Prod Direct** — forward to Prod, return result |
-| `SELECT` (single table) | Table has taints or tombstones | **Merged Read** — query both, filter, adapt, merge |
-| `SELECT` (JOIN) | No table has taints/tombstones | **Prod Direct** — forward to Prod, return result |
-| `SELECT` (JOIN) | Any table has taints/tombstones | **Join Patch** — execute on Prod, patch from Shadow |
+| `SELECT` (single table) | Table has no deltas/tombstones | **Prod Direct** — forward to Prod, return result |
+| `SELECT` (single table) | Table has deltas or tombstones | **Merged Read** — query both, filter, adapt, merge |
+| `SELECT` (JOIN) | No table has deltas/tombstones | **Prod Direct** — forward to Prod, return result |
+| `SELECT` (JOIN) | Any table has deltas/tombstones | **Join Patch** — execute on Prod, patch from Shadow |
 | `INSERT` | — | **Shadow Write** — execute on Shadow only |
 | `UPDATE` | — | **Hydrate + Shadow Write** — hydrate if needed, update Shadow |
 | `DELETE` | — | **Shadow Delete** — delete from Shadow, add tombstone |
 | `DDL` | — | **Shadow DDL** — execute on Shadow, update Schema Registry |
 | `BEGIN` | — | Open transactions on both Prod and Shadow |
-| `COMMIT` | — | Commit Shadow, close Prod, promote staged taints/tombstones |
-| `ROLLBACK` | — | Rollback Shadow, close Prod, discard staged taints/tombstones |
+| `COMMIT` | — | Commit Shadow, close Prod, promote staged deltas/tombstones |
+| `ROLLBACK` | — | Rollback Shadow, close Prod, discard staged deltas/tombstones |
 
 ---
 
@@ -209,7 +209,7 @@ The simplest case. The query touches only tables with no local mutations.
 
 ```
 App → SELECT * FROM orders WHERE total > 100 → Proxy
-Proxy: classify → READ, tables=[orders], orders not tainted
+Proxy: classify → READ, tables=[orders], orders not delta
 Proxy → forward query to Prod
 Prod → result set → Proxy → App
 ```
@@ -218,10 +218,10 @@ Zero overhead beyond the proxy hop. No merging, no filtering.
 
 ### 6.2 Merged Read (Single Table)
 
-When a SELECT touches a table that has entries in the Taint Map or Tombstone Set, the Proxy must merge results from both databases.
+When a SELECT touches a table that has entries in the Delta Map or Tombstone Set, the Proxy must merge results from both databases.
 
 **Example:** `SELECT * FROM users WHERE active = true ORDER BY created_at LIMIT 20`
-**Context:** `users` has 3 tainted rows and 1 tombstoned row.
+**Context:** `users` has 3 delta rows and 1 tombstoned row.
 
 **Step 1: Shadow Query.**
 Execute the original query against Shadow verbatim. Shadow contains only locally-created or hydrated rows, so this returns the local subset that matches the query.
@@ -233,19 +233,19 @@ SELECT * FROM users WHERE active = true ORDER BY created_at LIMIT 20
 ```
 
 **Step 2: Prod Query (with over-fetching).**
-Execute the query against Prod, but adjust the LIMIT to account for rows that will be filtered out. Over-fetch by `LIMIT + |taints_for_table| + |tombstones_for_table|`.
+Execute the query against Prod, but adjust the LIMIT to account for rows that will be filtered out. Over-fetch by `LIMIT + |deltas_for_table| + |tombstones_for_table|`.
 
 ```sql
 -- Against Prod (over-fetched):
 SELECT * FROM users WHERE active = true ORDER BY created_at LIMIT 24
--- (20 + 3 taints + 1 tombstone = 24)
+-- (20 + 3 deltas + 1 tombstone = 24)
 ```
 
 If the table has schema divergence (tracked in Schema Registry), sanitize the query first: remove WHERE predicates referencing Shadow-only columns, strip references to dropped columns.
 
 **Step 3: Filter Prod Results.**
 For each row returned from Prod:
-- If `(users, row.pk)` exists in Taint Map → **discard**. Shadow has the authoritative version.
+- If `(users, row.pk)` exists in Delta Map → **discard**. Shadow has the authoritative version.
 - If `(users, row.pk)` exists in Tombstone Set → **discard**. Row is locally deleted.
 
 **Step 4: Adapt Prod Results.**
@@ -262,9 +262,9 @@ Sort the merged set by the original `ORDER BY`. Apply `LIMIT`/`OFFSET` to the me
 
 #### Over-Fetching Detail
 
-Because Prod results are post-filtered (tainted and tombstoned rows removed), a `LIMIT N` on the Prod query may yield fewer than N usable rows. The over-fetching strategy:
+Because Prod results are post-filtered (delta and tombstoned rows removed), a `LIMIT N` on the Prod query may yield fewer than N usable rows. The over-fetching strategy:
 
-1. First attempt: `LIMIT N + |taints| + |tombstones|`
+1. First attempt: `LIMIT N + |deltas| + |tombstones|`
 2. If after filtering the result set is still short, issue a follow-up query with OFFSET
 3. Cap at **3 iterations** to bound latency
 
@@ -288,21 +288,21 @@ LIMIT 50
 Where `users` has local mutations, `orders` is clean.
 
 **Step 1: Execute on Prod.**
-Run the query as-is against Prod. This produces result set `R_prod` — correct for all non-tainted rows.
+Run the query as-is against Prod. This produces result set `R_prod` — correct for all non-delta rows.
 
 **Step 2: Identify affected rows.**
-Scan every row in `R_prod`. For each row, check if any primary key from a tainted table appears in the Taint Map or Tombstone Set. Partition into:
-- **Clean rows**: no referenced PKs are tainted or tombstoned → keep as-is
-- **Tainted rows**: at least one referenced PK is in the Taint Map → needs patching
+Scan every row in `R_prod`. For each row, check if any primary key from a delta table appears in the Delta Map or Tombstone Set. Partition into:
+- **Clean rows**: no referenced PKs are delta or tombstoned → keep as-is
+- **Delta rows**: at least one referenced PK is in the Delta Map → needs patching
 - **Dead rows**: at least one referenced PK is in the Tombstone Set → discard
 
 **Step 3: Discard tombstoned rows.**
 Remove any row from `R_prod` where a referenced PK is tombstoned.
 
-**Step 4: Patch tainted rows.**
-For each row referencing a tainted PK:
-1. Fetch the Shadow version of the tainted row(s)
-2. Replace the tainted columns in the joined result with Shadow's values
+**Step 4: Patch delta rows.**
+For each row referencing a delta PK:
+1. Fetch the Shadow version of the delta row(s)
+2. Replace the delta columns in the joined result with Shadow's values
 3. Re-evaluate whether the row still matches the original WHERE clause (e.g., if `u.active` was changed to `false` in Shadow, this row should be dropped)
 
 **Step 5: Execute on Shadow.**
@@ -317,10 +317,10 @@ Combine patched `R_prod` + `R_shadow`. Deduplicate by the composite key of the r
 
 #### Edge Cases
 
-- **All tables tainted**: Both Prod and Shadow execution contribute. The merge handles deduplication.
+- **All tables delta**: Both Prod and Shadow execution contribute. The merge handles deduplication.
 - **All tables clean**: Router detects this and uses Prod Direct. No merge needed.
-- **Self-joins**: Treated as a single-table merged read if the table is tainted.
-- **Subqueries**: Classified by their outermost operation. If the subquery references a tainted table, the entire query goes through the JOIN patch path.
+- **Self-joins**: Treated as a single-table merged read if the table is delta.
+- **Subqueries**: Classified by their outermost operation. If the subquery references a delta table, the entire query goes through the JOIN patch path.
 
 ---
 
@@ -336,9 +336,9 @@ INSERT INTO users (name, email) VALUES ('alice', 'alice@example.com')
 2. Shadow's offset sequence assigns a PK in the local range (e.g., `10,000,001`). The sequence offset guarantees locally-created PKs never collide with Prod PKs.
 3. Return the result (including generated PK) to the application.
 
-No Taint Map entry is needed for pure inserts — the row exists only in Shadow. The Router can identify locally-created rows by PK range: **any PK above the offset threshold was created locally and lives exclusively in Shadow.**
+No Delta Map entry is needed for pure inserts — the row exists only in Shadow. The Router can identify locally-created rows by PK range: **any PK above the offset threshold was created locally and lives exclusively in Shadow.**
 
-For non-integer PKs (UUIDs), Shadow generates the value locally. UUID v4 values are statistically guaranteed to never collide with Prod values. The Router cannot use range-based detection for UUIDs, so it checks the Taint Map for all lookups on UUID-keyed tables. (Since pure inserts don't add to the Taint Map, lookups for locally-inserted UUID rows check Shadow directly when the UUID is not found in Prod.)
+For non-integer PKs (UUIDs), Shadow generates the value locally. UUID v4 values are statistically guaranteed to never collide with Prod values. The Router cannot use range-based detection for UUIDs, so it checks the Delta Map for all lookups on UUID-keyed tables. (Since pure inserts don't add to the Delta Map, lookups for locally-inserted UUID rows check Shadow directly when the UUID is not found in Prod.)
 
 ### 7.2 UPDATE
 
@@ -355,7 +355,7 @@ UPDATE users SET email = 'new@example.com' WHERE id = 42
      b. Adapt the row for schema differences (inject NULLs for new columns, strip dropped columns, apply renames/casts per Schema Registry)
      c. Insert the adapted row into Shadow
 2. Apply the UPDATE to the row in Shadow.
-3. Add `(users, 42)` to the Taint Map (now Prod's version of this row is stale; Shadow is authoritative).
+3. Add `(users, 42)` to the Delta Map (now Prod's version of this row is stale; Shadow is authoritative).
 4. Return result to the application.
 
 **Bulk Update (no PK in WHERE, potentially many rows):**
@@ -367,7 +367,7 @@ UPDATE users SET active = false WHERE last_login < '2020-01-01'
 1. **Identify affected rows.** Run `SELECT pk_column FROM users WHERE last_login < '2020-01-01'` against **both** Prod and Shadow. Union the results (some rows may exist in both if previously hydrated).
 2. **Hydrate missing rows.** For each affected Prod row not already in Shadow: fetch, adapt, insert into Shadow.
 3. **Apply the UPDATE** on Shadow: `UPDATE users SET active = false WHERE last_login < '2020-01-01'`
-4. **Add all affected PKs** to the Taint Map.
+4. **Add all affected PKs** to the Delta Map.
 
 Bulk updates are expensive for large result sets — every affected Prod row must be hydrated. This is an acceptable cost for a development tool. Prod is never mutated regardless.
 
@@ -444,24 +444,24 @@ The app sees the row as if it came from Shadow's schema.
 Mori maintains per-connection transaction state. When the app opens a transaction, Mori coordinates across both Prod and Shadow:
 
 - **`BEGIN`**: Open a read-only transaction on Prod (with REPEATABLE READ isolation or equivalent) and a read-write transaction on Shadow. This ensures all Prod reads within the transaction see a consistent snapshot.
-- **`COMMIT`**: Commit the Shadow transaction. Close/release the Prod transaction (it was read-only, nothing to commit). Promote all staged Taint Map and Tombstone Set entries to persistent state.
-- **`ROLLBACK`**: Rollback the Shadow transaction (undoing all local mutations within this transaction). Close/release the Prod transaction. **Discard** all staged Taint Map and Tombstone Set entries — the mutations never happened, so the taints should not persist.
+- **`COMMIT`**: Commit the Shadow transaction. Close/release the Prod transaction (it was read-only, nothing to commit). Promote all staged Delta Map and Tombstone Set entries to persistent state.
+- **`ROLLBACK`**: Rollback the Shadow transaction (undoing all local mutations within this transaction). Close/release the Prod transaction. **Discard** all staged Delta Map and Tombstone Set entries — the mutations never happened, so the deltas should not persist.
 
-### 9.2 Staged Taint Tracking
+### 9.2 Staged Delta Tracking
 
-Within a transaction, Taint Map and Tombstone Set modifications are **staged** — held in a per-transaction buffer rather than applied to the persistent state immediately. This is critical for correctness:
+Within a transaction, Delta Map and Tombstone Set modifications are **staged** — held in a per-transaction buffer rather than applied to the persistent state immediately. This is critical for correctness:
 
 ```
 BEGIN;
-UPDATE users SET name = 'Bob' WHERE id = 42;   -- stages taint for (users, 42)
+UPDATE users SET name = 'Bob' WHERE id = 42;   -- stages delta for (users, 42)
 -- application encounters an error --
 ROLLBACK;
--- staged taint for (users, 42) is discarded
--- persistent taint map is unchanged
+-- staged delta for (users, 42) is discarded
+-- persistent delta map is unchanged
 -- Shadow row for users.42 is rolled back to its pre-transaction state
 ```
 
-Without staging, a ROLLBACK would leave phantom taints — the Taint Map would reference `(users, 42)` but Shadow would not have the modified row (because the transaction was rolled back). This would cause the row to be invisible: filtered from Prod reads (because it's tainted) but absent from Shadow reads (because the mutation was rolled back).
+Without staging, a ROLLBACK would leave phantom deltas — the Delta Map would reference `(users, 42)` but Shadow would not have the modified row (because the transaction was rolled back). This would cause the row to be invisible: filtered from Prod reads (because it's delta) but absent from Shadow reads (because the mutation was rolled back).
 
 ### 9.3 Isolation
 
@@ -471,7 +471,7 @@ The Prod connection within a transaction uses **REPEATABLE READ** isolation at m
 
 Many applications and ORMs operate in autocommit mode, where each statement is an implicit single-statement transaction. In this mode:
 - Each statement executes atomically
-- Taint/tombstone updates are applied immediately (no staging needed — a single-statement transaction either succeeds fully or fails fully)
+- Delta/tombstone updates are applied immediately (no staging needed — a single-statement transaction either succeeds fully or fails fully)
 - No explicit BEGIN/COMMIT/ROLLBACK needed
 
 ---
@@ -491,13 +491,13 @@ mori init --from <prod_connection_string> [--image <docker_image>]
 5. **Install extensions on Shadow.** For each extension detected in step 3, attempt to install it on Shadow. If any installation fails, abort with a clear message: "Prod uses extension `<name>` but it's not available in the Shadow image. Re-run with `--image <image_that_has_it>`."
 6. **Apply schema to Shadow.** With modifications:
    - **Strip foreign key constraints.** Shadow doesn't have Prod's data, so FK references would fail on INSERT/hydration. FKs are unnecessary — the app's own code enforces referential integrity at the application level.
-   - **Preserve primary keys and unique constraints.** Needed for taint map lookups and conflict detection.
+   - **Preserve primary keys and unique constraints.** Needed for delta map lookups and conflict detection.
    - **Preserve indexes.** Local query performance matters.
 7. **Offset sequences.** For each table with an auto-increment/serial PK:
    - Query Prod for the current max value of the PK column
    - Set Shadow's sequence to start at `max(prod_max * 10, prod_max + 10_000_000)`
    - This guarantees locally-created PKs never collide with Prod PKs for the duration of a session
-8. **Initialize state.** Create empty Taint Map, Tombstone Set, and Schema Registry.
+8. **Initialize state.** Create empty Delta Map, Tombstone Set, and Schema Registry.
 9. **Write config.** Create `.mori/` directory with connection metadata, sequence offsets, and state files.
 
 ### 10.2 Start
@@ -510,7 +510,7 @@ mori start [--port <port>]
 2. Start the Proxy, listening on `localhost:<port>`.
 3. Establish a read-only connection pool to Prod.
 4. Establish a read-write connection pool to Shadow.
-5. Load Taint Map, Tombstone Set, and Schema Registry from disk into memory.
+5. Load Delta Map, Tombstone Set, and Schema Registry from disk into memory.
 6. Begin accepting application connections.
 
 ### 10.3 Stop
@@ -520,7 +520,7 @@ mori stop
 ```
 
 1. Drain active connections (wait for in-flight queries to complete).
-2. Persist Taint Map, Tombstone Set, and Schema Registry to disk.
+2. Persist Delta Map, Tombstone Set, and Schema Registry to disk.
 3. Stop the Proxy.
 4. Optionally stop the Shadow instance.
 
@@ -533,7 +533,7 @@ mori reset
 1. Truncate all tables in Shadow (delete all local data).
 2. Re-apply schema from Prod (in case Prod schema has changed since init).
 3. Re-offset sequences.
-4. Clear Taint Map, Tombstone Set, and Schema Registry.
+4. Clear Delta Map, Tombstone Set, and Schema Registry.
 
 Result: a clean-slate view of production, as if starting fresh.
 
@@ -541,23 +541,23 @@ Result: a clean-slate view of production, as if starting fresh.
 
 ## 11. Primary Key Model
 
-Mori's taint and routing system depends on being able to identify rows by primary key. Different PK types require different handling:
+Mori's delta and routing system depends on being able to identify rows by primary key. Different PK types require different handling:
 
 ### 11.1 Integer Sequences (serial, bigserial, auto-increment)
 
-The most common case. Sequence offsets guarantee no PK collision between Prod and Shadow. The Router can use **range-based fast-path routing**: any PK value above the offset threshold was created locally and lives exclusively in Shadow. No Taint Map lookup needed for locally-created rows.
+The most common case. Sequence offsets guarantee no PK collision between Prod and Shadow. The Router can use **range-based fast-path routing**: any PK value above the offset threshold was created locally and lives exclusively in Shadow. No Delta Map lookup needed for locally-created rows.
 
 ### 11.2 UUIDs
 
-UUID v4 values are statistically guaranteed unique. Shadow generates UUIDs locally with no collision risk. However, the Router cannot use range-based routing — there's no "local range" for UUIDs. All PK lookups on UUID-keyed tables check the Taint Map. For locally-inserted UUID rows (not in Taint Map because INSERTs don't taint), the Router checks Shadow when the row is not found in Prod.
+UUID v4 values are statistically guaranteed unique. Shadow generates UUIDs locally with no collision risk. However, the Router cannot use range-based routing — there's no "local range" for UUIDs. All PK lookups on UUID-keyed tables check the Delta Map. For locally-inserted UUID rows (not in Delta Map because INSERTs don't delta), the Router checks Shadow when the row is not found in Prod.
 
 ### 11.3 Composite Primary Keys
 
-Tables with multi-column primary keys (e.g., `(user_id, role_id)`). The Taint Map serializes composite keys as tuples. All operations work the same — just with a compound key instead of a scalar.
+Tables with multi-column primary keys (e.g., `(user_id, role_id)`). The Delta Map serializes composite keys as tuples. All operations work the same — just with a compound key instead of a scalar.
 
 ### 11.4 Tables Without Primary Keys
 
-These cannot be reliably tracked in the Taint Map (no unique row identifier). For v1, tables without PKs are treated as **Prod-only / read-only**. Writes to PK-less tables emit a warning. This is an acceptable limitation — PK-less tables are uncommon in well-designed schemas.
+These cannot be reliably tracked in the Delta Map (no unique row identifier). For v1, tables without PKs are treated as **Prod-only / read-only**. Writes to PK-less tables emit a warning. This is an acceptable limitation — PK-less tables are uncommon in well-designed schemas.
 
 ---
 
@@ -599,7 +599,7 @@ These cannot be reliably tracked in the Taint Map (no unique row identifier). Fo
 
 **Decision:** Classify at template parse time (tables, operation type); resolve PK values at parameter bind time.
 
-**Rationale:** Database wire protocols separate the SQL template from parameter values. Most routing decisions depend only on tables and operation type (known at parse time). PK-specific routing (taint map lookups for point queries) needs the actual values, available at bind time.
+**Rationale:** Database wire protocols separate the SQL template from parameter values. Most routing decisions depend only on tables and operation type (known at parse time). PK-specific routing (delta map lookups for point queries) needs the actual values, available at bind time.
 
 **Tradeoff:** Increases the complexity of the classification pipeline — state must be carried across protocol messages. But this is necessary for correctness with real-world applications (virtually all of which use parameterized queries).
 
@@ -633,13 +633,13 @@ These cannot be reliably tracked in the Taint Map (no unique row identifier). Fo
 | **Prod data drift** | Long sessions see evolving Prod data | Acceptable for dev tool — document clearly |
 | **Tables without PKs** | Read-only, writes produce warning | Rare in practice — document |
 | **Bulk operations on large tables** | Hydrating thousands of rows for a bulk UPDATE is slow | Acceptable for dev tool — Prod is never at risk |
-| **Complex analytical queries across many tainted tables** | JOIN patching may be slow or produce subtle ordering differences | Primary use case is CRUD apps, not analytics |
+| **Complex analytical queries across many delta tables** | JOIN patching may be slow or produce subtle ordering differences | Primary use case is CRUD apps, not analytics |
 
 ### Things That Could Go Wrong
 
 1. **PK collision due to insufficient offset.** If Prod's insertion rate exceeds the offset gap during a session, locally-created PKs could collide with new Prod PKs. The sequence offset formula (`prod_max * 10` or `+ 10M`) makes this unlikely, but extremely high-volume tables in long sessions could hit it. Mitigation: monitor and warn if Prod max approaches the offset.
 
-2. **Large taint maps degrading read performance.** If a session accumulates thousands of taints, every merged read must filter thousands of PKs. Mitigation: use efficient data structures (hash sets). The performance hit is per-merged-read, not per-query (clean tables still go through Prod Direct).
+2. **Large delta maps degrading read performance.** If a session accumulates thousands of deltas, every merged read must filter thousands of PKs. Mitigation: use efficient data structures (hash sets). The performance hit is per-merged-read, not per-query (clean tables still go through Prod Direct).
 
 3. **Schema drift between Prod and Shadow becoming complex.** Multiple rounds of ALTER TABLE could create deep divergence that the Schema Registry struggles to adapt correctly (e.g., a column renamed twice, or a type changed multiple ways). Mitigation: `mori reset --hard` re-syncs from Prod, clearing all drift.
 

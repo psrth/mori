@@ -14,28 +14,28 @@ The first release. A fully functional copy-on-write proxy for PostgreSQL. A deve
 | `mori start [--port <port>] [--verbose]` | Start Proxy + Shadow, listen for app connections. `--verbose` logs all queries and routing |
 | `mori stop [--keep-shadow]` | Graceful shutdown, persist state. `--keep-shadow` leaves Shadow container running |
 | `mori reset [--hard]` | Wipe all local state. `--hard` re-syncs schema from Prod |
-| `mori status` | Display tainted rows, tombstones, schema diffs, sequence offsets |
+| `mori status` | Display delta rows, tombstones, schema diffs, sequence offsets |
 | `mori log [--tail <n>]` | Stream or dump proxy activity — queries, routing decisions, hydrations |
-| `mori inspect <table>` | Detailed state for a table: taints, tombstones, schema diffs, sequence offset |
+| `mori inspect <table>` | Detailed state for a table: deltas, tombstones, schema diffs, sequence offset |
 
 ### Proxy
 
 - **Wire protocol**: Full PostgreSQL v3 wire protocol support (simple query + extended query / prepared statements)
 - **Authentication**: Pass-through to Prod credentials, or local auth for the Mori → app connection
 - **Classification**: Parse all incoming SQL to determine operation type, affected tables, extractable PKs
-- **Routing**: Route queries to Prod, Shadow, or both based on operation type and taint state
+- **Routing**: Route queries to Prod, Shadow, or both based on operation type and delta state
 
 ### Read Path
 
-- **Prod Direct**: Untainted single-table SELECTs and JOINs pass through to Prod
-- **Merged Read (single table)**: Query both Prod and Shadow, filter tainted/tombstoned rows from Prod, adapt for schema diffs, merge, re-apply ORDER BY/LIMIT
-- **Merged Read (JOIN)**: Execute on Prod, patch tainted rows from Shadow, execute on Shadow to catch local inserts, merge + dedup
+- **Prod Direct**: Non-delta single-table SELECTs and JOINs pass through to Prod
+- **Merged Read (single table)**: Query both Prod and Shadow, filter delta/tombstoned rows from Prod, adapt for schema diffs, merge, re-apply ORDER BY/LIMIT
+- **Merged Read (JOIN)**: Execute on Prod, patch delta rows from Shadow, execute on Shadow to catch local inserts, merge + dedup
 - **Over-fetching**: For LIMIT queries, over-fetch from Prod to account for filtered rows (cap at 3 iterations)
 
 ### Write Path
 
 - **INSERT**: Shadow only. Offset sequences prevent PK collision with Prod
-- **UPDATE**: Hydrate from Prod if row not in Shadow, apply update on Shadow, add to Taint Map
+- **UPDATE**: Hydrate from Prod if row not in Shadow, apply update on Shadow, add to Delta Map
 - **DELETE**: Delete from Shadow if present, add to Tombstone Set
 - **Bulk operations**: Identify affected rows via SELECT on both DBs, hydrate all, apply mutation on Shadow
 
@@ -48,12 +48,12 @@ The first release. A fully functional copy-on-write proxy for PostgreSQL. A deve
 ### Transactions
 
 - **Coordinated transactions**: BEGIN opens on both Prod (REPEATABLE READ) and Shadow
-- **Staged taints**: Taint/tombstone additions staged within transaction, promoted on COMMIT, discarded on ROLLBACK
+- **Staged deltas**: Delta/tombstone additions staged within transaction, promoted on COMMIT, discarded on ROLLBACK
 - **Autocommit support**: Implicit single-statement transactions work without explicit BEGIN/COMMIT
 
 ### State Management
 
-- **Taint Map**: `(table, pk)` pairs for locally-modified rows, persistent across sessions
+- **Delta Map**: `(table, pk)` pairs for locally-modified rows, persistent across sessions
 - **Tombstone Set**: `(table, pk)` pairs for locally-deleted rows, persistent across sessions
 - **Schema Registry**: Per-table schema diffs, persistent across sessions
 - **Config**: Connection metadata, sequence offsets, engine version
@@ -62,8 +62,8 @@ The first release. A fully functional copy-on-write proxy for PostgreSQL. A deve
 ### Primary Key Support
 
 - **Serial / bigserial**: Sequence offset + range-based fast-path routing
-- **UUID**: Local generation, no collision by nature, taint map lookup for routing
-- **Composite PKs**: Serialized as tuple for taint map
+- **UUID**: Local generation, no collision by nature, delta map lookup for routing
+- **Composite PKs**: Serialized as tuple for delta map
 - **No PK**: Table treated as read-only with warning
 
 ### Decisions Baked Into v1
@@ -104,13 +104,13 @@ Explicitly pull rows from Prod into Shadow. Useful when a developer knows they'l
 
 - `mori hydrate users` — pull all users into Shadow
 - `mori hydrate users --where "active = true"` — pull a subset
-- Adds hydrated rows to the Taint Map so they're served from Shadow going forward
+- Adds hydrated rows to the Delta Map so they're served from Shadow going forward
 
 ### Improved Logging and Diagnostics
 
 - **Query timing**: Log how long each query took, broken down by Prod/Shadow/merge time
-- **Taint map diff**: `mori diff` shows what's changed since last reset
-- **Warning aggregation**: Collect and summarize warnings (e.g., "17 JOIN queries hit tainted tables in this session") rather than warning on each query
+- **Delta map diff**: `mori diff` shows what's changed since last reset
+- **Warning aggregation**: Collect and summarize warnings (e.g., "17 JOIN queries hit delta tables in this session") rather than warning on each query
 
 ### Better Error Messages
 
@@ -130,7 +130,7 @@ Major feature additions that expand Mori from a single-developer CLI tool into a
 
 ### Snapshots
 
-Save and restore complete Shadow state (data + taint map + tombstone set + schema registry).
+Save and restore complete Shadow state (data + delta map + tombstone set + schema registry).
 
 ```
 mori snapshot save <name>        # persist current state as named snapshot
@@ -222,11 +222,11 @@ The architecture (Protocol Handler → Classifier → Router → Merge/Write Eng
 3. **Shadow Management**: Engine-specific container setup, schema dump/restore, sequence handling
 4. **Adapter**: Engine-specific schema adaptation, row serialization, PK extraction
 
-The core routing logic (taint map, tombstone set, merge strategy) is engine-agnostic and shared.
+The core routing logic (delta map, tombstone set, merge strategy) is engine-agnostic and shared.
 
 **Planned engine order:**
-1. **Redis** — RESP protocol, key-based taint tracking, simpler than SQL (no JOINs, no schema)
+1. **Redis** — RESP protocol, key-based delta tracking, simpler than SQL (no JOINs, no schema)
 2. **MySQL** — Very similar to Postgres. MySQL wire protocol, SQL classifier reuse, different schema dump mechanism
-3. **MongoDB** — BSON wire protocol, document-based taint tracking, no schema (schemaless complicates the Schema Registry — may not need one)
+3. **MongoDB** — BSON wire protocol, document-based delta tracking, no schema (schemaless complicates the Schema Registry — may not need one)
 
-Each engine is a self-contained adapter package. The core Mori protocol (taint, tombstone, routing) applies to all.
+Each engine is a self-contained adapter package. The core Mori protocol (delta, tombstone, routing) applies to all.
