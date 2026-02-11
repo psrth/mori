@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/mori-dev/mori/internal/engine/postgres"
 	"github.com/spf13/cobra"
 )
 
@@ -28,11 +31,36 @@ func runInit(cmd *cobra.Command, args []string) error {
 	from, _ := cmd.Flags().GetString("from")
 	image, _ := cmd.Flags().GetString("image")
 
-	fmt.Printf("Initializing Mori project...\n")
-	fmt.Printf("  Prod: %s\n", from)
-	if image != "" {
-		fmt.Printf("  Image: %s\n", image)
+	projectRoot, err := config.FindProjectRoot()
+	if err != nil {
+		return fmt.Errorf("failed to determine project root: %w", err)
 	}
-	fmt.Println("\n[stub] Init not yet implemented.")
+
+	if config.IsInitialized(projectRoot) {
+		return fmt.Errorf("mori is already initialized in %s — run 'mori reset --hard' to re-initialize", projectRoot)
+	}
+
+	result, err := postgres.Init(cmd.Context(), postgres.InitOptions{
+		ProdConnStr:   from,
+		ImageOverride: image,
+		ProjectRoot:   projectRoot,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Println()
+	fmt.Println("Mori initialized successfully!")
+	fmt.Printf("  Engine:     PostgreSQL %s\n", result.Config.EngineVersion)
+	fmt.Printf("  Shadow:     localhost:%d (container: %s)\n", result.Container.HostPort, result.Container.ContainerName)
+	fmt.Printf("  Image:      %s\n", result.Config.ShadowImage)
+	fmt.Printf("  Tables:     %d\n", len(result.Dump.Tables))
+	fmt.Printf("  Sequences:  %d offset\n", len(result.Dump.Sequences))
+	if len(result.Config.Extensions) > 0 {
+		fmt.Printf("  Extensions: %s\n", strings.Join(result.Config.Extensions, ", "))
+	}
+	fmt.Println()
+	fmt.Println("Next: run 'mori start' to begin proxying.")
+
 	return nil
 }
