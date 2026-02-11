@@ -13,15 +13,15 @@
 | `pganalyze/pg_query_go/v5` | SQL parser | Wraps PostgreSQL's actual parser. Produces a full AST. Battle-tested. |
 | `docker/docker/client` | Docker SDK | Shadow container lifecycle (create, start, stop, remove) |
 | `spf13/cobra` | CLI framework | Command structure, flags, help text |
-| `encoding/json` (stdlib) | State persistence | Taint map, tombstone set, schema registry → JSON files |
+| `encoding/json` (stdlib) | State persistence | Delta map, tombstone set, schema registry → JSON files |
 | `net` (stdlib) | TCP listener | Proxy accepts connections |
-| `sync` (stdlib) | Concurrency | Mutexes for taint map, goroutine-per-connection |
+| `sync` (stdlib) | Concurrency | Mutexes for delta map, goroutine-per-connection |
 
 ---
 
 ## 2. Project Structure
 
-The architecture separates **engine-agnostic core** from **engine-specific adapters**. When we add Redis, MySQL, or MongoDB, we add a new package under `internal/engine/` and a new protocol handler — the core routing, taint, and merge logic is shared.
+The architecture separates **engine-agnostic core** from **engine-specific adapters**. When we add Redis, MySQL, or MongoDB, we add a new package under `internal/engine/` and a new protocol handler — the core routing, delta, and merge logic is shared.
 
 ```
 columbus-v1/
@@ -38,11 +38,11 @@ columbus-v1/
 │
 ├── internal/
 │   ├── core/                    # ◄ ENGINE-AGNOSTIC CORE
-│   │   ├── types.go             # Shared types: Classification, RoutingDecision, TaintEntry, etc.
+│   │   ├── types.go             # Shared types: Classification, RoutingDecision, DeltaEntry, etc.
 │   │   ├── classifier.go        # Classifier interface
-│   │   ├── router.go            # Router: classification + taint state → strategy
-│   │   ├── taint/
-│   │   │   ├── map.go           # TaintMap: (table, pk) → tainted, with txn staging
+│   │   ├── router.go            # Router: classification + delta state → strategy
+│   │   ├── delta/
+│   │   │   ├── map.go           # DeltaMap: (table, pk) → delta, with txn staging
 │   │   │   ├── tombstone.go     # TombstoneSet: (table, pk) → deleted, with txn staging
 │   │   │   └── store.go         # Persistence: JSON ↔ in-memory
 │   │   ├── schema/
@@ -94,7 +94,7 @@ columbus-v1/
 
 ### Why This Structure
 
-- **`internal/core/`** contains everything that is database-agnostic: the taint map, tombstone set, router logic, schema registry interface, transaction manager, and config. When we add Redis or MySQL, none of this changes.
+- **`internal/core/`** contains everything that is database-agnostic: the delta map, tombstone set, router logic, schema registry interface, transaction manager, and config. When we add Redis or MySQL, none of this changes.
 - **`internal/engine/postgres/`** contains everything PostgreSQL-specific: the PG wire protocol handler, SQL classifier (using `pg_query_go`), PG-specific merge logic, write paths, DDL handling, and Docker container management for PG.
 - Adding a new engine means creating `internal/engine/redis/`, `internal/engine/mysql/`, etc. Each implements the same core interfaces with engine-specific behavior.
 
@@ -168,11 +168,11 @@ type Classifier interface {
 ```go
 // internal/core/router.go
 
-// Router decides execution strategy based on classification and taint state.
-// This is engine-agnostic — it only looks at classification metadata and taint state.
+// Router decides execution strategy based on classification and delta state.
+// This is engine-agnostic — it only looks at classification metadata and delta state.
 type Router struct {
-    taintMap    *taint.Map
-    tombstones  *taint.TombstoneSet
+    deltaMap    *delta.Map
+    tombstones  *delta.TombstoneSet
 }
 
 // Route returns the execution strategy for a classified query.
@@ -180,12 +180,12 @@ func (r *Router) Route(c *Classification) RoutingStrategy {
     switch c.OpType {
     case OpRead:
         if c.IsJoin {
-            if r.anyTableTainted(c.Tables) {
+            if r.anyTableDelta(c.Tables) {
                 return StrategyJoinPatch
             }
             return StrategyProdDirect
         }
-        if r.anyTableTainted(c.Tables) {
+        if r.anyTableDelta(c.Tables) {
             return StrategyMergedRead
         }
         return StrategyProdDirect
@@ -338,32 +338,32 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 
 ---
 
-### Phase 5: State Stores (Taint Map, Tombstone Set, Schema Registry)
+### Phase 5: State Stores (Delta Map, Tombstone Set, Schema Registry)
 **Goal:** In-memory state management with persistence and transaction staging.
 
 **Build:**
-- `internal/core/taint/map.go`:
+- `internal/core/delta/map.go`:
   - Core data structure: `map[string]map[string]bool` (table → serialized_pk → exists)
-  - Methods: `Add(table, pk)`, `Remove(table, pk)`, `IsTainted(table, pk) bool`, `TaintedPKs(table) []string`, `CountForTable(table) int`
+  - Methods: `Add(table, pk)`, `Remove(table, pk)`, `IsDelta(table, pk) bool`, `DeltaPKs(table) []string`, `CountForTable(table) int`
   - Thread-safe (sync.RWMutex)
-- `internal/core/taint/tombstone.go`:
-  - Same structure and API as TaintMap
+- `internal/core/delta/tombstone.go`:
+  - Same structure and API as DeltaMap
   - Methods: `Add(table, pk)`, `IsTombstoned(table, pk) bool`, `TombstonedPKs(table) []string`
 - Transaction staging (in both):
   - `Stage(table, pk)` — add to per-transaction buffer
   - `Commit()` — promote staged entries to persistent state
   - `Rollback()` — discard staged entries
-- `internal/core/taint/store.go`:
+- `internal/core/delta/store.go`:
   - Serialize to JSON: `{"users": ["42", "108"], "orders": ["7"]}`
   - Deserialize from JSON on startup
-  - Persist to `.mori/taint.json` and `.mori/tombstones.json`
+  - Persist to `.mori/delta.json` and `.mori/tombstones.json`
 - `internal/core/schema/registry.go`:
   - Per-table diffs: `map[string]TableDiff`
   - `TableDiff`: `Added []Column`, `Dropped []string`, `Renamed map[string]string`, `TypeChanged map[string][2]string`
   - Methods: `RecordAddColumn(table, col)`, `RecordDropColumn(table, col)`, `GetDiff(table) *TableDiff`, `HasDiff(table) bool`
   - Persist to `.mori/schema_registry.json`
 
-**Checkpoint:** Unit tests for all operations. Persistence round-trip test: create state → persist → reload → verify identical. Transaction staging test: stage → commit → verify promoted; stage → rollback → verify discarded. Concurrent access test: multiple goroutines read/write taint map.
+**Checkpoint:** Unit tests for all operations. Persistence round-trip test: create state → persist → reload → verify identical. Transaction staging test: stage → commit → verify promoted; stage → rollback → verify discarded. Concurrent access test: multiple goroutines read/write delta map.
 
 ---
 
@@ -376,7 +376,7 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 - Update `internal/engine/postgres/proxy/connection.go`:
   - After receiving a message, classify the query
   - Route based on classification:
-    - READ + no taints → forward to Prod (existing behavior)
+    - READ + no deltas → forward to Prod (existing behavior)
     - WRITE → forward to Shadow
     - DDL → forward to Shadow
     - TRANSACTION → handle (next phase)
@@ -387,24 +387,24 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 ---
 
 ### Phase 7: Write Paths (INSERT, UPDATE, DELETE)
-**Goal:** Full write path with hydration, taint tracking, and tombstoning.
+**Goal:** Full write path with hydration, delta tracking, and tombstoning.
 
 **Build:**
 - `internal/engine/postgres/write/insert.go`:
   - Execute INSERT on Shadow
   - Return result (including RETURNING if present) to app
-  - No taint map update (row is Shadow-only)
+  - No delta map update (row is Shadow-only)
 - `internal/engine/postgres/write/update.go`:
   - **Point update** (`WHERE pk = value`):
     1. Check if `(table, pk)` exists in Shadow
     2. If not: fetch row from Prod (`SELECT * WHERE pk = value`), insert into Shadow (adapt for schema diffs)
     3. Execute UPDATE on Shadow
-    4. Add `(table, pk)` to Taint Map
+    4. Add `(table, pk)` to Delta Map
   - **Bulk update** (no PK in WHERE):
     1. `SELECT pk FROM table WHERE <condition>` on both Prod and Shadow
     2. For each Prod PK not in Shadow: hydrate
     3. Execute UPDATE on Shadow
-    4. Add all affected PKs to Taint Map
+    4. Add all affected PKs to Delta Map
 - `internal/engine/postgres/write/delete.go`:
   - If `(table, pk)` exists in Shadow: `DELETE FROM table WHERE pk = value`
   - Add `(table, pk)` to Tombstone Set
@@ -412,28 +412,28 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 
 **Checkpoint:** Integration test sequence:
 1. `INSERT INTO users (name) VALUES ('alice')` → success, returns new ID in local range
-2. `UPDATE users SET name = 'bob' WHERE id = 42` (Prod row) → hydrates user 42 into Shadow, updates, taint map shows `(users, 42)`
+2. `UPDATE users SET name = 'bob' WHERE id = 42` (Prod row) → hydrates user 42 into Shadow, updates, delta map shows `(users, 42)`
 3. `DELETE FROM users WHERE id = 43` → tombstone added
 4. Verify Shadow state directly: new row exists, user 42 exists with modified name, user 43 absent
-5. Verify taint map and tombstone set on disk
+5. Verify delta map and tombstone set on disk
 
 ---
 
 ### Phase 8: Merged Reads (Single Table)
-**Goal:** SELECTs on tainted tables merge Shadow + Prod results.
+**Goal:** SELECTs on delta tables merge Shadow + Prod results.
 
 **Build:**
 - `internal/engine/postgres/merge/single.go`:
   1. Execute query on Shadow → `R_shadow`
   2. Execute query on Prod (with over-fetching for LIMIT queries) → `R_prod`
-  3. Filter `R_prod`: remove rows where PK is in taint map or tombstone set
+  3. Filter `R_prod`: remove rows where PK is in delta map or tombstone set
   4. Adapt `R_prod` for schema diffs (via Schema Registry): inject NULLs, strip columns, rename, cast
   5. Merge `R_shadow` + filtered `R_prod`
   6. Re-sort by original ORDER BY
   7. Apply LIMIT/OFFSET to merged set
   8. Return to app
 - Over-fetching logic:
-  - First attempt: `LIMIT N + |taints| + |tombstones|`
+  - First attempt: `LIMIT N + |deltas| + |tombstones|`
   - If result too short: retry with OFFSET, cap at 3 iterations
 - Update proxy connection to use MergeEngine when StrategyMergedRead
 
@@ -446,15 +446,15 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 ---
 
 ### Phase 9: Merged Reads (JOINs)
-**Goal:** JOINs across tainted and clean tables produce correct results.
+**Goal:** JOINs across delta and clean tables produce correct results.
 
 **Build:**
 - `internal/engine/postgres/merge/join.go`:
   1. Execute JOIN on Prod → `R_prod`
-  2. For each row in `R_prod`, extract PKs for all tainted tables
-  3. Check PKs against taint map and tombstone set
+  2. For each row in `R_prod`, extract PKs for all delta tables
+  3. Check PKs against delta map and tombstone set
   4. Remove rows with tombstoned PKs
-  5. For rows with tainted PKs: fetch Shadow versions, replace tainted columns
+  5. For rows with delta PKs: fetch Shadow versions, replace delta columns
   6. Re-evaluate WHERE clause for patched rows (drop rows that no longer match)
   7. Execute same JOIN on Shadow → `R_shadow`
   8. Merge patched `R_prod` + `R_shadow`, dedup by composite PK
@@ -462,8 +462,8 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 - PK extraction from JOIN results: need to know which columns in the result map to which table's PK (use table alias tracking from classifier)
 
 **Checkpoint:**
-1. Taint a user (update name)
-2. `SELECT o.id, u.name FROM orders o JOIN users u ON o.user_id = u.id WHERE u.id = <tainted_id>` → shows updated name from Shadow
+1. Delta a user (update name)
+2. `SELECT o.id, u.name FROM orders o JOIN users u ON o.user_id = u.id WHERE u.id = <delta_id>` → shows updated name from Shadow
 3. Insert a new user, insert an order for that user
 4. Same JOIN query → new user+order appears in results
 5. Tombstone a user → their orders disappear from JOIN results
@@ -491,20 +491,20 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 ---
 
 ### Phase 11: Transaction Management
-**Goal:** BEGIN/COMMIT/ROLLBACK with staged taints and coordinated Prod/Shadow transactions.
+**Goal:** BEGIN/COMMIT/ROLLBACK with staged deltas and coordinated Prod/Shadow transactions.
 
 **Build:**
 - `internal/core/txn/manager.go`:
-  - Per-connection state: `inTransaction bool`, `stagedTaints []TablePK`, `stagedTombstones []TablePK`
+  - Per-connection state: `inTransaction bool`, `stagedDeltas []TablePK`, `stagedTombstones []TablePK`
   - `Begin()`: open Prod transaction (REPEATABLE READ), open Shadow transaction
-  - `Commit()`: commit Shadow, close Prod, promote staged taints/tombstones
-  - `Rollback()`: rollback Shadow, close Prod, discard staged taints/tombstones
+  - `Commit()`: commit Shadow, close Prod, promote staged deltas/tombstones
+  - `Rollback()`: rollback Shadow, close Prod, discard staged deltas/tombstones
 - Update proxy connection: detect TRANSACTION operations, delegate to txn manager
-- Update write paths: within a transaction, stage taint/tombstone additions instead of applying immediately
+- Update write paths: within a transaction, stage delta/tombstone additions instead of applying immediately
 
 **Checkpoint:**
-1. `BEGIN; INSERT INTO users (name) VALUES ('test'); ROLLBACK;` → taint map unchanged, row absent from Shadow
-2. `BEGIN; UPDATE users SET name = 'x' WHERE id = 42; COMMIT;` → taint map has (users, 42), Shadow has updated row
+1. `BEGIN; INSERT INTO users (name) VALUES ('test'); ROLLBACK;` → delta map unchanged, row absent from Shadow
+2. `BEGIN; UPDATE users SET name = 'x' WHERE id = 42; COMMIT;` → delta map has (users, 42), Shadow has updated row
 3. `BEGIN; DELETE FROM users WHERE id = 43; ROLLBACK;` → tombstone set unchanged
 4. Within a transaction, reads see transaction-local changes (Shadow's transaction isolation handles this)
 
@@ -542,7 +542,7 @@ Each phase produces something testable. Checkpoint at each phase before moving o
   Shadow:       postgres://localhost:54320/mori_shadow
   Proxy:        localhost:5432
 
-  Tainted Rows:
+  Delta Rows:
     users           4 rows
     orders          1 row
 
@@ -558,7 +558,7 @@ Each phase produces something testable. Checkpoint at each phase before moving o
   ```
 - `cmd/mori/reset.go`: truncate Shadow, re-sync schema, clear state. `--hard` re-dumps from Prod.
 - `cmd/mori/log.go`: stream from log file, `--tail N` for last N entries
-- `cmd/mori/inspect.go`: per-table detail (taint count, tombstone count, schema diffs, sequence offset, sample local rows)
+- `cmd/mori/inspect.go`: per-table detail (delta count, tombstone count, schema diffs, sequence offset, sample local rows)
 - `internal/logging/logger.go`: structured JSON log with query text, classification, routing decision, timing, hydration events
 
 **Checkpoint:** All commands produce correct, well-formatted output. `mori status` after a session shows accurate state. `mori log --tail 20` shows recent activity. `mori inspect users` shows detailed table state. `mori reset` clears everything and `mori status` confirms clean state.
@@ -578,7 +578,7 @@ Each phase produces something testable. Checkpoint at each phase before moving o
   - Run `mori stop`, verify graceful shutdown
 - **Edge cases:**
   - Tables without PKs → warning, read-only behavior
-  - UUID PKs → correct routing and taint tracking
+  - UUID PKs → correct routing and delta tracking
   - Composite PKs → correct serialization and lookup
   - Empty tables → no errors
   - Very large result sets → over-fetching works, performance acceptable
@@ -623,7 +623,7 @@ All state lives in `.mori/` as human-readable JSON:
 │     "orders": {"column": "id", "type": "bigserial", "prod_max": 612003, "shadow_start": 10000001}
 │   }
 │
-├── taint.json               # Taint map
+├── delta.json               # Delta map
 │   {
 │     "users": ["42", "108"],
 │     "orders": ["7"]
@@ -662,9 +662,9 @@ All state lives in `.mori/` as human-readable JSON:
 | Layer | Approach | Tools |
 |-------|----------|-------|
 | **Classifier** | Unit tests with SQL corpus (50+ patterns) | `go test`, table-driven tests |
-| **Taint/Tombstone** | Unit tests for CRUD, staging, persistence | `go test` |
+| **Delta/Tombstone** | Unit tests for CRUD, staging, persistence | `go test` |
 | **Schema Registry** | Unit tests for all DDL operations | `go test` |
-| **Router** | Unit tests with mock taint state | `go test` |
+| **Router** | Unit tests with mock delta state | `go test` |
 | **Write paths** | Integration tests with real PG (Shadow) | `go test` + Docker test container |
 | **Merge engine** | Integration tests with real PG (Prod + Shadow) | `go test` + Docker test containers |
 | **Proxy** | Integration tests with real PG client | `go test` + `pgx` test client |
