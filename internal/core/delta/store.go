@@ -14,9 +14,19 @@ const (
 	TombstoneFile = "tombstones.json"
 )
 
+// deltaFile is the on-disk format for the delta map, including inserted tables.
+type deltaFile struct {
+	Deltas         map[string][]string `json:"deltas"`
+	InsertedTables []string            `json:"inserted_tables,omitempty"`
+}
+
 // WriteDeltaMap persists the delta map to .mori/delta.json.
 func WriteDeltaMap(moriDir string, m *Map) error {
-	data, err := json.MarshalIndent(m.Snapshot(), "", "  ")
+	df := deltaFile{
+		Deltas:         m.Snapshot(),
+		InsertedTables: m.InsertedTablesList(),
+	}
+	data, err := json.MarshalIndent(df, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal delta map: %w", err)
 	}
@@ -29,11 +39,22 @@ func ReadDeltaMap(moriDir string) (*Map, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read delta map: %w", err)
 	}
+
+	m := NewMap()
+
+	// Try new format first (with inserted_tables).
+	var df deltaFile
+	if err := json.Unmarshal(data, &df); err == nil && df.Deltas != nil {
+		m.Load(df.Deltas)
+		m.LoadInsertedTables(df.InsertedTables)
+		return m, nil
+	}
+
+	// Fall back to legacy format (plain map[string][]string).
 	var raw map[string][]string
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("failed to parse delta map: %w", err)
 	}
-	m := NewMap()
 	m.Load(raw)
 	return m, nil
 }

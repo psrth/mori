@@ -80,6 +80,7 @@ func TestDeltaMapFileFormat(t *testing.T) {
 
 	m := NewMap()
 	m.Add("users", "42")
+	m.MarkInserted("orders")
 
 	if err := WriteDeltaMap(dir, m); err != nil {
 		t.Fatalf("WriteDeltaMap() error: %v", err)
@@ -90,13 +91,16 @@ func TestDeltaMapFileFormat(t *testing.T) {
 		t.Fatalf("ReadFile() error: %v", err)
 	}
 
-	// Should be valid indented JSON.
-	var raw map[string][]string
+	// Should be valid indented JSON with deltas and inserted_tables.
+	var raw deltaFile
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("file is not valid JSON: %v", err)
 	}
-	if len(raw["users"]) != 1 || raw["users"][0] != "42" {
-		t.Errorf("file content = %v, want {users: [42]}", raw)
+	if len(raw.Deltas["users"]) != 1 || raw.Deltas["users"][0] != "42" {
+		t.Errorf("deltas = %v, want {users: [42]}", raw.Deltas)
+	}
+	if len(raw.InsertedTables) != 1 || raw.InsertedTables[0] != "orders" {
+		t.Errorf("inserted_tables = %v, want [orders]", raw.InsertedTables)
 	}
 }
 

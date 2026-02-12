@@ -73,11 +73,13 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 		password = "mori"
 	}
 
-	// Create and start container with random port mapping
+	// Create and start container with random port mapping.
+	// Use trust auth since Shadow is a local throwaway database bound to 127.0.0.1.
 	cmd := exec.CommandContext(ctx, "docker", "run", "-d",
 		"--name", name,
 		"-e", "POSTGRES_PASSWORD="+password,
 		"-e", "POSTGRES_DB="+cfg.DBName,
+		"-e", "POSTGRES_HOST_AUTH_METHOD=trust",
 		"-p", "127.0.0.1::5432",
 		cfg.Image,
 	)
