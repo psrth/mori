@@ -107,7 +107,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// 8. Load schema registry.
-	var schemaReg *coreSchema.Registry
+	schemaReg := coreSchema.NewRegistry()
 	if sr, err := coreSchema.ReadRegistry(moriDir); err == nil {
 		schemaReg = sr
 	} else if verbose {
@@ -115,7 +115,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// 9. Create router.
-	router := core.NewRouter(deltaMap, tombstones)
+	router := core.NewRouter(deltaMap, tombstones, schemaReg)
 
 	// 10. Compute Shadow address.
 	shadowAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ShadowPort)

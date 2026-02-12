@@ -4,17 +4,18 @@ import (
 	"testing"
 
 	"github.com/mori-dev/mori/internal/core/delta"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 )
 
 func TestNewRouterNotNil(t *testing.T) {
-	r := NewRouter(nil, nil)
+	r := NewRouter(nil, nil, nil)
 	if r == nil {
 		t.Fatal("NewRouter() returned nil")
 	}
 }
 
 func TestRouterNilStateReadsAreProdDirect(t *testing.T) {
-	r := NewRouter(nil, nil)
+	r := NewRouter(nil, nil, nil)
 	cl := &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users"}}
 	if got := r.Route(cl); got != StrategyProdDirect {
 		t.Errorf("nil state SELECT: got %s, want PROD_DIRECT", got)
@@ -22,7 +23,7 @@ func TestRouterNilStateReadsAreProdDirect(t *testing.T) {
 }
 
 func TestRouterNilStateWritesRouteToShadow(t *testing.T) {
-	r := NewRouter(nil, nil)
+	r := NewRouter(nil, nil, nil)
 	cl := &Classification{OpType: OpWrite, SubType: SubInsert, Tables: []string{"users"}}
 	if got := r.Route(cl); got != StrategyShadowWrite {
 		t.Errorf("nil state INSERT: got %s, want SHADOW_WRITE", got)
@@ -36,7 +37,7 @@ func TestRouterRoutingTable(t *testing.T) {
 	ts := delta.NewTombstoneSet()
 	ts.Add("orders", "99")
 
-	r := NewRouter(dm, ts)
+	r := NewRouter(dm, ts, nil)
 
 	tests := []struct {
 		name string
@@ -156,7 +157,7 @@ func TestRouterSelectCleanTableAfterDeltaRemoved(t *testing.T) {
 	dm.Add("users", "42")
 	dm.Remove("users", "42")
 	ts := delta.NewTombstoneSet()
-	r := NewRouter(dm, ts)
+	r := NewRouter(dm, ts, nil)
 
 	cl := &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users"}}
 	if got := r.Route(cl); got != StrategyProdDirect {
@@ -168,10 +169,35 @@ func TestRouterEmptyTablesReadIsProdDirect(t *testing.T) {
 	dm := delta.NewMap()
 	dm.Add("users", "42")
 	ts := delta.NewTombstoneSet()
-	r := NewRouter(dm, ts)
+	r := NewRouter(dm, ts, nil)
 
 	cl := &Classification{OpType: OpRead, SubType: SubSelect, Tables: nil}
 	if got := r.Route(cl); got != StrategyProdDirect {
 		t.Errorf("SELECT with no tables: got %s, want PROD_DIRECT", got)
+	}
+}
+
+func TestRouterSchemaDiffTriggersMergedRead(t *testing.T) {
+	reg := coreSchema.NewRegistry()
+	reg.RecordAddColumn("users", coreSchema.Column{Name: "phone", Type: "TEXT"})
+
+	r := NewRouter(nil, nil, reg)
+
+	// SELECT on a table with schema diff → MergedRead.
+	cl := &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users"}}
+	if got := r.Route(cl); got != StrategyMergedRead {
+		t.Errorf("SELECT on schema-diff table: got %s, want MERGED_READ", got)
+	}
+
+	// SELECT on a clean table → ProdDirect.
+	cl2 := &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"orders"}}
+	if got := r.Route(cl2); got != StrategyProdDirect {
+		t.Errorf("SELECT on clean table: got %s, want PROD_DIRECT", got)
+	}
+
+	// JOIN where one table has schema diff → JoinPatch.
+	cl3 := &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users", "orders"}, IsJoin: true}
+	if got := r.Route(cl3); got != StrategyJoinPatch {
+		t.Errorf("JOIN with schema-diff table: got %s, want JOIN_PATCH", got)
 	}
 }
