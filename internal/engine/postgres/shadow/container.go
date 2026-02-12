@@ -17,6 +17,7 @@ type ContainerConfig struct {
 	Image    string // Docker image (e.g., "postgres:16.2")
 	DBName   string // Database name to create
 	Password string // Postgres password (default: "mori")
+	HostPort int    // Host port to bind (default: 9001)
 }
 
 // ContainerInfo holds the result of creating a Shadow container.
@@ -73,14 +74,21 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 		password = "mori"
 	}
 
-	// Create and start container with random port mapping.
+	// Determine host port (default 9001).
+	hostPort := cfg.HostPort
+	if hostPort == 0 {
+		hostPort = 9001
+	}
+	portMapping := fmt.Sprintf("127.0.0.1:%d:5432", hostPort)
+
+	// Create and start container with fixed port mapping.
 	// Use trust auth since Shadow is a local throwaway database bound to 127.0.0.1.
 	cmd := exec.CommandContext(ctx, "docker", "run", "-d",
 		"--name", name,
 		"-e", "POSTGRES_PASSWORD="+password,
 		"-e", "POSTGRES_DB="+cfg.DBName,
 		"-e", "POSTGRES_HOST_AUTH_METHOD=trust",
-		"-p", "127.0.0.1::5432",
+		"-p", portMapping,
 		cfg.Image,
 	)
 	out, err := cmd.CombinedOutput()
@@ -88,13 +96,6 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 		return nil, fmt.Errorf("failed to create container: %s", strings.TrimSpace(string(out)))
 	}
 	containerID := strings.TrimSpace(string(out))
-
-	// Get the assigned host port
-	hostPort, err := m.getHostPort(ctx, containerID)
-	if err != nil {
-		m.StopAndRemove(ctx, containerID)
-		return nil, fmt.Errorf("failed to get host port: %w", err)
-	}
 
 	// Wait for PostgreSQL to be ready
 	if err := m.WaitReady(ctx, containerID); err != nil {

@@ -19,6 +19,7 @@ import (
 	"github.com/mori-dev/mori/internal/engine/postgres/proxy"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/mori-dev/mori/internal/logging"
+	morimcp "github.com/mori-dev/mori/internal/mcp"
 	"github.com/spf13/cobra"
 )
 
@@ -32,13 +33,17 @@ database transparently.`,
 }
 
 func init() {
-	startCmd.Flags().IntP("port", "p", 5432, "Port for the proxy to listen on")
+	startCmd.Flags().IntP("port", "p", 9002, "Port for the proxy to listen on")
 	startCmd.Flags().Bool("verbose", false, "Log all intercepted queries and routing decisions")
+	startCmd.Flags().Bool("mcp", false, "Enable MCP server for AI tool integration")
+	startCmd.Flags().Int("mcp-port", 9000, "Port for the MCP server")
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
 	port, _ := cmd.Flags().GetInt("port")
 	verbose, _ := cmd.Flags().GetBool("verbose")
+	mcpEnabled, _ := cmd.Flags().GetBool("mcp")
+	mcpPort, _ := cmd.Flags().GetInt("mcp-port")
 
 	// 1. Find project root and read config.
 	projectRoot, err := config.FindProjectRoot()
@@ -145,9 +150,23 @@ func runStart(cmd *cobra.Command, args []string) error {
 		errCh <- p.ListenAndServe(ctx)
 	}()
 
+	// 12. Optionally start MCP server.
+	var mcpSrv *morimcp.Server
+	if mcpEnabled {
+		mcpSrv = morimcp.New(mcpPort, port, dsn.DBName, dsn.User, dsn.Password)
+		go func() {
+			if err := mcpSrv.ListenAndServe(ctx); err != nil {
+				log.Printf("MCP server error: %v", err)
+			}
+		}()
+	}
+
 	fmt.Printf("Mori proxy started on 127.0.0.1:%d → %s\n", port, prodAddr)
 	fmt.Printf("  Prod:   %s\n", cfg.RedactedProdConnection())
 	fmt.Printf("  Shadow: %s\n", shadowAddr)
+	if mcpEnabled {
+		fmt.Printf("  MCP:    http://127.0.0.1:%d/mcp\n", mcpPort)
+	}
 	if verbose {
 		fmt.Println("  Verbose logging enabled.")
 	}
@@ -168,6 +187,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
+	if mcpSrv != nil {
+		if err := mcpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("MCP server shutdown error: %v", err)
+		}
+	}
 	if err := p.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Shutdown timeout: %v", err)
 	}
