@@ -287,6 +287,18 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		}
 	}
 
+	// Create a DDLHandler for schema-tracking DDL execution.
+	var ddh *DDLHandler
+	if p.schemaRegistry != nil {
+		ddh = &DDLHandler{
+			shadowConn:     shadowConn,
+			schemaRegistry: p.schemaRegistry,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+		}
+	}
+
 	for {
 		msg, err := readMsg(clientConn)
 		if err != nil {
@@ -337,6 +349,17 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 				}
 				continue
 			}
+		}
+
+		// Dispatch DDL to DDLHandler when available.
+		if ddh != nil && decision.classification != nil && decision.strategy == core.StrategyShadowDDL {
+			if err := ddh.HandleDDL(clientConn, msg.Raw, decision.classification); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] DDL handler error: %v", connID, err)
+				}
+				return
+			}
+			continue
 		}
 
 		switch decision.target {
@@ -414,7 +437,11 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 		}
 
 	case core.StrategyShadowDDL:
-		return routeDecision{target: targetShadow, strategy: strategy}
+		return routeDecision{
+			target:         targetShadow,
+			classification: classification,
+			strategy:       strategy,
+		}
 
 	case core.StrategyTransaction:
 		return routeDecision{target: targetBoth, strategy: strategy}
