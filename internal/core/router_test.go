@@ -1,30 +1,177 @@
 package core
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/mori-dev/mori/internal/core/delta"
+)
 
 func TestNewRouterNotNil(t *testing.T) {
-	r := NewRouter()
+	r := NewRouter(nil, nil)
 	if r == nil {
 		t.Fatal("NewRouter() returned nil")
 	}
 }
 
-func TestRouterStubAlwaysReturnsProdDirect(t *testing.T) {
-	r := NewRouter()
+func TestRouterNilStateReadsAreProdDirect(t *testing.T) {
+	r := NewRouter(nil, nil)
+	cl := &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users"}}
+	if got := r.Route(cl); got != StrategyProdDirect {
+		t.Errorf("nil state SELECT: got %s, want PROD_DIRECT", got)
+	}
+}
 
-	classifications := []*Classification{
-		{OpType: OpRead, SubType: SubSelect, Tables: []string{"users"}},
-		{OpType: OpWrite, SubType: SubInsert, Tables: []string{"users"}},
-		{OpType: OpWrite, SubType: SubUpdate, Tables: []string{"orders"}},
-		{OpType: OpWrite, SubType: SubDelete, Tables: []string{"users"}},
-		{OpType: OpDDL, SubType: SubAlter, Tables: []string{"users"}},
-		{OpType: OpTransaction, SubType: SubBegin},
+func TestRouterNilStateWritesRouteToShadow(t *testing.T) {
+	r := NewRouter(nil, nil)
+	cl := &Classification{OpType: OpWrite, SubType: SubInsert, Tables: []string{"users"}}
+	if got := r.Route(cl); got != StrategyShadowWrite {
+		t.Errorf("nil state INSERT: got %s, want SHADOW_WRITE", got)
+	}
+}
+
+func TestRouterRoutingTable(t *testing.T) {
+	dm := delta.NewMap()
+	dm.Add("users", "42")
+
+	ts := delta.NewTombstoneSet()
+	ts.Add("orders", "99")
+
+	r := NewRouter(dm, ts)
+
+	tests := []struct {
+		name string
+		cl   *Classification
+		want RoutingStrategy
+	}{
+		// Reads on clean tables → ProdDirect
+		{
+			name: "SELECT clean table",
+			cl:   &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"products"}},
+			want: StrategyProdDirect,
+		},
+		// Reads on delta table → MergedRead
+		{
+			name: "SELECT delta table",
+			cl:   &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users"}},
+			want: StrategyMergedRead,
+		},
+		// Reads on tombstone table → MergedRead
+		{
+			name: "SELECT tombstone table",
+			cl:   &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"orders"}},
+			want: StrategyMergedRead,
+		},
+		// JOIN on clean tables → ProdDirect
+		{
+			name: "SELECT JOIN clean",
+			cl:   &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"products", "categories"}, IsJoin: true},
+			want: StrategyProdDirect,
+		},
+		// JOIN where one table has deltas → JoinPatch
+		{
+			name: "SELECT JOIN delta",
+			cl:   &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users", "products"}, IsJoin: true},
+			want: StrategyJoinPatch,
+		},
+		// JOIN where one table has tombstones → JoinPatch
+		{
+			name: "SELECT JOIN tombstone",
+			cl:   &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"orders", "products"}, IsJoin: true},
+			want: StrategyJoinPatch,
+		},
+		// INSERT → ShadowWrite
+		{
+			name: "INSERT",
+			cl:   &Classification{OpType: OpWrite, SubType: SubInsert, Tables: []string{"users"}},
+			want: StrategyShadowWrite,
+		},
+		// UPDATE → HydrateAndWrite
+		{
+			name: "UPDATE",
+			cl:   &Classification{OpType: OpWrite, SubType: SubUpdate, Tables: []string{"users"}},
+			want: StrategyHydrateAndWrite,
+		},
+		// DELETE → ShadowDelete
+		{
+			name: "DELETE",
+			cl:   &Classification{OpType: OpWrite, SubType: SubDelete, Tables: []string{"users"}},
+			want: StrategyShadowDelete,
+		},
+		// DDL: ALTER → ShadowDDL
+		{
+			name: "ALTER TABLE",
+			cl:   &Classification{OpType: OpDDL, SubType: SubAlter, Tables: []string{"users"}},
+			want: StrategyShadowDDL,
+		},
+		// DDL: CREATE → ShadowDDL
+		{
+			name: "CREATE TABLE",
+			cl:   &Classification{OpType: OpDDL, SubType: SubCreate, Tables: []string{"new_table"}},
+			want: StrategyShadowDDL,
+		},
+		// DDL: DROP → ShadowDDL
+		{
+			name: "DROP TABLE",
+			cl:   &Classification{OpType: OpDDL, SubType: SubDrop, Tables: []string{"users"}},
+			want: StrategyShadowDDL,
+		},
+		// Transaction: BEGIN
+		{
+			name: "BEGIN",
+			cl:   &Classification{OpType: OpTransaction, SubType: SubBegin},
+			want: StrategyTransaction,
+		},
+		// Transaction: COMMIT
+		{
+			name: "COMMIT",
+			cl:   &Classification{OpType: OpTransaction, SubType: SubCommit},
+			want: StrategyTransaction,
+		},
+		// Transaction: ROLLBACK
+		{
+			name: "ROLLBACK",
+			cl:   &Classification{OpType: OpTransaction, SubType: SubRollback},
+			want: StrategyTransaction,
+		},
+		// Other: SET → ProdDirect
+		{
+			name: "SET",
+			cl:   &Classification{OpType: OpOther, SubType: SubOther},
+			want: StrategyProdDirect,
+		},
 	}
 
-	for _, c := range classifications {
-		got := r.Route(c)
-		if got != StrategyProdDirect {
-			t.Errorf("Route(%s/%s) = %s, want PROD_DIRECT", c.OpType, c.SubType, got)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := r.Route(tt.cl)
+			if got != tt.want {
+				t.Errorf("Route() = %s, want %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRouterSelectCleanTableAfterDeltaRemoved(t *testing.T) {
+	dm := delta.NewMap()
+	dm.Add("users", "42")
+	dm.Remove("users", "42")
+	ts := delta.NewTombstoneSet()
+	r := NewRouter(dm, ts)
+
+	cl := &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users"}}
+	if got := r.Route(cl); got != StrategyProdDirect {
+		t.Errorf("SELECT after delta removed: got %s, want PROD_DIRECT", got)
+	}
+}
+
+func TestRouterEmptyTablesReadIsProdDirect(t *testing.T) {
+	dm := delta.NewMap()
+	dm.Add("users", "42")
+	ts := delta.NewTombstoneSet()
+	r := NewRouter(dm, ts)
+
+	cl := &Classification{OpType: OpRead, SubType: SubSelect, Tables: nil}
+	if got := r.Route(cl); got != StrategyProdDirect {
+		t.Errorf("SELECT with no tables: got %s, want PROD_DIRECT", got)
 	}
 }

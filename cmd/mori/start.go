@@ -10,9 +10,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/mori-dev/mori/internal/core/delta"
+	"github.com/mori-dev/mori/internal/engine/postgres/classify"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 	"github.com/mori-dev/mori/internal/engine/postgres/proxy"
+	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/spf13/cobra"
 )
 
@@ -73,10 +77,44 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to write PID file: %w", err)
 	}
 
-	// 5. Create proxy.
-	p := proxy.New(prodAddr, port, verbose)
+	// 5. Load table metadata for classifier.
+	moriDir := config.MoriDirPath(projectRoot)
+	tables, err := schema.ReadTables(moriDir)
+	if err != nil {
+		if verbose {
+			log.Printf("Warning: could not load table metadata: %v (classifier will run without PK info)", err)
+		}
+		tables = make(map[string]schema.TableMeta)
+	}
 
-	// 6. Set up signal handling.
+	// 6. Create classifier.
+	classifier := classify.New(tables)
+
+	// 7. Load delta state.
+	deltaMap := delta.NewMap()
+	if dm, err := delta.ReadDeltaMap(moriDir); err == nil {
+		deltaMap = dm
+	} else if verbose {
+		log.Printf("No existing delta map found (starting clean): %v", err)
+	}
+
+	tombstones := delta.NewTombstoneSet()
+	if ts, err := delta.ReadTombstoneSet(moriDir); err == nil {
+		tombstones = ts
+	} else if verbose {
+		log.Printf("No existing tombstones found (starting clean): %v", err)
+	}
+
+	// 8. Create router.
+	router := core.NewRouter(deltaMap, tombstones)
+
+	// 9. Compute Shadow address.
+	shadowAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ShadowPort)
+
+	// 10. Create proxy.
+	p := proxy.New(prodAddr, shadowAddr, dsn.DBName, port, verbose, classifier, router)
+
+	// 11. Set up signal handling.
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
@@ -89,13 +127,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}()
 
 	fmt.Printf("Mori proxy started on 127.0.0.1:%d → %s\n", port, prodAddr)
-	fmt.Printf("  Prod: %s\n", cfg.RedactedProdConnection())
+	fmt.Printf("  Prod:   %s\n", cfg.RedactedProdConnection())
+	fmt.Printf("  Shadow: %s\n", shadowAddr)
 	if verbose {
 		fmt.Println("  Verbose logging enabled.")
 	}
 	fmt.Println("Press Ctrl+C to stop.")
 
-	// 7. Wait for signal or error.
+	// 12. Wait for signal or error.
 	select {
 	case sig := <-sigCh:
 		fmt.Printf("\nReceived %s, shutting down...\n", sig)
@@ -105,7 +144,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 8. Graceful shutdown with 10-second timeout.
+	// 13. Graceful shutdown with 10-second timeout.
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -114,7 +153,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("Shutdown timeout: %v", err)
 	}
 
-	// 9. Remove PID file.
+	// 14. Remove PID file.
 	os.Remove(pidPath)
 	fmt.Println("Mori proxy stopped.")
 
