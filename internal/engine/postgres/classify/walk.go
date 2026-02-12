@@ -59,6 +59,16 @@ func hasJoinExpr(nodes []*pg_query.Node) bool {
 	return false
 }
 
+// hasRangeSubselect returns true if any node in the list is a derived table (subquery in FROM).
+func hasRangeSubselect(nodes []*pg_query.Node) bool {
+	for _, n := range nodes {
+		if n != nil && n.GetRangeSubselect() != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // extractIntValue extracts an integer from a constant node.
 // Returns 0 if the node is not a simple integer literal.
 func extractIntValue(n *pg_query.Node) int {

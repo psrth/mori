@@ -28,6 +28,14 @@ func (m *Map) Add(table, pk string) { m.s.add(table, pk) }
 // Remove unmarks (table, pk) as a delta.
 func (m *Map) Remove(table, pk string) { m.s.remove(table, pk) }
 
+// ClearTable removes all delta entries for the given table.
+func (m *Map) ClearTable(table string) {
+	m.s.clearTable(table)
+	m.insertMu.Lock()
+	delete(m.insertedTables, table)
+	m.insertMu.Unlock()
+}
+
 // IsDelta reports whether (table, pk) has been modified in Shadow.
 func (m *Map) IsDelta(table, pk string) bool { return m.s.has(table, pk) }
 

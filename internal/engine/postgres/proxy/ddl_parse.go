@@ -15,6 +15,7 @@ const (
 	ddlRenameColumn
 	ddlAlterType
 	ddlDropTable
+	ddlCreateTable
 )
 
 type ddlChange struct {
@@ -55,8 +56,14 @@ func parseDDLChanges(sql string) ([]ddlChange, error) {
 		return parseRenameStmt(node.GetRenameStmt())
 	case node.GetDropStmt() != nil:
 		return parseDropStmt(node.GetDropStmt())
+	case node.GetCreateStmt() != nil:
+		table := rangeVarName(node.GetCreateStmt().GetRelation())
+		if table != "" {
+			return []ddlChange{{Kind: ddlCreateTable, Table: table}}, nil
+		}
+		return nil, nil
 	default:
-		// CREATE TABLE, CREATE INDEX, etc. — no column-level changes to track.
+		// CREATE INDEX, etc. — no column-level changes to track.
 		return nil, nil
 	}
 }

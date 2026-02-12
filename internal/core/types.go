@@ -115,15 +115,18 @@ func (r RoutingStrategy) String() string {
 
 // Classification is the result of parsing a query.
 type Classification struct {
-	OpType  OpType   // READ, WRITE, DDL, TRANSACTION, OTHER
-	SubType SubType  // SELECT, INSERT, UPDATE, DELETE, ALTER, CREATE, DROP, BEGIN, COMMIT, ROLLBACK
-	Tables  []string // All table names referenced
-	PKs     []TablePK // Extractable (table, pk) pairs from WHERE clauses
-	IsJoin  bool     // Whether the query involves multiple tables
-	HasLimit bool    // Whether the query has a LIMIT clause
-	Limit   int      // The LIMIT value, if present
-	OrderBy string   // Raw ORDER BY clause, for re-application after merge
-	RawSQL  string   // Original SQL text
+	OpType       OpType   // READ, WRITE, DDL, TRANSACTION, OTHER
+	SubType      SubType  // SELECT, INSERT, UPDATE, DELETE, ALTER, CREATE, DROP, BEGIN, COMMIT, ROLLBACK
+	Tables       []string // All table names referenced
+	PKs          []TablePK // Extractable (table, pk) pairs from WHERE clauses
+	IsJoin       bool     // Whether the query involves multiple tables
+	HasLimit     bool     // Whether the query has a LIMIT clause
+	Limit        int      // The LIMIT value, if present
+	OrderBy      string   // Raw ORDER BY clause, for re-application after merge
+	HasAggregate  bool     // Whether the query uses aggregate functions (COUNT, SUM, etc.) or GROUP BY
+	HasSetOp      bool     // Whether the query uses UNION/INTERSECT/EXCEPT
+	IsComplexRead bool     // Whether the query is too complex for merged read (derived tables, complex CTEs)
+	RawSQL        string   // Original SQL text
 }
 
 // TablePK identifies a row in a specific table.

@@ -295,6 +295,8 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		ddh = &DDLHandler{
 			shadowConn:     shadowConn,
 			schemaRegistry: p.schemaRegistry,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
 			moriDir:        p.moriDir,
 			connID:         connID,
 			verbose:        p.verbose,
@@ -341,7 +343,8 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			txnHandler:     txh,
 			writeHandler:   wh,
 			readHandler:    rh,
-			stmtCache:      make(map[string]string),
+			stmtCache:       make(map[string]string),
+			shadowOnlyStmts: make(map[string]bool),
 		}
 	}
 
@@ -554,6 +557,26 @@ func forwardAndRelay(raw []byte, backend, client net.Conn) error {
 
 		if msg.Type == 'Z' {
 			return nil
+		}
+	}
+}
+
+// forwardAndCapture sends a message to the backend and collects the complete
+// response (until ReadyForQuery). Returns all response messages without relaying.
+func forwardAndCapture(raw []byte, backend net.Conn) ([]*pgMsg, error) {
+	if _, err := backend.Write(raw); err != nil {
+		return nil, fmt.Errorf("sending to backend: %w", err)
+	}
+
+	var msgs []*pgMsg
+	for {
+		msg, err := readMsg(backend)
+		if err != nil {
+			return msgs, fmt.Errorf("reading backend response: %w", err)
+		}
+		msgs = append(msgs, msg)
+		if msg.Type == 'Z' {
+			return msgs, nil
 		}
 	}
 }

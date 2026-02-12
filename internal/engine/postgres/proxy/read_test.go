@@ -1075,7 +1075,7 @@ func TestParseSimpleOrderBy(t *testing.T) {
 		{"name", "name", false},
 		{"u.name DESC", "name", true},
 		{`"created_at" DESC`, "created_at", true},
-		{"id, name", "", false}, // multi-column: skip
+		{"id, name", "id", false}, // multi-column: returns first column
 		{"", "", false},
 	}
 

@@ -209,7 +209,7 @@ func TestParseBindMsgPayload(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			payload := tt.msg[5:]
-			portal, stmtName, params, err := parseBindMsgPayload(payload)
+			portal, stmtName, _, params, err := parseBindMsgPayload(payload)
 			if err != nil {
 				t.Fatalf("error = %v", err)
 			}
@@ -229,7 +229,7 @@ func TestParseBindMsgPayload(t *testing.T) {
 func TestParseBindMsgPayloadWithNull(t *testing.T) {
 	msg := makeBindMsgWithNull("", "", "hello", nil, "world")
 	payload := msg[5:]
-	_, _, params, err := parseBindMsgPayload(payload)
+	_, _, _, params, err := parseBindMsgPayload(payload)
 	if err != nil {
 		t.Fatalf("error = %v", err)
 	}
@@ -371,7 +371,7 @@ func TestReconstructSQL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := reconstructSQL(tt.sql, tt.params)
+			got := reconstructSQL(tt.sql, tt.params, nil)
 			if got != tt.want {
 				t.Errorf("reconstructSQL() = %q, want %q", got, tt.want)
 			}
@@ -384,7 +384,7 @@ func TestResolveParams(t *testing.T) {
 		[]byte("hello"),
 		nil,
 		[]byte("42"),
-	})
+	}, nil)
 	if len(params) != 3 {
 		t.Fatalf("len = %d, want 3", len(params))
 	}

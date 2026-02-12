@@ -27,6 +27,7 @@ type TableDiff struct {
 	Dropped     []string            `json:"dropped"`
 	Renamed     map[string]string   `json:"renamed"`      // old_name -> new_name
 	TypeChanged map[string][2]string `json:"type_changed"` // column -> [old_type, new_type]
+	IsNewTable  bool                `json:"is_new_table"`  // true if table only exists in Shadow
 }
 
 // Registry tracks schema diffs for all modified tables.
@@ -52,6 +53,21 @@ func (r *Registry) getOrCreateDiff(table string) *TableDiff {
 		r.diffs[table] = d
 	}
 	return d
+}
+
+// RecordNewTable records that a table was created in Shadow (doesn't exist in Prod).
+func (r *Registry) RecordNewTable(table string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	d := r.getOrCreateDiff(table)
+	d.IsNewTable = true
+}
+
+// RemoveTable removes a table's diff from the registry (e.g., after DROP TABLE).
+func (r *Registry) RemoveTable(table string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.diffs, table)
 }
 
 // RecordAddColumn records that a column was added to the table in Shadow.
@@ -100,6 +116,7 @@ func (r *Registry) GetDiff(table string) *TableDiff {
 		Dropped:     make([]string, len(d.Dropped)),
 		Renamed:     make(map[string]string, len(d.Renamed)),
 		TypeChanged: make(map[string][2]string, len(d.TypeChanged)),
+		IsNewTable:  d.IsNewTable,
 	}
 	copy(cp.Added, d.Added)
 	copy(cp.Dropped, d.Dropped)

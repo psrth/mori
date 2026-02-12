@@ -6,6 +6,7 @@ import (
 	"net"
 
 	"github.com/mori-dev/mori/internal/core"
+	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/logging"
 )
@@ -15,6 +16,8 @@ import (
 type DDLHandler struct {
 	shadowConn     net.Conn
 	schemaRegistry *coreSchema.Registry
+	deltaMap       *delta.Map
+	tombstones     *delta.TombstoneSet
 	moriDir        string
 	connID         int64
 	verbose        bool
@@ -112,10 +115,24 @@ func (dh *DDLHandler) applyChange(ch ddlChange) {
 		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("ALTER TYPE %s.%s -> %s", ch.Table, ch.Column, ch.NewType))
 
 	case ddlDropTable:
+		dh.schemaRegistry.RemoveTable(ch.Table)
+		if dh.deltaMap != nil {
+			dh.deltaMap.ClearTable(ch.Table)
+		}
+		if dh.tombstones != nil {
+			dh.tombstones.ClearTable(ch.Table)
+		}
 		if dh.verbose {
-			log.Printf("[conn %d] schema registry: DROP TABLE %s (informational)", dh.connID, ch.Table)
+			log.Printf("[conn %d] schema registry: DROP TABLE %s", dh.connID, ch.Table)
 		}
 		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("DROP TABLE %s", ch.Table))
+
+	case ddlCreateTable:
+		dh.schemaRegistry.RecordNewTable(ch.Table)
+		if dh.verbose {
+			log.Printf("[conn %d] schema registry: CREATE TABLE %s", dh.connID, ch.Table)
+		}
+		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("CREATE TABLE %s", ch.Table))
 	}
 }
 

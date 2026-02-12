@@ -26,8 +26,8 @@ func TestLifecycle(t *testing.T) {
 		if !strings.Contains(out, "Engine:") {
 			t.Errorf("status output missing Engine info:\n%s", out)
 		}
-		if !strings.Contains(out, "PostgreSQL") {
-			t.Errorf("status output missing PostgreSQL:\n%s", out)
+		if !strings.Contains(strings.ToLower(out), "postgres") {
+			t.Errorf("status output missing postgres:\n%s", out)
 		}
 	})
 

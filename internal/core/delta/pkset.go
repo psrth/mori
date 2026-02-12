@@ -73,6 +73,16 @@ func (s *pkSet) countForTable(table string) int {
 	return len(s.entries[table])
 }
 
+// clearTable removes all entries for a table from both committed and staged.
+func (s *pkSet) clearTable(table string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.entries, table)
+	if s.staged != nil {
+		delete(s.staged, table)
+	}
+}
+
 // tables returns all table names that have entries, sorted.
 func (s *pkSet) tables() []string {
 	s.mu.RLock()
