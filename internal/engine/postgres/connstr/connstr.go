@@ -176,6 +176,11 @@ func (d *ProdDSN) Redacted() string {
 	return fmt.Sprintf("postgres://%s:***@%s:%d/%s", d.User, d.Host, d.Port, d.DBName)
 }
 
+// Address returns the "host:port" string for TCP dialing.
+func (d *ProdDSN) Address() string {
+	return fmt.Sprintf("%s:%d", d.Host, d.Port)
+}
+
 // ConnString returns a full connection string suitable for pgx.
 func (d *ProdDSN) ConnString() string {
 	u := &url.URL{
