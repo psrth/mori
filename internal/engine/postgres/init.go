@@ -114,7 +114,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	// 8. Persist configuration
 	fmt.Println("Persisting configuration...")
 	cfg := &config.Config{
-		ProdConnection:  dsn.Redacted(),
+		ProdConnection:  dsn.ConnString(),
 		ShadowPort:      containerInfo.HostPort,
 		ShadowContainer: containerInfo.ContainerName,
 		ShadowImage:     imageName,

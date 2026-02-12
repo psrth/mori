@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -13,6 +14,8 @@ const (
 	MoriDir = ".mori"
 	// ConfigFile is the name of the main configuration file.
 	ConfigFile = "config.json"
+	// PidFile is the name of the proxy PID file.
+	PidFile = "proxy.pid"
 )
 
 // Config holds all Mori project configuration.
@@ -37,6 +40,11 @@ func MoriDirPath(projectRoot string) string {
 // ConfigFilePath returns the absolute path to the config.json file.
 func ConfigFilePath(projectRoot string) string {
 	return filepath.Join(projectRoot, MoriDir, ConfigFile)
+}
+
+// PidFilePath returns the absolute path to the proxy PID file.
+func PidFilePath(projectRoot string) string {
+	return filepath.Join(projectRoot, MoriDir, PidFile)
 }
 
 // IsInitialized checks whether a .mori/config.json file exists
@@ -78,6 +86,21 @@ func ReadConfig(projectRoot string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// RedactedProdConnection returns ProdConnection with the password masked.
+// If ProdConnection cannot be parsed, returns it as-is.
+func (c *Config) RedactedProdConnection() string {
+	u, err := url.Parse(c.ProdConnection)
+	if err != nil {
+		return c.ProdConnection
+	}
+	if u.User != nil {
+		if _, hasPass := u.User.Password(); hasPass {
+			u.User = url.UserPassword(u.User.Username(), "***")
+		}
+	}
+	return u.String()
 }
 
 // FindProjectRoot walks up the directory tree from the current working directory
