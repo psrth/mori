@@ -11,21 +11,46 @@ import (
 // handleJoinPatch implements the JOIN merged read algorithm.
 // Strategy: Execute on Prod, patch delta columns from Shadow, merge with Shadow results.
 func (rh *ReadHandler) handleJoinPatch(clientConn net.Conn, cl *core.Classification) error {
+	columns, values, nulls, err := rh.joinPatchCore(cl, cl.RawSQL)
+	if err != nil {
+		if re, ok := err.(*relayError); ok {
+			_, writeErr := clientConn.Write(re.rawMsgs)
+			return writeErr
+		}
+		return err
+	}
+
+	response := buildSelectResponse(columns, values, nulls)
+	_, err = clientConn.Write(response)
+	return err
+}
+
+// joinPatchCore performs the JOIN patch algorithm and returns the result
+// without writing to the client. The querySQL parameter is the SQL to execute.
+func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
+	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
+) {
 	// Identify which tables have deltas/tombstones.
 	deltaTables := rh.identifyDeltaTables(cl.Tables)
 	if len(deltaTables) == 0 {
-		// No delta tables — should not have been routed here. Fall back to Prod.
-		return forwardAndRelay(buildQueryMsg(cl.RawSQL), rh.prodConn, clientConn)
+		// No delta tables — execute directly on Prod and return result.
+		prodResult, err := execQuery(rh.prodConn, querySQL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("prod JOIN query: %w", err)
+		}
+		if prodResult.Error != "" {
+			return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
+		}
+		return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
 	}
 
 	// Step 1: Execute JOIN on Prod.
-	prodResult, err := execQuery(rh.prodConn, cl.RawSQL)
+	prodResult, err := execQuery(rh.prodConn, querySQL)
 	if err != nil {
-		return fmt.Errorf("prod JOIN query: %w", err)
+		return nil, nil, nil, fmt.Errorf("prod JOIN query: %w", err)
 	}
 	if prodResult.Error != "" {
-		_, err := clientConn.Write(prodResult.RawMsgs)
-		return err
+		return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
 	}
 
 	// Step 2: Find PK column indices for each delta table in the result set.
@@ -64,15 +89,15 @@ func (rh *ReadHandler) handleJoinPatch(clientConn net.Conn, cl *core.Classificat
 	}
 
 	// Step 5: Execute same JOIN on Shadow (catches locally-inserted rows).
-	shadowResult, err := execQuery(rh.shadowConn, cl.RawSQL)
+	shadowResult, err := execQuery(rh.shadowConn, querySQL)
 	if err != nil {
-		return fmt.Errorf("shadow JOIN query: %w", err)
+		return nil, nil, nil, fmt.Errorf("shadow JOIN query: %w", err)
 	}
 
 	// Step 6: Merge Shadow + patched Prod. Shadow rows first (priority).
-	columns := prodResult.Columns
+	resultColumns := prodResult.Columns
 	if len(shadowResult.Columns) > 0 && shadowResult.Error == "" {
-		columns = shadowResult.Columns
+		resultColumns = shadowResult.Columns
 	}
 
 	var mergedValues [][]string
@@ -86,14 +111,12 @@ func (rh *ReadHandler) handleJoinPatch(clientConn net.Conn, cl *core.Classificat
 	mergedNulls = append(mergedNulls, patchedNulls...)
 
 	// Step 7: Deduplicate by composite key (PK columns from ALL joined tables).
-	// Using all tables' PKs prevents false dedup on one-to-many JOINs where
-	// multiple rows share the same delta-table PK but differ in other table PKs.
-	allPKIndices := rh.findPKIndicesForTables(cl.Tables, columns)
-	mergedValues, mergedNulls = rh.dedupJoin(cl.Tables, allPKIndices, columns, mergedValues, mergedNulls)
+	allPKIndices := rh.findPKIndicesForTables(cl.Tables, resultColumns)
+	mergedValues, mergedNulls = rh.dedupJoin(cl.Tables, allPKIndices, resultColumns, mergedValues, mergedNulls)
 
 	// Step 8: Re-sort by ORDER BY.
 	if cl.OrderBy != "" {
-		sortMerged(columns, mergedValues, mergedNulls, cl.OrderBy)
+		sortMerged(resultColumns, mergedValues, mergedNulls, cl.OrderBy)
 	}
 
 	// Step 9: Apply LIMIT.
@@ -102,10 +125,7 @@ func (rh *ReadHandler) handleJoinPatch(clientConn net.Conn, cl *core.Classificat
 		mergedNulls = mergedNulls[:cl.Limit]
 	}
 
-	// Build and send response.
-	response := buildSelectResponse(columns, mergedValues, mergedNulls)
-	_, err = clientConn.Write(response)
-	return err
+	return resultColumns, mergedValues, mergedNulls, nil
 }
 
 type joinRowAction int

@@ -13,41 +13,67 @@ import (
 // handleMergedRead implements the single-table merged read algorithm.
 // Steps: Shadow query -> Prod query (over-fetched) -> filter -> adapt -> merge -> dedup -> sort -> limit -> respond.
 func (rh *ReadHandler) handleMergedRead(clientConn net.Conn, cl *core.Classification) error {
+	columns, values, nulls, err := rh.mergedReadCore(cl, cl.RawSQL)
+	if err != nil {
+		// Check if this is a relay error (raw response already sent).
+		if re, ok := err.(*relayError); ok {
+			_, writeErr := clientConn.Write(re.rawMsgs)
+			return writeErr
+		}
+		return err
+	}
+
+	response := buildSelectResponse(columns, values, nulls)
+	_, err = clientConn.Write(response)
+	return err
+}
+
+// relayError wraps raw backend response bytes for errors that should be
+// relayed directly to the client (e.g., Shadow/Prod query errors).
+type relayError struct {
+	rawMsgs []byte
+	msg     string
+}
+
+func (e *relayError) Error() string { return e.msg }
+
+// mergedReadCore performs the merged read algorithm and returns the result
+// without writing to the client. The querySQL parameter is the SQL to execute
+// (may differ from cl.RawSQL when parameters have been substituted).
+func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) (
+	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
+) {
 	if len(cl.Tables) == 0 {
-		return fmt.Errorf("merged read with no tables")
+		return nil, nil, nil, fmt.Errorf("merged read with no tables")
 	}
 	table := cl.Tables[0]
 
 	// Step 1: Execute query on Shadow verbatim.
-	shadowResult, err := execQuery(rh.shadowConn, cl.RawSQL)
+	shadowResult, err := execQuery(rh.shadowConn, querySQL)
 	if err != nil {
-		return fmt.Errorf("shadow query: %w", err)
+		return nil, nil, nil, fmt.Errorf("shadow query: %w", err)
 	}
 	if shadowResult.Error != "" {
-		// Relay Shadow's error response to client.
-		_, err := clientConn.Write(shadowResult.RawMsgs)
-		return err
+		return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
 	}
 
 	// Step 2: Execute query on Prod (with over-fetching for LIMIT queries).
-	prodSQL := cl.RawSQL
+	prodSQL := querySQL
 	if cl.HasLimit && cl.Limit > 0 {
 		deltaCount := rh.deltaMap.CountForTable(table)
 		tombstoneCount := rh.tombstones.CountForTable(table)
 		overfetch := deltaCount + tombstoneCount
 		if overfetch > 0 {
-			prodSQL = rewriteLimit(cl.RawSQL, cl.Limit+overfetch)
+			prodSQL = rewriteLimit(querySQL, cl.Limit+overfetch)
 		}
 	}
 
 	prodResult, err := execQuery(rh.prodConn, prodSQL)
 	if err != nil {
-		return fmt.Errorf("prod query: %w", err)
+		return nil, nil, nil, fmt.Errorf("prod query: %w", err)
 	}
 	if prodResult.Error != "" {
-		// Relay Prod's error response to client.
-		_, err := clientConn.Write(prodResult.RawMsgs)
-		return err
+		return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
 	}
 
 	// Step 3: Filter Prod results — remove delta and tombstoned rows.
@@ -77,10 +103,7 @@ func (rh *ReadHandler) handleMergedRead(clientConn net.Conn, cl *core.Classifica
 		mergedNulls = mergedNulls[:cl.Limit]
 	}
 
-	// Step 9: Build and send PG wire response.
-	response := buildSelectResponse(mergedColumns, mergedValues, mergedNulls)
-	_, err = clientConn.Write(response)
-	return err
+	return mergedColumns, mergedValues, mergedNulls, nil
 }
 
 // rewriteLimit replaces the LIMIT value in a SQL string.
