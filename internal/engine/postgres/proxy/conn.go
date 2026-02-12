@@ -272,6 +272,21 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		}
 	}
 
+	// Create a ReadHandler for merged reads.
+	var rh *ReadHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		rh = &ReadHandler{
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			connID:         connID,
+			verbose:        p.verbose,
+		}
+	}
+
 	for {
 		msg, err := readMsg(clientConn)
 		if err != nil {
@@ -302,6 +317,21 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 				if err := wh.HandleWrite(clientConn, msg.Raw, decision.classification, decision.strategy); err != nil {
 					if p.verbose {
 						log.Printf("[conn %d] write handler error: %v", connID, err)
+					}
+					return
+				}
+				continue
+			}
+		}
+
+		// Dispatch merged read strategies to ReadHandler when available.
+		if rh != nil && decision.classification != nil {
+			switch decision.strategy {
+			case core.StrategyMergedRead,
+				core.StrategyJoinPatch:
+				if err := rh.HandleRead(clientConn, msg.Raw, decision.classification, decision.strategy); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] read handler error: %v", connID, err)
 					}
 					return
 				}
@@ -389,8 +419,15 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 	case core.StrategyTransaction:
 		return routeDecision{target: targetBoth, strategy: strategy}
 
+	case core.StrategyMergedRead, core.StrategyJoinPatch:
+		return routeDecision{
+			target:         targetProd, // fallback if ReadHandler is nil
+			classification: classification,
+			strategy:       strategy,
+		}
+
 	default:
-		// ProdDirect, MergedRead (deferred), JoinPatch (deferred), Other
+		// ProdDirect, Other
 		return routeDecision{target: targetProd, strategy: strategy}
 	}
 }

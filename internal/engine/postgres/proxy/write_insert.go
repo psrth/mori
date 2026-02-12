@@ -1,10 +1,19 @@
 package proxy
 
-import "net"
+import (
+	"net"
+
+	"github.com/mori-dev/mori/internal/core"
+)
 
 // handleInsert executes an INSERT on Shadow and relays the response to the client.
-// No delta map update is needed — locally inserted rows are identified by their
-// PK being in the Shadow's sequence offset range (above Prod's max).
-func (w *WriteHandler) handleInsert(clientConn net.Conn, rawMsg []byte) error {
-	return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
+// Marks the target table as having inserts so the Router triggers merged reads.
+func (w *WriteHandler) handleInsert(clientConn net.Conn, rawMsg []byte, cl *core.Classification) error {
+	if err := forwardAndRelay(rawMsg, w.shadowConn, clientConn); err != nil {
+		return err
+	}
+	for _, table := range cl.Tables {
+		w.deltaMap.MarkInserted(table)
+	}
+	return nil
 }

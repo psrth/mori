@@ -177,9 +177,13 @@ func TestHandleInsert(t *testing.T) {
 		t.Error("expected non-empty response relayed to client")
 	}
 
-	// Delta map should NOT have any entries (INSERT doesn't track deltas).
+	// Delta map should NOT have per-PK entries (INSERT doesn't track individual deltas).
 	if wh.deltaMap.CountForTable("users") != 0 {
 		t.Errorf("delta map should be empty for INSERT, got %d entries", wh.deltaMap.CountForTable("users"))
+	}
+	// But the table should be marked as having inserts (for merged read routing).
+	if !wh.deltaMap.HasInserts("users") {
+		t.Error("delta map should mark users as having inserts")
 	}
 }
 
