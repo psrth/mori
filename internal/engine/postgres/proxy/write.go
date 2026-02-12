@@ -32,7 +32,7 @@ func (w *WriteHandler) HandleWrite(
 ) error {
 	switch strategy {
 	case core.StrategyShadowWrite:
-		return w.handleInsert(clientConn, rawMsg)
+		return w.handleInsert(clientConn, rawMsg, cl)
 	case core.StrategyHydrateAndWrite:
 		return w.handleUpdate(clientConn, rawMsg, cl)
 	case core.StrategyShadowDelete:

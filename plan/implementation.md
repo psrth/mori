@@ -271,9 +271,9 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 **Goal:** `mori init` connects to Prod, dumps schema, spins up a PG Shadow container, applies schema.
 
 **Build:**
-- `internal/engine/postgres/shadow/container.go` — Docker SDK:
+- `internal/engine/postgres/shadow/container.go` — Docker CLI:
   - Pull PG image (matching Prod version, or user-specified `--image`)
-  - Create container with random port mapping
+  - Create container with random port mapping, `POSTGRES_HOST_AUTH_METHOD=trust` (PG 16+ defaults to SCRAM-SHA-256 which the proxy's `connectShadow` doesn't support; trust auth is acceptable since Shadow is bound to 127.0.0.1 only)
   - Start container, wait for health check (`pg_isready`)
   - Stop and remove container
 - `internal/engine/postgres/schema/dumper.go`:
@@ -345,7 +345,8 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 - `internal/core/delta/map.go`:
   - Core data structure: `map[string]map[string]bool` (table → serialized_pk → exists)
   - Methods: `Add(table, pk)`, `Remove(table, pk)`, `IsDelta(table, pk) bool`, `DeltaPKs(table) []string`, `CountForTable(table) int`
-  - Thread-safe (sync.RWMutex)
+  - **Insert tracking**: `insertedTables map[string]bool` tracks tables that have had Shadow INSERTs (separate from per-PK deltas). Methods: `MarkInserted(table)`, `HasInserts(table)`, `InsertedTablesList()`, `LoadInsertedTables([]string)`. `AnyTableDelta()` checks both delta entries and inserted tables, so the Router triggers `MergedRead` for tables with inserts.
+  - Thread-safe (sync.RWMutex for pkSet, separate sync.RWMutex for insertedTables)
 - `internal/core/delta/tombstone.go`:
   - Same structure and API as DeltaMap
   - Methods: `Add(table, pk)`, `IsTombstoned(table, pk) bool`, `TombstonedPKs(table) []string`
@@ -354,8 +355,8 @@ Each phase produces something testable. Checkpoint at each phase before moving o
   - `Commit()` — promote staged entries to persistent state
   - `Rollback()` — discard staged entries
 - `internal/core/delta/store.go`:
-  - Serialize to JSON: `{"users": ["42", "108"], "orders": ["7"]}`
-  - Deserialize from JSON on startup
+  - Delta map format: `{"deltas": {"users": ["42", "108"]}, "inserted_tables": ["orders"]}` (backward-compatible: `ReadDeltaMap` falls back to legacy `map[string][]string` format)
+  - Tombstone format: `{"users": ["99"]}` (plain `map[string][]string`)
   - Persist to `.mori/delta.json` and `.mori/tombstones.json`
 - `internal/core/schema/registry.go`:
   - Per-table diffs: `map[string]TableDiff`
@@ -390,10 +391,10 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 **Goal:** Full write path with hydration, delta tracking, and tombstoning.
 
 **Build:**
-- `internal/engine/postgres/write/insert.go`:
-  - Execute INSERT on Shadow
+- `internal/engine/postgres/proxy/write_insert.go`:
+  - Execute INSERT on Shadow via `forwardAndRelay`
   - Return result (including RETURNING if present) to app
-  - No delta map update (row is Shadow-only)
+  - Mark table as having inserts via `deltaMap.MarkInserted(table)` so the Router triggers merged reads on subsequent SELECTs (no per-PK delta entry needed — the row only exists in Shadow)
 - `internal/engine/postgres/write/update.go`:
   - **Point update** (`WHERE pk = value`):
     1. Check if `(table, pk)` exists in Shadow
@@ -422,51 +423,64 @@ Each phase produces something testable. Checkpoint at each phase before moving o
 ### Phase 8: Merged Reads (Single Table)
 **Goal:** SELECTs on delta tables merge Shadow + Prod results.
 
-**Build:**
-- `internal/engine/postgres/merge/single.go`:
-  1. Execute query on Shadow → `R_shadow`
-  2. Execute query on Prod (with over-fetching for LIMIT queries) → `R_prod`
-  3. Filter `R_prod`: remove rows where PK is in delta map or tombstone set
-  4. Adapt `R_prod` for schema diffs (via Schema Registry): inject NULLs, strip columns, rename, cast
-  5. Merge `R_shadow` + filtered `R_prod`
-  6. Re-sort by original ORDER BY
-  7. Apply LIMIT/OFFSET to merged set
-  8. Return to app
-- Over-fetching logic:
-  - First attempt: `LIMIT N + |deltas| + |tombstones|`
-  - If result too short: retry with OFFSET, cap at 3 iterations
-- Update proxy connection to use MergeEngine when StrategyMergedRead
+**Status: IMPLEMENTED** (see `plan/logs.md` for integration test results)
 
-**Checkpoint:**
-1. Insert user locally, UPDATE another, DELETE a third
-2. `SELECT * FROM users ORDER BY id` → see Prod users + local insert + updated user from Shadow + deleted user absent
-3. `SELECT * FROM users WHERE active = true LIMIT 10` → merged results with correct filtering, ordering, and limit
-4. `SELECT count(*) FROM users` → correct count (Prod count - tombstones + local inserts)
+**Build:**
+- `internal/engine/postgres/proxy/read.go` — `ReadHandler` struct (mirrors `WriteHandler`), `HandleRead` dispatch
+- `internal/engine/postgres/proxy/read_single.go` — `handleMergedRead`:
+  1. Execute query on Shadow verbatim → `R_shadow`
+  2. Execute query on Prod (with over-fetching for LIMIT queries: `LIMIT N + |deltas| + |tombstones|`) → `R_prod`
+  3. Filter `R_prod`: remove rows where PK is in delta map or tombstone set
+  4. Adapt `R_prod` for schema diffs (via Schema Registry): inject NULLs for added columns, strip dropped columns, apply renames
+  5. Merge `R_shadow` + filtered/adapted `R_prod` (Shadow rows first for dedup priority)
+  6. Deduplicate by PK (Shadow version wins)
+  7. Re-sort by single-column ORDER BY (parsed via `parseSimpleOrderBy`, handles `col [ASC|DESC]`, strips trailing semicolons)
+  8. Apply LIMIT to merged set
+  9. Build synthesized PG wire response via `buildSelectResponse` and send to client
+- `internal/engine/postgres/proxy/pgwire.go` — production message builders: `buildPGMsg`, `buildRowDescMsg`, `buildDataRowMsg`, `buildCommandCompleteMsg`, `buildReadyForQueryMsg`, `buildSelectResponse`
+- `internal/engine/postgres/proxy/conn.go` — `ReadHandler` creation in `routeLoop`, dispatch for `StrategyMergedRead`/`StrategyJoinPatch`
+- `internal/engine/postgres/proxy/proxy.go` — added `schemaRegistry` field, updated `New()` signature
+- `cmd/mori/start.go` — loads SchemaRegistry, passes to `proxy.New()`
+
+**Checkpoint:** All verified via integration testing against real PostgreSQL (see `plan/logs.md`):
+1. Insert user locally, UPDATE another, DELETE a third ✅
+2. `SELECT * FROM users ORDER BY id` → merged view with correct data ✅
+3. `SELECT * FROM users ORDER BY name DESC` → correct descending sort ✅
+4. `SELECT * FROM users ORDER BY id LIMIT 2` → correct truncation ✅
+
+**Known v1 limitations:**
+- Multi-column ORDER BY not re-applied (only single-column sort)
+- `LIMIT $1` parameterized not rewritten
+- Aggregate queries (COUNT, SUM) run on both backends independently, returning multiple rows
 
 ---
 
 ### Phase 9: Merged Reads (JOINs)
 **Goal:** JOINs across delta and clean tables produce correct results.
 
-**Build:**
-- `internal/engine/postgres/merge/join.go`:
-  1. Execute JOIN on Prod → `R_prod`
-  2. For each row in `R_prod`, extract PKs for all delta tables
-  3. Check PKs against delta map and tombstone set
-  4. Remove rows with tombstoned PKs
-  5. For rows with delta PKs: fetch Shadow versions, replace delta columns
-  6. Re-evaluate WHERE clause for patched rows (drop rows that no longer match)
-  7. Execute same JOIN on Shadow → `R_shadow`
-  8. Merge patched `R_prod` + `R_shadow`, dedup by composite PK
-  9. Re-apply ORDER BY + LIMIT
-- PK extraction from JOIN results: need to know which columns in the result map to which table's PK (use table alias tracking from classifier)
+**Status: IMPLEMENTED** (see `plan/logs.md` for integration test results)
 
-**Checkpoint:**
-1. Delta a user (update name)
-2. `SELECT o.id, u.name FROM orders o JOIN users u ON o.user_id = u.id WHERE u.id = <delta_id>` → shows updated name from Shadow
-3. Insert a new user, insert an order for that user
-4. Same JOIN query → new user+order appears in results
-5. Tombstone a user → their orders disappear from JOIN results
+**Build:**
+- `internal/engine/postgres/proxy/read_join.go` — `handleJoinPatch`:
+  1. Identify delta tables (subset of `cl.Tables` with deltas/tombstones/inserts)
+  2. Execute JOIN on Prod → `R_prod`
+  3. Find PK column indices for each delta table in the result set
+  4. Classify each Prod row as clean / delta / dead
+  5. Patch delta rows: fetch Shadow version via `SELECT * FROM table WHERE pk = value`, replace matching columns
+  6. Execute same JOIN on Shadow → `R_shadow` (catches locally-inserted rows)
+  7. Merge: Shadow results first (priority) + patched Prod results
+  8. Deduplicate by composite key (PK columns from ALL joined tables). If PK column mapping is ambiguous (e.g., multiple tables with same-named "id" column mapping to same result column), falls back to full-row dedup to prevent false positive dedup on one-to-many JOINs.
+  9. Re-sort by ORDER BY + apply LIMIT
+
+**Checkpoint:** All verified via integration testing:
+1. Delta a user (update name) → JOIN shows updated name from Shadow ✅
+2. Tombstone a user → their orders disappear from JOIN results ✅
+3. One-to-many JOIN (user with 2 orders) → all rows preserved correctly ✅
+
+**Known v1 limitations:**
+- JOIN PK patching requires PK column in SELECT list (can't patch when PK is not selected)
+- WHERE not re-evaluated after patching JOIN rows
+- Multi-column ORDER BY not re-sorted
 
 ---
 
@@ -623,10 +637,13 @@ All state lives in `.mori/` as human-readable JSON:
 │     "orders": {"column": "id", "type": "bigserial", "prod_max": 612003, "shadow_start": 10000001}
 │   }
 │
-├── delta.json               # Delta map
+├── delta.json               # Delta map (with insert tracking)
 │   {
-│     "users": ["42", "108"],
-│     "orders": ["7"]
+│     "deltas": {
+│       "users": ["42", "108"],
+│       "orders": ["7"]
+│     },
+│     "inserted_tables": ["users"]
 │   }
 │
 ├── tombstones.json          # Tombstone set

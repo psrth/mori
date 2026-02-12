@@ -13,6 +13,7 @@ import (
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/core/delta"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/classify"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 	"github.com/mori-dev/mori/internal/engine/postgres/proxy"
@@ -105,15 +106,23 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("No existing tombstones found (starting clean): %v", err)
 	}
 
-	// 8. Create router.
+	// 8. Load schema registry.
+	var schemaReg *coreSchema.Registry
+	if sr, err := coreSchema.ReadRegistry(moriDir); err == nil {
+		schemaReg = sr
+	} else if verbose {
+		log.Printf("No existing schema registry found (starting clean): %v", err)
+	}
+
+	// 9. Create router.
 	router := core.NewRouter(deltaMap, tombstones)
 
-	// 9. Compute Shadow address.
+	// 10. Compute Shadow address.
 	shadowAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ShadowPort)
 
-	// 10. Create proxy.
+	// 11. Create proxy.
 	p := proxy.New(prodAddr, shadowAddr, dsn.DBName, port, verbose, classifier, router,
-		deltaMap, tombstones, tables, moriDir)
+		deltaMap, tombstones, tables, moriDir, schemaReg)
 
 	// 11. Set up signal handling.
 	ctx, cancel := context.WithCancel(cmd.Context())

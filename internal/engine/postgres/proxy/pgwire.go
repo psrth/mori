@@ -215,6 +215,86 @@ func quoteLiteral(s string) string {
 	return "'" + escaped + "'"
 }
 
+// buildPGMsg constructs a raw PG wire protocol message with type byte and payload.
+func buildPGMsg(msgType byte, payload []byte) []byte {
+	msgLen := 4 + len(payload)
+	raw := make([]byte, 1+4+len(payload))
+	raw[0] = msgType
+	binary.BigEndian.PutUint32(raw[1:5], uint32(msgLen))
+	copy(raw[5:], payload)
+	return raw
+}
+
+// buildRowDescMsg constructs a RowDescription ('T') message from column metadata.
+func buildRowDescMsg(columns []ColumnInfo) []byte {
+	var payload []byte
+	numFields := make([]byte, 2)
+	binary.BigEndian.PutUint16(numFields, uint16(len(columns)))
+	payload = append(payload, numFields...)
+
+	for _, col := range columns {
+		payload = append(payload, []byte(col.Name)...)
+		payload = append(payload, 0) // null terminator
+		// tableOID(4) + colNum(2) = 6 bytes (zeroed)
+		fieldMeta := make([]byte, 18)
+		// typeOID at offset 6
+		binary.BigEndian.PutUint32(fieldMeta[6:10], col.OID)
+		// typeLen(2) at offset 10, typeMod(4) at offset 12, format(2) at offset 16 — all zero
+		payload = append(payload, fieldMeta...)
+	}
+
+	return buildPGMsg('T', payload)
+}
+
+// buildDataRowMsg constructs a DataRow ('D') message from string values and null indicators.
+func buildDataRowMsg(values []string, nulls []bool) []byte {
+	var payload []byte
+	numCols := make([]byte, 2)
+	binary.BigEndian.PutUint16(numCols, uint16(len(values)))
+	payload = append(payload, numCols...)
+
+	for i, v := range values {
+		if nulls[i] {
+			lenBuf := make([]byte, 4)
+			binary.BigEndian.PutUint32(lenBuf, 0xFFFFFFFF) // -1 = NULL
+			payload = append(payload, lenBuf...)
+		} else {
+			data := []byte(v)
+			lenBuf := make([]byte, 4)
+			binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+			payload = append(payload, lenBuf...)
+			payload = append(payload, data...)
+		}
+	}
+
+	return buildPGMsg('D', payload)
+}
+
+// buildCommandCompleteMsg constructs a CommandComplete ('C') message.
+func buildCommandCompleteMsg(tag string) []byte {
+	payload := append([]byte(tag), 0)
+	return buildPGMsg('C', payload)
+}
+
+// buildReadyForQueryMsg constructs a ReadyForQuery ('Z') message with idle status.
+func buildReadyForQueryMsg() []byte {
+	return buildPGMsg('Z', []byte{'I'})
+}
+
+// buildSelectResponse constructs a complete PG SELECT response
+// (RowDescription + DataRows + CommandComplete + ReadyForQuery) from in-memory data.
+func buildSelectResponse(columns []ColumnInfo, rowValues [][]string, rowNulls [][]bool) []byte {
+	var buf []byte
+	buf = append(buf, buildRowDescMsg(columns)...)
+	for i := range rowValues {
+		buf = append(buf, buildDataRowMsg(rowValues[i], rowNulls[i])...)
+	}
+	tag := fmt.Sprintf("SELECT %d", len(rowValues))
+	buf = append(buf, buildCommandCompleteMsg(tag)...)
+	buf = append(buf, buildReadyForQueryMsg()...)
+	return buf
+}
+
 // buildInsertSQL constructs an INSERT statement from column metadata and values.
 // Uses ON CONFLICT DO NOTHING to handle concurrent/duplicate hydration.
 func buildInsertSQL(table string, columns []ColumnInfo, values []string, nulls []bool) string {
