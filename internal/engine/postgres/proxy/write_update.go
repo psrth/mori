@@ -49,13 +49,21 @@ func (w *WriteHandler) handleUpdate(
 		return err
 	}
 
-	// Update delta map for all PKs and persist.
+	// Update delta map for all PKs.
 	for _, pk := range cl.PKs {
-		w.deltaMap.Add(pk.Table, pk.PK)
+		if w.inTxn() {
+			w.deltaMap.Stage(pk.Table, pk.PK)
+		} else {
+			w.deltaMap.Add(pk.Table, pk.PK)
+		}
 	}
-	if err := delta.WriteDeltaMap(w.moriDir, w.deltaMap); err != nil {
-		if w.verbose {
-			log.Printf("[conn %d] failed to persist delta map: %v", w.connID, err)
+
+	// Only persist immediately in autocommit mode; txn commit handles persistence.
+	if !w.inTxn() {
+		if err := delta.WriteDeltaMap(w.moriDir, w.deltaMap); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] failed to persist delta map: %v", w.connID, err)
+			}
 		}
 	}
 

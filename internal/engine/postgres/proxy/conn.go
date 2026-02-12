@@ -299,6 +299,25 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		}
 	}
 
+	// Create a TxnHandler for coordinated transaction control.
+	var txh *TxnHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		txh = &TxnHandler{
+			prodConn:   prodConn,
+			shadowConn: shadowConn,
+			deltaMap:   p.deltaMap,
+			tombstones: p.tombstones,
+			moriDir:    p.moriDir,
+			connID:     connID,
+			verbose:    p.verbose,
+		}
+	}
+
+	// Link TxnHandler to WriteHandler for staged delta awareness.
+	if wh != nil && txh != nil {
+		wh.txnHandler = txh
+	}
+
 	for {
 		msg, err := readMsg(clientConn)
 		if err != nil {
@@ -356,6 +375,17 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			if err := ddh.HandleDDL(clientConn, msg.Raw, decision.classification); err != nil {
 				if p.verbose {
 					log.Printf("[conn %d] DDL handler error: %v", connID, err)
+				}
+				return
+			}
+			continue
+		}
+
+		// Dispatch transaction control to TxnHandler when available.
+		if txh != nil && decision.classification != nil && decision.strategy == core.StrategyTransaction {
+			if err := txh.HandleTxn(clientConn, msg.Raw, decision.classification); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] txn handler error: %v", connID, err)
 				}
 				return
 			}
@@ -444,7 +474,7 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 		}
 
 	case core.StrategyTransaction:
-		return routeDecision{target: targetBoth, strategy: strategy}
+		return routeDecision{target: targetBoth, classification: classification, strategy: strategy}
 
 	case core.StrategyMergedRead, core.StrategyJoinPatch:
 		return routeDecision{
