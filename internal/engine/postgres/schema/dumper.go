@@ -3,7 +3,6 @@ package schema
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -60,17 +59,20 @@ func DetectExtensions(ctx context.Context, conn *pgx.Conn) ([]Extension, error) 
 	return exts, rows.Err()
 }
 
-// DumpSchema shells out to pg_dump --schema-only against the Prod database.
-func DumpSchema(ctx context.Context, dsn *connstr.ProdDSN) (string, error) {
-	pgDump, err := exec.LookPath("pg_dump")
-	if err != nil {
-		return "", fmt.Errorf("pg_dump not found on PATH — install PostgreSQL client tools (e.g., 'brew install postgresql' or 'apt install postgresql-client')")
+// DumpSchema runs pg_dump --schema-only against the Prod database.
+// It runs pg_dump inside a Docker container using the given image to guarantee
+// version parity with the production server.
+func DumpSchema(ctx context.Context, dsn *connstr.ProdDSN, image string) (string, error) {
+	args := []string{
+		"run", "--rm",
+		"-e", "PGPASSWORD=" + dsn.Password,
+		"--add-host", "host.docker.internal:host-gateway",
+		image,
+		"pg_dump",
 	}
+	args = append(args, dsn.PgDumpDockerArgs()...)
 
-	args := dsn.PgDumpArgs()
-	cmd := exec.CommandContext(ctx, pgDump, args...)
-	cmd.Env = append(os.Environ(), dsn.PgDumpEnv())
-
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -88,6 +90,16 @@ var fkRegex = regexp.MustCompile(`(?im)^ALTER TABLE\s+(?:ONLY\s+)?[\w."]+\s+ADD\
 // StripForeignKeys removes all FK constraint definitions from a schema dump.
 func StripForeignKeys(schemaSQL string) string {
 	return fkRegex.ReplaceAllString(schemaSQL, "")
+}
+
+// psqlMetaRegex matches psql metacommands (lines starting with \) that appear
+// in pg_dump output (e.g., \restrict, \unrestrict, \connect). These are not
+// valid SQL and must be stripped before executing via pgx.
+var psqlMetaRegex = regexp.MustCompile(`(?m)^\\[a-zA-Z].*\n?`)
+
+// StripPsqlMeta removes psql metacommands from a schema dump.
+func StripPsqlMeta(schemaSQL string) string {
+	return psqlMetaRegex.ReplaceAllString(schemaSQL, "")
 }
 
 // InstallExtensions connects to Shadow and installs each extension.
@@ -345,17 +357,19 @@ func ApplySequenceOffsets(ctx context.Context, shadowConnStr string, offsets map
 }
 
 // FullDump performs the complete schema dump pipeline from Prod.
-func FullDump(ctx context.Context, conn *pgx.Conn, dsn *connstr.ProdDSN) (*DumpResult, error) {
+// The image parameter specifies which Docker image to use for pg_dump.
+func FullDump(ctx context.Context, conn *pgx.Conn, dsn *connstr.ProdDSN, image string) (*DumpResult, error) {
 	exts, err := DetectExtensions(ctx, conn)
 	if err != nil {
 		return nil, fmt.Errorf("extension detection failed: %w", err)
 	}
 
-	schemaSQL, err := DumpSchema(ctx, dsn)
+	schemaSQL, err := DumpSchema(ctx, dsn, image)
 	if err != nil {
 		return nil, fmt.Errorf("schema dump failed: %w", err)
 	}
 	schemaSQL = StripForeignKeys(schemaSQL)
+	schemaSQL = StripPsqlMeta(schemaSQL)
 
 	tables, err := DetectTableMetadata(ctx, conn)
 	if err != nil {

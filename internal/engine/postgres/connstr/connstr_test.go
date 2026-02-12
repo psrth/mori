@@ -136,6 +136,37 @@ func TestPgDumpArgs(t *testing.T) {
 	}
 }
 
+func TestDockerHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want string
+	}{
+		{"localhost", "host.docker.internal"},
+		{"127.0.0.1", "host.docker.internal"},
+		{"prod-host.example.com", "prod-host.example.com"},
+		{"10.0.0.5", "10.0.0.5"},
+	}
+	for _, tt := range tests {
+		dsn := &ProdDSN{Host: tt.host}
+		got := dsn.DockerHost()
+		if got != tt.want {
+			t.Errorf("DockerHost() for %q = %q, want %q", tt.host, got, tt.want)
+		}
+	}
+}
+
+func TestPgDumpDockerArgs(t *testing.T) {
+	dsn, _ := Parse("postgres://alice:secret@localhost:5433/mydb")
+	args := dsn.PgDumpDockerArgs()
+	// Should use host.docker.internal instead of localhost
+	if args[1] != "host.docker.internal" {
+		t.Errorf("PgDumpDockerArgs host = %q, want %q", args[1], "host.docker.internal")
+	}
+	if args[3] != "5433" {
+		t.Errorf("PgDumpDockerArgs port = %q, want %q", args[3], "5433")
+	}
+}
+
 func TestConnString(t *testing.T) {
 	dsn, _ := Parse("postgres://alice:secret@prod-host:5433/mydb?sslmode=require")
 	s := dsn.ConnString()

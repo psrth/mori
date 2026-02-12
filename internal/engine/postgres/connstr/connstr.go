@@ -140,6 +140,29 @@ func (d *ProdDSN) PgDumpArgs() []string {
 	}
 }
 
+// DockerHost returns the hostname to use when connecting from inside a Docker
+// container. Translates localhost/127.0.0.1 to host.docker.internal.
+func (d *ProdDSN) DockerHost() string {
+	if d.Host == "localhost" || d.Host == "127.0.0.1" {
+		return "host.docker.internal"
+	}
+	return d.Host
+}
+
+// PgDumpDockerArgs returns pg_dump arguments suitable for running inside a
+// Docker container, using DockerHost() for the host.
+func (d *ProdDSN) PgDumpDockerArgs() []string {
+	return []string{
+		"-h", d.DockerHost(),
+		"-p", strconv.Itoa(d.Port),
+		"-U", d.User,
+		"-d", d.DBName,
+		"--schema-only",
+		"--no-owner",
+		"--no-privileges",
+	}
+}
+
 // PgDumpEnv returns the environment variable for pg_dump password.
 func (d *ProdDSN) PgDumpEnv() string {
 	return "PGPASSWORD=" + d.Password
