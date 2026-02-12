@@ -120,7 +120,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		ShadowImage:     imageName,
 		Engine:          "postgres",
 		EngineVersion:   version.Full,
-		ProxyPort:       5432,
+		ProxyPort:       9002,
 		Extensions:      extensionNames(dumpResult.Extensions),
 		InitializedAt:   time.Now(),
 	}
