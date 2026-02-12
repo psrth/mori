@@ -79,6 +79,35 @@ func TestStripForeignKeysNoFK(t *testing.T) {
 	}
 }
 
+func TestStripPsqlMeta(t *testing.T) {
+	input := `\restrict abc123
+SET statement_timeout = 0;
+CREATE TABLE users (id serial PRIMARY KEY);
+\unrestrict abc123
+`
+	result := StripPsqlMeta(input)
+	if contains(result, `\restrict`) {
+		t.Error(`\restrict was not removed`)
+	}
+	if contains(result, `\unrestrict`) {
+		t.Error(`\unrestrict was not removed`)
+	}
+	if !contains(result, "SET statement_timeout") {
+		t.Error("SET statement was incorrectly removed")
+	}
+	if !contains(result, "CREATE TABLE users") {
+		t.Error("CREATE TABLE was incorrectly removed")
+	}
+}
+
+func TestStripPsqlMetaNoMeta(t *testing.T) {
+	input := `CREATE TABLE users (id serial PRIMARY KEY);`
+	result := StripPsqlMeta(input)
+	if result != input {
+		t.Errorf("input was modified when no metacommands present:\n%s", result)
+	}
+}
+
 func TestComputeOffset(t *testing.T) {
 	tests := []struct {
 		prodMax int64

@@ -95,7 +95,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 
 	// 6. Dump production schema
 	fmt.Println("Dumping production schema...")
-	dumpResult, err := schema.FullDump(ctx, prodConn, dsn)
+	dumpResult, err := schema.FullDump(ctx, prodConn, dsn, imageName)
 	if err != nil {
 		initErr = err
 		return nil, err
