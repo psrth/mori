@@ -237,6 +237,14 @@ const (
 	targetBoth
 )
 
+// routeDecision captures the routing target along with classification details
+// needed by write path handlers.
+type routeDecision struct {
+	target         routeTarget
+	classification *core.Classification // nil for non-Query messages
+	strategy       core.RoutingStrategy
+}
+
 // routeLoop is the main query routing loop for a connection.
 func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int64) {
 	var closeOnce sync.Once
@@ -248,6 +256,21 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		})
 	}
 	defer closeAll()
+
+	// Create a WriteHandler for this connection if write-path state is available.
+	var wh *WriteHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		wh = &WriteHandler{
+			prodConn:   prodConn,
+			shadowConn: shadowConn,
+			deltaMap:   p.deltaMap,
+			tombstones: p.tombstones,
+			tables:     p.tables,
+			moriDir:    p.moriDir,
+			connID:     connID,
+			verbose:    p.verbose,
+		}
+	}
 
 	for {
 		msg, err := readMsg(clientConn)
@@ -268,9 +291,25 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			return
 		}
 
-		target := p.classifyAndRoute(msg, connID)
+		decision := p.classifyAndRoute(msg, connID)
 
-		switch target {
+		// Dispatch write strategies to WriteHandler when available.
+		if wh != nil && decision.classification != nil {
+			switch decision.strategy {
+			case core.StrategyShadowWrite,
+				core.StrategyHydrateAndWrite,
+				core.StrategyShadowDelete:
+				if err := wh.HandleWrite(clientConn, msg.Raw, decision.classification, decision.strategy); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] write handler error: %v", connID, err)
+					}
+					return
+				}
+				continue
+			}
+		}
+
+		switch decision.target {
 		case targetProd:
 			if err := forwardAndRelay(msg.Raw, prodConn, clientConn); err != nil {
 				if p.verbose {
@@ -307,15 +346,15 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 }
 
 // classifyAndRoute determines which backend should handle this message.
-func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeTarget {
+func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 	// Only classify Query ('Q') messages.
 	if msg.Type != 'Q' {
-		return targetProd
+		return routeDecision{target: targetProd}
 	}
 
 	sql := querySQL(msg.Payload)
 	if sql == "" {
-		return targetProd
+		return routeDecision{target: targetProd}
 	}
 
 	classification, err := p.classifier.Classify(sql)
@@ -323,7 +362,7 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeTarget {
 		if p.verbose {
 			log.Printf("[conn %d] classify error, forwarding to prod: %v", connID, err)
 		}
-		return targetProd
+		return routeDecision{target: targetProd}
 	}
 
 	strategy := p.router.Route(classification)
@@ -336,17 +375,23 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeTarget {
 
 	switch strategy {
 	case core.StrategyShadowWrite,
-		core.StrategyShadowDDL,
-		core.StrategyShadowDelete,
-		core.StrategyHydrateAndWrite:
-		return targetShadow
+		core.StrategyHydrateAndWrite,
+		core.StrategyShadowDelete:
+		return routeDecision{
+			target:         targetShadow,
+			classification: classification,
+			strategy:       strategy,
+		}
+
+	case core.StrategyShadowDDL:
+		return routeDecision{target: targetShadow, strategy: strategy}
 
 	case core.StrategyTransaction:
-		return targetBoth
+		return routeDecision{target: targetBoth, strategy: strategy}
 
 	default:
 		// ProdDirect, MergedRead (deferred), JoinPatch (deferred), Other
-		return targetProd
+		return routeDecision{target: targetProd, strategy: strategy}
 	}
 }
 
