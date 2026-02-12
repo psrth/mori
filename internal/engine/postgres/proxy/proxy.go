@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 
 	"github.com/mori-dev/mori/internal/core"
+	"github.com/mori-dev/mori/internal/core/delta"
+	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 )
 
 // Proxy is a protocol-aware PostgreSQL proxy that classifies queries and
@@ -24,6 +26,11 @@ type Proxy struct {
 	port         int
 	verbose      bool
 
+	deltaMap   *delta.Map
+	tombstones *delta.TombstoneSet
+	tables     map[string]schema.TableMeta
+	moriDir    string
+
 	listenerMu sync.Mutex
 	listener   net.Listener
 
@@ -35,8 +42,13 @@ type Proxy struct {
 
 // New creates a Proxy. If shadowAddr is empty or classifier/router is nil,
 // the proxy operates in pass-through mode (all traffic goes to Prod).
+// deltaMap, tombstones, tables, and moriDir enable write-path tracking;
+// pass nil/empty to disable.
 func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool,
-	classifier core.Classifier, router *core.Router) *Proxy {
+	classifier core.Classifier, router *core.Router,
+	deltaMap *delta.Map, tombstones *delta.TombstoneSet,
+	tables map[string]schema.TableMeta, moriDir string,
+) *Proxy {
 	return &Proxy{
 		prodAddr:     prodAddr,
 		shadowAddr:   shadowAddr,
@@ -45,6 +57,10 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		router:       router,
 		port:         listenPort,
 		verbose:      verbose,
+		deltaMap:     deltaMap,
+		tombstones:   tombstones,
+		tables:       tables,
+		moriDir:      moriDir,
 		shutdownCh:   make(chan struct{}),
 	}
 }

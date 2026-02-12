@@ -112,7 +112,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 	shadowAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ShadowPort)
 
 	// 10. Create proxy.
-	p := proxy.New(prodAddr, shadowAddr, dsn.DBName, port, verbose, classifier, router)
+	p := proxy.New(prodAddr, shadowAddr, dsn.DBName, port, verbose, classifier, router,
+		deltaMap, tombstones, tables, moriDir)
 
 	// 11. Set up signal handling.
 	ctx, cancel := context.WithCancel(cmd.Context())
