@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strconv"
+	"syscall"
 
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/spf13/cobra"
@@ -36,9 +39,29 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("Engine:       %s %s\n", cfg.Engine, cfg.EngineVersion)
-	fmt.Printf("Prod:         %s (read-only)\n", cfg.ProdConnection)
+	fmt.Printf("Prod:         %s (read-only)\n", cfg.RedactedProdConnection())
 	fmt.Printf("Shadow:       localhost:%d\n", cfg.ShadowPort)
-	fmt.Printf("Proxy:        localhost:%d\n", cfg.ProxyPort)
+
+	// Show proxy running state.
+	pidPath := config.PidFilePath(projectRoot)
+	if data, err := os.ReadFile(pidPath); err == nil {
+		if pid, err := strconv.Atoi(string(data)); err == nil {
+			if proc, err := os.FindProcess(pid); err == nil {
+				if err := proc.Signal(syscall.Signal(0)); err == nil {
+					fmt.Printf("Proxy:        localhost:%d (running, PID %d)\n", cfg.ProxyPort, pid)
+				} else {
+					fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
+				}
+			} else {
+				fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
+			}
+		} else {
+			fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
+		}
+	} else {
+		fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
+	}
+
 	fmt.Printf("Initialized:  %s\n", cfg.InitializedAt.Format("2006-01-02 15:04:05"))
 
 	return nil
