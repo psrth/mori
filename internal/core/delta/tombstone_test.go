@@ -84,6 +84,26 @@ func TestTombstoneTables(t *testing.T) {
 	}
 }
 
+func TestAnyTableTombstone(t *testing.T) {
+	ts := NewTombstoneSet()
+	ts.Add("users", "1")
+
+	if !ts.AnyTableTombstone([]string{"users"}) {
+		t.Error("AnyTableTombstone([users]) = false, want true")
+	}
+	if ts.AnyTableTombstone([]string{"orders"}) {
+		t.Error("AnyTableTombstone([orders]) = true, want false")
+	}
+	if !ts.AnyTableTombstone([]string{"orders", "users"}) {
+		t.Error("AnyTableTombstone([orders, users]) = false, want true")
+	}
+
+	empty := NewTombstoneSet()
+	if empty.AnyTableTombstone([]string{"users"}) {
+		t.Error("AnyTableTombstone on empty set = true, want false")
+	}
+}
+
 func TestTombstoneSnapshotAndLoad(t *testing.T) {
 	ts := NewTombstoneSet()
 	ts.Add("users", "1")

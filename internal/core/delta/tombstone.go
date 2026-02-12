@@ -26,6 +26,16 @@ func (t *TombstoneSet) CountForTable(table string) int { return t.s.countForTabl
 // Tables returns all table names that have tombstone entries, sorted.
 func (t *TombstoneSet) Tables() []string { return t.s.tables() }
 
+// AnyTableTombstone reports whether any of the given tables have at least one tombstone entry.
+func (t *TombstoneSet) AnyTableTombstone(tables []string) bool {
+	for _, tbl := range tables {
+		if t.s.countForTable(tbl) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // Stage adds (table, pk) to the per-transaction staging buffer.
 func (t *TombstoneSet) Stage(table, pk string) { t.s.stage(table, pk) }
 
