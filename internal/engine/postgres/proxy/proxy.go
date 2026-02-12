@@ -10,6 +10,7 @@ import (
 
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 )
 
@@ -26,10 +27,11 @@ type Proxy struct {
 	port         int
 	verbose      bool
 
-	deltaMap   *delta.Map
-	tombstones *delta.TombstoneSet
-	tables     map[string]schema.TableMeta
-	moriDir    string
+	deltaMap        *delta.Map
+	tombstones      *delta.TombstoneSet
+	tables          map[string]schema.TableMeta
+	schemaRegistry  *coreSchema.Registry
+	moriDir         string
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -48,20 +50,22 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	classifier core.Classifier, router *core.Router,
 	deltaMap *delta.Map, tombstones *delta.TombstoneSet,
 	tables map[string]schema.TableMeta, moriDir string,
+	schemaRegistry *coreSchema.Registry,
 ) *Proxy {
 	return &Proxy{
-		prodAddr:     prodAddr,
-		shadowAddr:   shadowAddr,
-		shadowDBName: shadowDBName,
-		classifier:   classifier,
-		router:       router,
-		port:         listenPort,
-		verbose:      verbose,
-		deltaMap:     deltaMap,
-		tombstones:   tombstones,
-		tables:       tables,
-		moriDir:      moriDir,
-		shutdownCh:   make(chan struct{}),
+		prodAddr:       prodAddr,
+		shadowAddr:     shadowAddr,
+		shadowDBName:   shadowDBName,
+		classifier:     classifier,
+		router:         router,
+		port:           listenPort,
+		verbose:        verbose,
+		deltaMap:       deltaMap,
+		tombstones:     tombstones,
+		tables:         tables,
+		schemaRegistry: schemaRegistry,
+		moriDir:        moriDir,
+		shutdownCh:     make(chan struct{}),
 	}
 }
 
