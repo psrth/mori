@@ -9,6 +9,7 @@ import (
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/logging"
 )
 
 // ReadHandler encapsulates merged read logic for a single connection.
@@ -23,6 +24,7 @@ type ReadHandler struct {
 	schemaRegistry *coreSchema.Registry
 	connID         int64
 	verbose        bool
+	logger         *logging.Logger
 }
 
 // HandleRead dispatches a read operation based on the routing strategy.

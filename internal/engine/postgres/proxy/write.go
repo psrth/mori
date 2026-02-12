@@ -7,6 +7,7 @@ import (
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/logging"
 )
 
 // WriteHandler encapsulates write path logic for a single connection.
@@ -20,6 +21,7 @@ type WriteHandler struct {
 	moriDir    string
 	connID     int64
 	verbose    bool
+	logger     *logging.Logger
 	txnHandler *TxnHandler // nil when no TxnHandler; used to check inTxn state
 }
 

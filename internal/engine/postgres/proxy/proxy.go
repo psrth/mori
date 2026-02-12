@@ -12,6 +12,7 @@ import (
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/logging"
 )
 
 // Proxy is a protocol-aware PostgreSQL proxy that classifies queries and
@@ -32,6 +33,7 @@ type Proxy struct {
 	tables          map[string]schema.TableMeta
 	schemaRegistry  *coreSchema.Registry
 	moriDir         string
+	logger          *logging.Logger
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -51,6 +53,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	deltaMap *delta.Map, tombstones *delta.TombstoneSet,
 	tables map[string]schema.TableMeta, moriDir string,
 	schemaRegistry *coreSchema.Registry,
+	logger *logging.Logger,
 ) *Proxy {
 	return &Proxy{
 		prodAddr:       prodAddr,
@@ -65,6 +68,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		tables:         tables,
 		schemaRegistry: schemaRegistry,
 		moriDir:        moriDir,
+		logger:         logger,
 		shutdownCh:     make(chan struct{}),
 	}
 }
@@ -136,8 +140,10 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	select {
 	case <-done:
 		log.Println("All connections drained. Proxy stopped.")
+		p.logger.Close()
 		return nil
 	case <-ctx.Done():
+		p.logger.Close()
 		return ctx.Err()
 	}
 }

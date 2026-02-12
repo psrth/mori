@@ -16,6 +16,10 @@ const (
 	ConfigFile = "config.json"
 	// PidFile is the name of the proxy PID file.
 	PidFile = "proxy.pid"
+	// LogDir is the subdirectory for log files within .mori/.
+	LogDir = "log"
+	// LogFile is the name of the structured query log file.
+	LogFile = "mori.log"
 )
 
 // Config holds all Mori project configuration.
@@ -45,6 +49,11 @@ func ConfigFilePath(projectRoot string) string {
 // PidFilePath returns the absolute path to the proxy PID file.
 func PidFilePath(projectRoot string) string {
 	return filepath.Join(projectRoot, MoriDir, PidFile)
+}
+
+// LogFilePath returns the absolute path to the structured query log file.
+func LogFilePath(projectRoot string) string {
+	return filepath.Join(projectRoot, MoriDir, LogDir, LogFile)
 }
 
 // IsInitialized checks whether a .mori/config.json file exists

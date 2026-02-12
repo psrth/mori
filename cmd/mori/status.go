@@ -2,11 +2,11 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"strconv"
-	"syscall"
 
 	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/mori-dev/mori/internal/core/delta"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/spf13/cobra"
 )
 
@@ -38,31 +38,90 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to read config: %w", err)
 	}
 
+	// Connection info.
 	fmt.Printf("Engine:       %s %s\n", cfg.Engine, cfg.EngineVersion)
 	fmt.Printf("Prod:         %s (read-only)\n", cfg.RedactedProdConnection())
 	fmt.Printf("Shadow:       localhost:%d\n", cfg.ShadowPort)
 
-	// Show proxy running state.
+	// Proxy running state.
 	pidPath := config.PidFilePath(projectRoot)
-	if data, err := os.ReadFile(pidPath); err == nil {
-		if pid, err := strconv.Atoi(string(data)); err == nil {
-			if proc, err := os.FindProcess(pid); err == nil {
-				if err := proc.Signal(syscall.Signal(0)); err == nil {
-					fmt.Printf("Proxy:        localhost:%d (running, PID %d)\n", cfg.ProxyPort, pid)
-				} else {
-					fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
-				}
-			} else {
-				fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
-			}
-		} else {
-			fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
-		}
+	if pid, running := isProxyRunning(pidPath); running {
+		fmt.Printf("Proxy:        localhost:%d (running, PID %d)\n", cfg.ProxyPort, pid)
 	} else {
 		fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
 	}
 
-	fmt.Printf("Initialized:  %s\n", cfg.InitializedAt.Format("2006-01-02 15:04:05"))
+	moriDir := config.MoriDirPath(projectRoot)
+
+	// Delta Rows.
+	if dm, err := delta.ReadDeltaMap(moriDir); err == nil {
+		tables := dm.Tables()
+		insertedTables := dm.InsertedTablesList()
+		if len(tables) > 0 || len(insertedTables) > 0 {
+			fmt.Println("\nDelta Rows:")
+			shown := make(map[string]bool)
+			for _, t := range tables {
+				count := dm.CountForTable(t)
+				fmt.Printf("  %-20s %d %s\n", t, count, pluralize(count, "row", "rows"))
+				shown[t] = true
+			}
+			for _, t := range insertedTables {
+				if !shown[t] {
+					fmt.Printf("  %-20s (inserts)\n", t)
+				}
+			}
+		} else {
+			fmt.Println("\nDelta Rows:   (none)")
+		}
+	} else {
+		fmt.Println("\nDelta Rows:   (none)")
+	}
+
+	// Tombstones.
+	if ts, err := delta.ReadTombstoneSet(moriDir); err == nil {
+		tables := ts.Tables()
+		if len(tables) > 0 {
+			fmt.Println("\nTombstones:")
+			for _, t := range tables {
+				count := ts.CountForTable(t)
+				fmt.Printf("  %-20s %d %s\n", t, count, pluralize(count, "row", "rows"))
+			}
+		} else {
+			fmt.Println("\nTombstones:   (none)")
+		}
+	} else {
+		fmt.Println("\nTombstones:   (none)")
+	}
+
+	// Schema Diffs.
+	if sr, err := coreSchema.ReadRegistry(moriDir); err == nil {
+		tables := sr.Tables()
+		if len(tables) > 0 {
+			fmt.Println("\nSchema Diffs:")
+			for _, t := range tables {
+				diff := sr.GetDiff(t)
+				fmt.Printf("  %-20s %s\n", t, formatSchemaDiff(diff))
+			}
+		} else {
+			fmt.Println("\nSchema Diffs: (none)")
+		}
+	} else {
+		fmt.Println("\nSchema Diffs: (none)")
+	}
+
+	// Sequence Offsets.
+	if seqs, err := schema.ReadSequences(moriDir); err == nil && len(seqs) > 0 {
+		fmt.Println("\nSequence Offsets:")
+		for tableName, offset := range seqs {
+			label := tableName + "." + offset.Column
+			fmt.Printf("  %-20s start=%s (prod max: %s)\n",
+				label,
+				formatNumber(offset.ShadowStart),
+				formatNumber(offset.ProdMax))
+		}
+	} else {
+		fmt.Println("\nSequence Offsets: (none)")
+	}
 
 	return nil
 }
