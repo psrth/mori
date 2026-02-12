@@ -9,6 +9,7 @@ import (
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/logging"
 )
 
 // ExtHandler processes extended query protocol batches for a single connection.
@@ -25,6 +26,7 @@ type ExtHandler struct {
 	moriDir        string
 	connID         int64
 	verbose        bool
+	logger         *logging.Logger
 
 	txnHandler   *TxnHandler
 	writeHandler *WriteHandler
@@ -144,6 +146,8 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) error {
 			eh.connID, cl.OpType, cl.SubType,
 			cl.Tables, strategy, truncateSQL(eh.batchSQL, 80))
 	}
+
+	eh.logger.Query(eh.connID, eh.batchSQL, cl, strategy, 0)
 
 	switch strategy {
 	case core.StrategyProdDirect:

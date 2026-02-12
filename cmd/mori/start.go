@@ -18,6 +18,7 @@ import (
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 	"github.com/mori-dev/mori/internal/engine/postgres/proxy"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/logging"
 	"github.com/spf13/cobra"
 )
 
@@ -120,9 +121,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 10. Compute Shadow address.
 	shadowAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ShadowPort)
 
+	// 10b. Create structured logger.
+	var logger *logging.Logger
+	if l, err := logging.New(config.LogFilePath(projectRoot)); err != nil {
+		log.Printf("Warning: could not create log file: %v (structured logging disabled)", err)
+	} else {
+		logger = l
+	}
+
 	// 11. Create proxy.
 	p := proxy.New(prodAddr, shadowAddr, dsn.DBName, port, verbose, classifier, router,
-		deltaMap, tombstones, tables, moriDir, schemaReg)
+		deltaMap, tombstones, tables, moriDir, schemaReg, logger)
 
 	// 11. Set up signal handling.
 	ctx, cancel := context.WithCancel(cmd.Context())

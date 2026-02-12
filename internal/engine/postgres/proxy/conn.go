@@ -269,6 +269,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			moriDir:    p.moriDir,
 			connID:     connID,
 			verbose:    p.verbose,
+			logger:     p.logger,
 		}
 	}
 
@@ -284,6 +285,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			schemaRegistry: p.schemaRegistry,
 			connID:         connID,
 			verbose:        p.verbose,
+			logger:         p.logger,
 		}
 	}
 
@@ -296,6 +298,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			moriDir:        p.moriDir,
 			connID:         connID,
 			verbose:        p.verbose,
+			logger:         p.logger,
 		}
 	}
 
@@ -310,6 +313,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			moriDir:    p.moriDir,
 			connID:     connID,
 			verbose:    p.verbose,
+			logger:     p.logger,
 		}
 	}
 
@@ -333,6 +337,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			moriDir:        p.moriDir,
 			connID:         connID,
 			verbose:        p.verbose,
+			logger:         p.logger,
 			txnHandler:     txh,
 			writeHandler:   wh,
 			readHandler:    rh,
@@ -476,6 +481,8 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 		return routeDecision{target: targetProd}
 	}
 
+	start := time.Now()
+
 	classification, err := p.classifier.Classify(sql)
 	if err != nil {
 		if p.verbose {
@@ -485,12 +492,15 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 	}
 
 	strategy := p.router.Route(classification)
+	elapsed := time.Since(start)
 
 	if p.verbose {
 		log.Printf("[conn %d] %s/%s tables=%v → %s | %s",
 			connID, classification.OpType, classification.SubType,
 			classification.Tables, strategy, truncateSQL(sql, 100))
 	}
+
+	p.logger.Query(connID, sql, classification, strategy, elapsed)
 
 	switch strategy {
 	case core.StrategyShadowWrite,

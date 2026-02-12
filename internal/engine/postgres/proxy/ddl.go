@@ -7,6 +7,7 @@ import (
 
 	"github.com/mori-dev/mori/internal/core"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/mori-dev/mori/internal/logging"
 )
 
 // DDLHandler handles DDL operations for a single connection.
@@ -17,6 +18,7 @@ type DDLHandler struct {
 	moriDir        string
 	connID         int64
 	verbose        bool
+	logger         *logging.Logger
 }
 
 // HandleDDL executes a DDL statement on Shadow and updates the schema registry.
@@ -86,29 +88,34 @@ func (dh *DDLHandler) applyChange(ch ddlChange) {
 		if dh.verbose {
 			log.Printf("[conn %d] schema registry: ADD COLUMN %s.%s (%s)", dh.connID, ch.Table, ch.Column, ch.ColType)
 		}
+		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("ADD COLUMN %s.%s (%s)", ch.Table, ch.Column, ch.ColType))
 
 	case ddlDropColumn:
 		dh.schemaRegistry.RecordDropColumn(ch.Table, ch.Column)
 		if dh.verbose {
 			log.Printf("[conn %d] schema registry: DROP COLUMN %s.%s", dh.connID, ch.Table, ch.Column)
 		}
+		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("DROP COLUMN %s.%s", ch.Table, ch.Column))
 
 	case ddlRenameColumn:
 		dh.schemaRegistry.RecordRenameColumn(ch.Table, ch.OldName, ch.NewName)
 		if dh.verbose {
 			log.Printf("[conn %d] schema registry: RENAME COLUMN %s.%s → %s", dh.connID, ch.Table, ch.OldName, ch.NewName)
 		}
+		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("RENAME COLUMN %s.%s -> %s", ch.Table, ch.OldName, ch.NewName))
 
 	case ddlAlterType:
 		dh.schemaRegistry.RecordTypeChange(ch.Table, ch.Column, ch.OldType, ch.NewType)
 		if dh.verbose {
 			log.Printf("[conn %d] schema registry: ALTER TYPE %s.%s → %s", dh.connID, ch.Table, ch.Column, ch.NewType)
 		}
+		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("ALTER TYPE %s.%s -> %s", ch.Table, ch.Column, ch.NewType))
 
 	case ddlDropTable:
 		if dh.verbose {
 			log.Printf("[conn %d] schema registry: DROP TABLE %s (informational)", dh.connID, ch.Table)
 		}
+		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("DROP TABLE %s", ch.Table))
 	}
 }
 

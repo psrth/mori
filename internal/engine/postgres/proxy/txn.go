@@ -7,6 +7,7 @@ import (
 
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
+	"github.com/mori-dev/mori/internal/logging"
 )
 
 // TxnHandler manages transaction state for a single connection.
@@ -20,6 +21,7 @@ type TxnHandler struct {
 	moriDir    string
 	connID     int64
 	verbose    bool
+	logger     *logging.Logger
 	inTxn      bool
 }
 
@@ -78,6 +80,7 @@ func (th *TxnHandler) handleBegin(clientConn net.Conn, rawMsg []byte) error {
 		if th.verbose {
 			log.Printf("[conn %d] BEGIN: Shadow=ok Prod=REPEATABLE READ", th.connID)
 		}
+		th.logger.Event(th.connID, "txn", "BEGIN")
 	}
 
 	return nil
@@ -119,6 +122,7 @@ func (th *TxnHandler) handleCommit(clientConn net.Conn, rawMsg []byte) error {
 		if th.verbose {
 			log.Printf("[conn %d] COMMIT: staged deltas promoted", th.connID)
 		}
+		th.logger.Event(th.connID, "txn", "COMMIT: staged deltas promoted")
 	} else {
 		// An error occurred — discard staged entries.
 		th.deltaMap.Rollback()
@@ -127,6 +131,7 @@ func (th *TxnHandler) handleCommit(clientConn net.Conn, rawMsg []byte) error {
 			log.Printf("[conn %d] COMMIT failed (shadow=%v prod=%v): staged deltas discarded",
 				th.connID, shadowHadError, prodHadError)
 		}
+		th.logger.Event(th.connID, "txn", "COMMIT failed: staged deltas discarded")
 	}
 
 	return nil
@@ -153,6 +158,7 @@ func (th *TxnHandler) handleRollback(clientConn net.Conn, rawMsg []byte) error {
 	if th.verbose {
 		log.Printf("[conn %d] ROLLBACK: staged deltas discarded", th.connID)
 	}
+	th.logger.Event(th.connID, "txn", "ROLLBACK")
 
 	return nil
 }
