@@ -318,6 +318,28 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		wh.txnHandler = txh
 	}
 
+	// Create an ExtHandler for extended query protocol (Parse/Bind/Execute/...).
+	var eh *ExtHandler
+	if p.classifier != nil && p.router != nil {
+		eh = &ExtHandler{
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			classifier:     p.classifier,
+			router:         p.router,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			txnHandler:     txh,
+			writeHandler:   wh,
+			readHandler:    rh,
+			stmtCache:      make(map[string]string),
+		}
+	}
+
 	for {
 		msg, err := readMsg(clientConn)
 		if err != nil {
@@ -335,6 +357,20 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 				log.Printf("[conn %d] terminated", connID)
 			}
 			return
+		}
+
+		// Extended query protocol: accumulate messages, dispatch on Sync.
+		if isExtendedProtocolMsg(msg.Type) && eh != nil {
+			eh.Accumulate(msg)
+			if msg.Type == 'S' { // Sync triggers batch processing.
+				if err := eh.FlushBatch(clientConn); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] extended query error: %v", connID, err)
+					}
+					return
+				}
+			}
+			continue
 		}
 
 		decision := p.classifyAndRoute(msg, connID)

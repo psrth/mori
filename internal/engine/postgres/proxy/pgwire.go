@@ -281,10 +281,45 @@ func buildReadyForQueryMsg() []byte {
 	return buildPGMsg('Z', []byte{'I'})
 }
 
+// buildParseCompleteMsg constructs a ParseComplete ('1') message.
+func buildParseCompleteMsg() []byte {
+	return buildPGMsg('1', nil)
+}
+
+// buildBindCompleteMsg constructs a BindComplete ('2') message.
+func buildBindCompleteMsg() []byte {
+	return buildPGMsg('2', nil)
+}
+
+// buildNoDataMsg constructs a NoData ('n') message.
+func buildNoDataMsg() []byte {
+	return buildPGMsg('n', nil)
+}
+
 // buildSelectResponse constructs a complete PG SELECT response
 // (RowDescription + DataRows + CommandComplete + ReadyForQuery) from in-memory data.
 func buildSelectResponse(columns []ColumnInfo, rowValues [][]string, rowNulls [][]bool) []byte {
 	var buf []byte
+	buf = append(buf, buildRowDescMsg(columns)...)
+	for i := range rowValues {
+		buf = append(buf, buildDataRowMsg(rowValues[i], rowNulls[i])...)
+	}
+	tag := fmt.Sprintf("SELECT %d", len(rowValues))
+	buf = append(buf, buildCommandCompleteMsg(tag)...)
+	buf = append(buf, buildReadyForQueryMsg()...)
+	return buf
+}
+
+// buildExtSelectResponse constructs a complete extended query protocol SELECT response:
+// ParseComplete + BindComplete + RowDescription + DataRows + CommandComplete + ReadyForQuery.
+func buildExtSelectResponse(hasParse, hasBind bool, columns []ColumnInfo, rowValues [][]string, rowNulls [][]bool) []byte {
+	var buf []byte
+	if hasParse {
+		buf = append(buf, buildParseCompleteMsg()...)
+	}
+	if hasBind {
+		buf = append(buf, buildBindCompleteMsg()...)
+	}
 	buf = append(buf, buildRowDescMsg(columns)...)
 	for i := range rowValues {
 		buf = append(buf, buildDataRowMsg(rowValues[i], rowNulls[i])...)
