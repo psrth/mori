@@ -31,21 +31,29 @@ func (w *WriteHandler) handleDelete(
 		return nil
 	}
 
-	// Add tombstones and remove from delta map.
+	// Add tombstones; conditionally remove from delta map.
 	for _, pk := range cl.PKs {
-		w.tombstones.Add(pk.Table, pk.PK)
-		w.deltaMap.Remove(pk.Table, pk.PK)
-	}
-
-	// Persist both.
-	if err := delta.WriteTombstoneSet(w.moriDir, w.tombstones); err != nil {
-		if w.verbose {
-			log.Printf("[conn %d] failed to persist tombstone set: %v", w.connID, err)
+		if w.inTxn() {
+			w.tombstones.Stage(pk.Table, pk.PK)
+			// Skip deltaMap.Remove() in txn: staged tombstone handles
+			// filtering via has() which checks both committed and staged.
+		} else {
+			w.tombstones.Add(pk.Table, pk.PK)
+			w.deltaMap.Remove(pk.Table, pk.PK)
 		}
 	}
-	if err := delta.WriteDeltaMap(w.moriDir, w.deltaMap); err != nil {
-		if w.verbose {
-			log.Printf("[conn %d] failed to persist delta map: %v", w.connID, err)
+
+	// Only persist immediately in autocommit mode; txn commit handles persistence.
+	if !w.inTxn() {
+		if err := delta.WriteTombstoneSet(w.moriDir, w.tombstones); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] failed to persist tombstone set: %v", w.connID, err)
+			}
+		}
+		if err := delta.WriteDeltaMap(w.moriDir, w.deltaMap); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] failed to persist delta map: %v", w.connID, err)
+			}
 		}
 	}
 

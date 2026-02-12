@@ -20,6 +20,12 @@ type WriteHandler struct {
 	moriDir    string
 	connID     int64
 	verbose    bool
+	txnHandler *TxnHandler // nil when no TxnHandler; used to check inTxn state
+}
+
+// inTxn reports whether this connection is inside an explicit transaction.
+func (w *WriteHandler) inTxn() bool {
+	return w.txnHandler != nil && w.txnHandler.InTxn()
 }
 
 // HandleWrite dispatches a write operation based on the routing strategy.
