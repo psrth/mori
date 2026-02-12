@@ -7,16 +7,25 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+
+	"github.com/mori-dev/mori/internal/core"
 )
 
-// Proxy is a transparent TCP relay between PostgreSQL clients and a
-// production database. It accepts connections on a local port and
-// forwards all bytes to prodAddr without modification.
+// Proxy is a protocol-aware PostgreSQL proxy that classifies queries and
+// routes them to either the production database or the local Shadow database.
+// If shadowAddr is empty or classifier/router is nil, it operates in
+// pass-through mode (all traffic goes to Prod).
 type Proxy struct {
-	prodAddr string
-	listener net.Listener
-	port     int
-	verbose  bool
+	prodAddr     string
+	shadowAddr   string          // empty = Shadow unavailable
+	shadowDBName string          // database name for Shadow startup
+	classifier   core.Classifier // nil = pass-through mode
+	router       *core.Router    // nil = pass-through mode
+	port         int
+	verbose      bool
+
+	listenerMu sync.Mutex
+	listener   net.Listener
 
 	activeConns sync.WaitGroup
 	connCount   atomic.Int64
@@ -24,14 +33,19 @@ type Proxy struct {
 	once        sync.Once
 }
 
-// New creates a Proxy that will relay connections to prodAddr.
-// prodAddr must be in "host:port" format.
-func New(prodAddr string, listenPort int, verbose bool) *Proxy {
+// New creates a Proxy. If shadowAddr is empty or classifier/router is nil,
+// the proxy operates in pass-through mode (all traffic goes to Prod).
+func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool,
+	classifier core.Classifier, router *core.Router) *Proxy {
 	return &Proxy{
-		prodAddr:   prodAddr,
-		port:       listenPort,
-		verbose:    verbose,
-		shutdownCh: make(chan struct{}),
+		prodAddr:     prodAddr,
+		shadowAddr:   shadowAddr,
+		shadowDBName: shadowDBName,
+		classifier:   classifier,
+		router:       router,
+		port:         listenPort,
+		verbose:      verbose,
+		shutdownCh:   make(chan struct{}),
 	}
 }
 
@@ -43,8 +57,15 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
+	p.listenerMu.Lock()
 	p.listener = ln
-	log.Printf("Mori proxy listening on %s → %s", ln.Addr().String(), p.prodAddr)
+	p.listenerMu.Unlock()
+
+	if p.canRoute() {
+		log.Printf("Mori proxy listening on %s → prod=%s shadow=%s", ln.Addr().String(), p.prodAddr, p.shadowAddr)
+	} else {
+		log.Printf("Mori proxy listening on %s → %s (pass-through)", ln.Addr().String(), p.prodAddr)
+	}
 
 	// Close the listener when context is done or shutdown is signalled.
 	go func() {
@@ -79,8 +100,11 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.once.Do(func() { close(p.shutdownCh) })
 
-	if p.listener != nil {
-		p.listener.Close()
+	p.listenerMu.Lock()
+	ln := p.listener
+	p.listenerMu.Unlock()
+	if ln != nil {
+		ln.Close()
 	}
 
 	done := make(chan struct{})
@@ -100,8 +124,16 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 
 // Addr returns the listener's address, or "" if not yet listening.
 func (p *Proxy) Addr() string {
-	if p.listener == nil {
+	p.listenerMu.Lock()
+	ln := p.listener
+	p.listenerMu.Unlock()
+	if ln == nil {
 		return ""
 	}
-	return p.listener.Addr().String()
+	return ln.Addr().String()
+}
+
+// canRoute reports whether the proxy has all dependencies for query routing.
+func (p *Proxy) canRoute() bool {
+	return p.shadowAddr != "" && p.classifier != nil && p.router != nil
 }

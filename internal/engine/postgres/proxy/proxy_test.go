@@ -52,7 +52,7 @@ func TestProxyRelay(t *testing.T) {
 	echoAddr, cleanup := startEchoServer(t)
 	defer cleanup()
 
-	p := New(echoAddr, 0, false)
+	p := New(echoAddr, "", "", 0, false, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -88,7 +88,7 @@ func TestProxyRelay(t *testing.T) {
 
 func TestProxyProdUnreachable(t *testing.T) {
 	// Point proxy at a port that's not listening.
-	p := New("127.0.0.1:1", 0, false)
+	p := New("127.0.0.1:1", "", "", 0, false, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -134,7 +134,7 @@ func TestProxyShutdownDrains(t *testing.T) {
 		}
 	}()
 
-	p := New(ln.Addr().String(), 0, false)
+	p := New(ln.Addr().String(), "", "", 0, false, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -171,7 +171,7 @@ func TestProxyConcurrentConns(t *testing.T) {
 	echoAddr, cleanup := startEchoServer(t)
 	defer cleanup()
 
-	p := New(echoAddr, 0, false)
+	p := New(echoAddr, "", "", 0, false, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
