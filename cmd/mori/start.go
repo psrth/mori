@@ -24,6 +24,7 @@ import (
 	"github.com/spf13/cobra"
 
 	// Register engine implementations via side-effect imports.
+	_ "github.com/mori-dev/mori/internal/engine/mysql"
 	_ "github.com/mori-dev/mori/internal/engine/postgres"
 )
 

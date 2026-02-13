@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/charmbracelet/huh v0.8.0
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/mark3labs/mcp-go v0.43.2
 	github.com/pganalyze/pg_query_go/v6 v6.2.2
@@ -12,6 +13,7 @@ require (
 )
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
