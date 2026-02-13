@@ -30,18 +30,38 @@ const (
 	tnsControl   byte = 14
 )
 
-// readTNSPacket reads a single TNS packet from the reader.
+// readTNSPacket reads a single TNS packet using the pre-handshake 2-byte length format.
 func readTNSPacket(r io.Reader) (*tnsMsg, error) {
+	return readTNSPacketWith(r, false)
+}
+
+// readTNSPacketV2 reads a single TNS packet using the post-handshake 4-byte length
+// format (used when the negotiated TNS version >= 315, e.g. Oracle 12c+).
+func readTNSPacketV2(r io.Reader) (*tnsMsg, error) {
+	return readTNSPacketWith(r, true)
+}
+
+// readTNSPacketWith reads a single TNS packet. When use32bitLen is true the packet
+// length occupies the first 4 bytes of the header (post-handshake, version >= 315);
+// otherwise the classic 2-byte length at bytes [0:2] is used.
+func readTNSPacketWith(r io.Reader, use32bitLen bool) (*tnsMsg, error) {
 	var header [8]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, err
 	}
 
-	packetLen := int(binary.BigEndian.Uint16(header[0:2]))
+	var packetLen int
+	if use32bitLen {
+		packetLen = int(binary.BigEndian.Uint32(header[0:4]))
+	} else {
+		packetLen = int(binary.BigEndian.Uint16(header[0:2]))
+	}
 	packetType := header[4]
 
+	log.Printf("[tns] readPacket: use32bit=%v header=%x packetLen=%d type=%d", use32bitLen, header, packetLen, packetType)
+
 	if packetLen < 8 {
-		return nil, fmt.Errorf("invalid TNS packet length: %d", packetLen)
+		return nil, fmt.Errorf("invalid TNS packet length: %d (header=%x, use32bit=%v)", packetLen, header, use32bitLen)
 	}
 
 	payloadLen := packetLen - 8
@@ -70,18 +90,28 @@ func writeTNSPacket(w io.Writer, packetType byte, payload []byte) error {
 	return err
 }
 
-// buildTNSPacket constructs a raw TNS packet.
+// buildTNSPacket constructs a raw TNS packet using 2-byte length (pre-handshake).
 func buildTNSPacket(packetType byte, payload []byte) []byte {
+	return buildTNSPacketWith(packetType, payload, false)
+}
+
+// buildTNSPacketV2 constructs a raw TNS packet using 4-byte length (post-handshake, version >= 315).
+func buildTNSPacketV2(packetType byte, payload []byte) []byte {
+	return buildTNSPacketWith(packetType, payload, true)
+}
+
+// buildTNSPacketWith constructs a raw TNS packet. When use32bitLen is true the
+// packet length is written as a 4-byte big-endian value; otherwise 2-byte.
+func buildTNSPacketWith(packetType byte, payload []byte, use32bitLen bool) []byte {
 	pktLen := 8 + len(payload)
 	raw := make([]byte, pktLen)
-	binary.BigEndian.PutUint16(raw[0:2], uint16(pktLen))
-	// Checksum = 0.
-	raw[2] = 0
-	raw[3] = 0
+	if use32bitLen {
+		binary.BigEndian.PutUint32(raw[0:4], uint32(pktLen))
+	} else {
+		binary.BigEndian.PutUint16(raw[0:2], uint16(pktLen))
+	}
 	raw[4] = packetType
-	// Reserved = 0.
 	raw[5] = 0
-	// Header checksum = 0.
 	raw[6] = 0
 	raw[7] = 0
 	copy(raw[8:], payload)
@@ -89,14 +119,23 @@ func buildTNSPacket(packetType byte, payload []byte) []byte {
 }
 
 // buildTNSRefuse constructs a TNS Refuse packet with an error message.
+// useV2 selects the 4-byte length framing used post-handshake (version >= 315).
 func buildTNSRefuse(message string) []byte {
+	return buildTNSRefuseWith(message, false)
+}
+
+func buildTNSRefuseV2(message string) []byte {
+	return buildTNSRefuseWith(message, true)
+}
+
+func buildTNSRefuseWith(message string, use32bitLen bool) []byte {
 	// Refuse packet payload: reason(1) + data length(2) + data
 	msgBytes := []byte(message)
 	payload := make([]byte, 3+len(msgBytes))
 	payload[0] = 1 // User reason.
 	binary.BigEndian.PutUint16(payload[1:3], uint16(len(msgBytes)))
 	copy(payload[3:], msgBytes)
-	return buildTNSPacket(tnsRefuse, payload)
+	return buildTNSPacketWith(tnsRefuse, payload, use32bitLen)
 }
 
 // extractQueryFromTNSData attempts to extract SQL text from a TNS Data packet payload.

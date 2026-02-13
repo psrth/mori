@@ -78,7 +78,7 @@ func runTests(m *testing.M) int {
 	proxyDSN = fmt.Sprintf("oracle://%s:%s@127.0.0.1:%d/%s", dbUser, dbPass, proxyPort, serviceName)
 
 	fmt.Println("SETUP: Waiting for Oracle to be ready (this may take a while)...")
-	if err := waitForOracle(prodDSN, 120*time.Second); err != nil {
+	if err := waitForOracle(prodDSN, 300*time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "SETUP: Oracle not ready: %v\n", err)
 		return 1
 	}

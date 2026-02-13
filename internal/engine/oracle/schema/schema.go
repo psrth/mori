@@ -18,9 +18,10 @@ type DumpResult struct {
 func DumpSchema(ctx context.Context, db *sql.DB, schemaName string) (string, error) {
 	upperSchema := strings.ToUpper(schemaName)
 
-	// Get all base tables owned by the schema.
+	// Get all base tables owned by the schema, excluding Oracle internal/system
+	// tables (which contain '$' in their names) and recyclebin objects ('BIN$%').
 	rows, err := db.QueryContext(ctx,
-		`SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :1 ORDER BY TABLE_NAME`,
+		`SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :1 AND TABLE_NAME NOT LIKE 'BIN$%' AND TABLE_NAME NOT LIKE '%$%' ORDER BY TABLE_NAME`,
 		upperSchema)
 	if err != nil {
 		return "", fmt.Errorf("failed to query tables: %w", err)
@@ -161,7 +162,7 @@ func generateSequenceDDL(ctx context.Context, db *sql.DB, owner string) (string,
 	rows, err := db.QueryContext(ctx, `
 		SELECT SEQUENCE_NAME, MIN_VALUE, MAX_VALUE, INCREMENT_BY, LAST_NUMBER
 		FROM ALL_SEQUENCES
-		WHERE SEQUENCE_OWNER = :1
+		WHERE SEQUENCE_OWNER = :1 AND SEQUENCE_NAME NOT LIKE '%$%'
 		ORDER BY SEQUENCE_NAME`, owner)
 	if err != nil {
 		return "", err
@@ -171,11 +172,12 @@ func generateSequenceDDL(ctx context.Context, db *sql.DB, owner string) (string,
 	var ddls []string
 	for rows.Next() {
 		var seqName string
-		var minVal, maxVal, incBy, lastNum int64
+		var minVal, maxVal string
+		var incBy, lastNum int64
 		if err := rows.Scan(&seqName, &minVal, &maxVal, &incBy, &lastNum); err != nil {
 			return "", err
 		}
-		ddl := fmt.Sprintf("CREATE SEQUENCE %s START WITH %d INCREMENT BY %d MINVALUE %d MAXVALUE %d;",
+		ddl := fmt.Sprintf("CREATE SEQUENCE %s START WITH %d INCREMENT BY %d MINVALUE %s MAXVALUE %s;",
 			seqName, lastNum, incBy, minVal, maxVal)
 		ddls = append(ddls, ddl)
 	}
@@ -201,7 +203,7 @@ func DetectTableMetadata(ctx context.Context, db *sql.DB, schemaName string) (ma
 	upperSchema := strings.ToUpper(schemaName)
 
 	rows, err := db.QueryContext(ctx,
-		`SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :1 AND TABLE_NAME NOT LIKE 'BIN$%' ORDER BY TABLE_NAME`,
+		`SELECT TABLE_NAME FROM ALL_TABLES WHERE OWNER = :1 AND TABLE_NAME NOT LIKE 'BIN$%' AND TABLE_NAME NOT LIKE '%$%' ORDER BY TABLE_NAME`,
 		upperSchema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tables: %w", err)

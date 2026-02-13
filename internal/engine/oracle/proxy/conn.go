@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -51,7 +53,8 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	}
 
 	// Relay TNS handshake between client and prod.
-	if err := relayTNSHandshake(clientConn, prodConn); err != nil {
+	useV2, err := relayTNSHandshake(clientConn, prodConn)
+	if err != nil {
 		log.Printf("[conn %d] TNS handshake failed: %v", connID, err)
 		clientConn.Close()
 		prodConn.Close()
@@ -59,70 +62,120 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	}
 
 	guardedProd := NewSafeProdConn(prodConn, connID, p.verbose, p.logger)
-	p.routeLoop(clientConn, guardedProd, connID)
+	p.routeLoop(clientConn, guardedProd, connID, useV2)
 }
 
 // relayTNSHandshake relays the TNS connection handshake between client and production.
 // TNS handshake flow:
-// 1. Client -> Server: Connect packet
+// 1. Client -> Server: Connect packet (+ optional Data packet for large connect strings)
 // 2. Server -> Client: Accept/Refuse/Redirect packet
 // 3. If Redirect: follow redirect
 // After Accept, authentication proceeds over Data packets.
-func relayTNSHandshake(clientConn, prodConn net.Conn) error {
-	// 1. Read Connect from client.
-	connectPkt, err := readTNSPacket(clientConn)
+func relayTNSHandshake(clientConn, prodConn net.Conn) (useV2 bool, err error) {
+	// 1. Read Connect from client and forward to prod.
+	connectPkt, connectDataPkt, err := relayConnectPackets(clientConn, prodConn)
 	if err != nil {
-		return err
-	}
-
-	// Forward to prod.
-	if _, err := prodConn.Write(connectPkt.Raw); err != nil {
-		return err
+		return false, err
 	}
 
 	// 2. Read response from prod.
 	for {
 		respPkt, err := readTNSPacket(prodConn)
 		if err != nil {
-			return err
-		}
-
-		// Forward to client.
-		if _, err := clientConn.Write(respPkt.Raw); err != nil {
-			return err
+			return false, err
 		}
 
 		switch respPkt.PacketType {
 		case tnsAccept:
-			return nil
-		case tnsRefuse:
-			return io.EOF
-		case tnsRedirect:
-			// Redirect: client sends a new Connect.
-			newConnect, err := readTNSPacket(clientConn)
-			if err != nil {
-				return err
+			// Forward Accept to client.
+			if _, err := clientConn.Write(respPkt.Raw); err != nil {
+				return false, err
 			}
-			if _, err := prodConn.Write(newConnect.Raw); err != nil {
-				return err
+			// Parse negotiated TNS version from Accept payload.
+			// Accept payload layout: version(2 BE) + service_options(2) + ...
+			// When version >= 315, post-handshake packets use 4-byte lengths.
+			if len(respPkt.Payload) >= 2 {
+				version := binary.BigEndian.Uint16(respPkt.Payload[0:2])
+				useV2 = version >= 315
+				log.Printf("[handshake] Accept: TNS version=%d, useV2=%v, payload_len=%d", version, useV2, len(respPkt.Payload))
+			}
+			return useV2, nil
+		case tnsRefuse:
+			// Forward Refuse to client.
+			if _, err := clientConn.Write(respPkt.Raw); err != nil {
+				return false, err
+			}
+			return false, io.EOF
+		case tnsRedirect:
+			// Forward Redirect to client, then read new Connect.
+			if _, err := clientConn.Write(respPkt.Raw); err != nil {
+				return false, err
+			}
+			connectPkt, connectDataPkt, err = relayConnectPackets(clientConn, prodConn)
+			if err != nil {
+				return false, err
 			}
 			continue
 		case tnsResend:
-			// Server wants the Connect packet again.
+			// Server wants the Connect packet again. Do NOT forward the Resend
+			// to the client — the go-ora driver would resend its packets into our
+			// buffer, corrupting the post-handshake stream. Instead, replay our
+			// saved copies directly to prod.
 			if _, err := prodConn.Write(connectPkt.Raw); err != nil {
-				return err
+				return false, err
+			}
+			if connectDataPkt != nil {
+				if _, err := prodConn.Write(connectDataPkt.Raw); err != nil {
+					return false, err
+				}
 			}
 			continue
 		default:
 			// Other packet types during handshake — relay to client and continue.
+			if _, err := clientConn.Write(respPkt.Raw); err != nil {
+				return false, err
+			}
 			continue
 		}
 	}
 }
 
+// relayConnectPackets reads a Connect packet from the client, forwards it to prod,
+// and handles the two-packet Connect flow used by go-ora when the connect string
+// exceeds 230 bytes. In that case the Connect packet is exactly 70 bytes (the fixed
+// header size) and the connect data follows in a separate Data packet.
+// Returns the Connect packet and the optional Data packet (nil if single-packet flow).
+func relayConnectPackets(clientConn, prodConn net.Conn) (connectPkt, dataPkt *tnsMsg, err error) {
+	connectPkt, err = readTNSPacket(clientConn)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if _, err = prodConn.Write(connectPkt.Raw); err != nil {
+		return nil, nil, err
+	}
+
+	// go-ora sends connect data in a separate Data packet when the connect
+	// string exceeds 230 bytes. The Connect packet is exactly 70 bytes (its
+	// fixed header: 8-byte TNS header + 62-byte connect-specific fields).
+	// We must relay that Data packet before prod will respond.
+	if connectPkt.PacketType == tnsConnect && len(connectPkt.Raw) == 70 {
+		dataPkt, err = readTNSPacket(clientConn)
+		if err != nil {
+			return nil, nil, fmt.Errorf("reading connect data packet: %w", err)
+		}
+		if _, err = prodConn.Write(dataPkt.Raw); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return connectPkt, dataPkt, nil
+}
+
 // routeLoop is the main query routing loop for a connection.
 // It relays TNS Data packets between client and prod, intercepting SQL for classification.
-func (p *Proxy) routeLoop(clientConn, prodConn net.Conn, connID int64) {
+// useV2 indicates post-handshake 4-byte length framing (TNS version >= 315).
+func (p *Proxy) routeLoop(clientConn, prodConn net.Conn, connID int64, useV2 bool) {
 	var closeOnce sync.Once
 	closeAll := func() {
 		closeOnce.Do(func() {
@@ -131,6 +184,17 @@ func (p *Proxy) routeLoop(clientConn, prodConn net.Conn, connID int64) {
 		})
 	}
 	defer closeAll()
+
+	// Select the correct packet reader for the negotiated TNS version.
+	readPkt := readTNSPacket
+	buildRefuse := buildTNSRefuse
+	if useV2 {
+		readPkt = readTNSPacketV2
+		buildRefuse = buildTNSRefuseV2
+	}
+	if p.verbose {
+		log.Printf("[conn %d] routeLoop started, useV2=%v", connID, useV2)
+	}
 
 	// After the TNS handshake, authentication and subsequent communication happens
 	// over TNS Data packets. We relay all packets, inspecting Data packets for SQL.
@@ -146,10 +210,16 @@ func (p *Proxy) routeLoop(clientConn, prodConn net.Conn, connID int64) {
 	// Client -> Prod (with classification and guard).
 	go func() {
 		for {
-			pkt, err := readTNSPacket(clientConn)
+			pkt, err := readPkt(clientConn)
 			if err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] client->prod read error: %v", connID, err)
+				}
 				errCh <- err
 				return
+			}
+			if p.verbose {
+				log.Printf("[conn %d] client->prod: type=%d len=%d", connID, pkt.PacketType, len(pkt.Raw))
 			}
 
 			if pkt.PacketType == tnsData && len(pkt.Payload) > 0 {
@@ -163,8 +233,8 @@ func (p *Proxy) routeLoop(clientConn, prodConn net.Conn, connID int64) {
 						(decision.classification.OpType == core.OpWrite || decision.classification.OpType == core.OpDDL) {
 						log.Printf("[CRITICAL] [conn %d] WRITE GUARD L3: %s/%s reached targetProd — BLOCKED",
 							connID, decision.classification.OpType, decision.classification.SubType)
-						// Send a TNS Data packet with error back to client.
-						errMsg := buildTNSRefuse("mori: write operation blocked — internal routing error detected")
+						// Send a TNS Refuse packet with error back to client.
+						errMsg := buildRefuse("mori: write operation blocked — internal routing error detected")
 						clientConn.Write(errMsg)
 						continue
 					}
@@ -185,10 +255,19 @@ func (p *Proxy) routeLoop(clientConn, prodConn net.Conn, connID int64) {
 		for {
 			n, err := prodConn.Read(buf)
 			if err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] prod->client read error: %v", connID, err)
+				}
 				errCh <- err
 				return
 			}
+			if p.verbose {
+				log.Printf("[conn %d] prod->client: %d bytes", connID, n)
+			}
 			if _, err := clientConn.Write(buf[:n]); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] prod->client write error: %v", connID, err)
+				}
 				errCh <- err
 				return
 			}
