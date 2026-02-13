@@ -109,7 +109,7 @@ func runTests(m *testing.M) int {
 	// Allow extra time because engine Init creates a Shadow container
 	// and Oracle under emulation (ARM) is slow to start.
 	fmt.Println("SETUP: Waiting for proxy to be ready (may take a few minutes for Shadow init)...")
-	if err := waitForOracle(proxyDSN, 300*time.Second); err != nil {
+	if err := waitForOracle(proxyDSN, 540*time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "SETUP: proxy not ready: %v\n", err)
 		return 1
 	}

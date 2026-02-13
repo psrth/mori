@@ -91,7 +91,10 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 	if err != nil {
 		return nil, fmt.Errorf("failed to create container: %s", strings.TrimSpace(string(out)))
 	}
-	containerID := strings.TrimSpace(string(out))
+	// Extract only the last non-empty line as the container ID.
+	// CombinedOutput may include Docker warnings (e.g., platform mismatch)
+	// before the actual container ID on stdout.
+	containerID := extractContainerID(string(out))
 
 	if err := m.WaitReady(ctx, containerID, password); err != nil {
 		m.StopAndRemove(ctx, containerID)
@@ -204,6 +207,19 @@ func (m *Manager) IsRunning(ctx context.Context, containerIDOrName string) (bool
 		return false, fmt.Errorf("failed to inspect container: %s", strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)) == "true", nil
+}
+
+// extractContainerID extracts the container ID from docker run output.
+// On ARM hosts, docker may prepend a platform mismatch WARNING before the ID.
+func extractContainerID(output string) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return line
+		}
+	}
+	return strings.TrimSpace(output)
 }
 
 func generateContainerName() (string, error) {

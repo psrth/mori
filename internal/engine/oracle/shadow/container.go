@@ -75,7 +75,7 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 
 	hostPort := cfg.HostPort
 	if hostPort == 0 {
-		hostPort = 9001
+		hostPort = 9002
 	}
 	portMapping := fmt.Sprintf("127.0.0.1:%d:1521", hostPort)
 
@@ -91,7 +91,10 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 	if err != nil {
 		return nil, fmt.Errorf("failed to create container: %s", strings.TrimSpace(string(out)))
 	}
-	containerID := strings.TrimSpace(string(out))
+	// Extract only the last non-empty line as the container ID.
+	// CombinedOutput may include Docker warnings (e.g., platform mismatch)
+	// before the actual container ID on stdout.
+	containerID := extractContainerID(string(out))
 
 	if err := m.WaitReady(ctx, containerID, password); err != nil {
 		m.StopAndRemove(ctx, containerID)
@@ -136,9 +139,9 @@ func (m *Manager) GetHostPort(ctx context.Context, containerID string) (int, err
 }
 
 // WaitReady polls the container until Oracle is accepting connections.
-// Polls every 3s, times out after 300 seconds (Oracle XE under ARM emulation is very slow).
+// Polls every 3s, times out after 480 seconds (Oracle XE under ARM emulation is very slow).
 func (m *Manager) WaitReady(ctx context.Context, containerID, password string) error {
-	deadline := time.After(300 * time.Second)
+	deadline := time.After(480 * time.Second)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -147,7 +150,7 @@ func (m *Manager) WaitReady(ctx context.Context, containerID, password string) e
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-deadline:
-			return fmt.Errorf("timed out waiting for Oracle to start (300s)")
+			return fmt.Errorf("timed out waiting for Oracle to start (480s)")
 		case <-ticker.C:
 			if m.isOracleReady(ctx, containerID, password) {
 				return nil
@@ -206,6 +209,19 @@ func (m *Manager) IsRunning(ctx context.Context, containerIDOrName string) (bool
 		return false, fmt.Errorf("failed to inspect container: %s", strings.TrimSpace(string(out)))
 	}
 	return strings.TrimSpace(string(out)) == "true", nil
+}
+
+// extractContainerID extracts the container ID from docker run output.
+// On ARM hosts, docker may prepend a platform mismatch WARNING before the ID.
+func extractContainerID(output string) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return line
+		}
+	}
+	return strings.TrimSpace(output)
 }
 
 func generateContainerName() (string, error) {
