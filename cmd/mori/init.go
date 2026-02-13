@@ -2,65 +2,108 @@ package main
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine/postgres"
+	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 	"github.com/spf13/cobra"
 )
 
 var initCmd = &cobra.Command{
 	Use:   "init",
-	Short: "Initialize a Mori project",
-	Long: `Connect to a production database, dump its schema, spin up a local Shadow
-database container, apply the schema, offset sequences, and create the .mori/
-configuration directory.
+	Short: "Add a database connection",
+	Long: `Interactively configure a new database connection and save it to mori.yaml.
 
-The Shadow database is a schema-only clone of production with zero rows.
-All local mutations will be stored here.`,
+Select an engine, a provider, fill in connection details, and give it a name.
+The connection is saved locally — no containers or connections are created yet.
+Run 'mori start <name>' to begin proxying.
+
+For scripting, use --from with a connection string:
+  mori init --from "postgres://user:pass@host:5432/db" --name my-db`,
 	RunE: runInit,
 }
 
 func init() {
-	initCmd.Flags().StringP("from", "f", "", "Production database connection string (required)")
-	initCmd.Flags().String("image", "", "Docker image for the Shadow database (default: auto-detect from Prod version)")
-	initCmd.MarkFlagRequired("from")
+	initCmd.Flags().StringP("from", "f", "", "Connection string (non-interactive)")
+	initCmd.Flags().String("name", "", "Connection name (used with --from)")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
-	from, _ := cmd.Flags().GetString("from")
-	image, _ := cmd.Flags().GetString("image")
-
 	projectRoot, err := config.FindProjectRoot()
 	if err != nil {
 		return fmt.Errorf("failed to determine project root: %w", err)
 	}
 
-	if config.IsInitialized(projectRoot) {
-		return fmt.Errorf("mori is already initialized in %s — run 'mori reset --hard' to re-initialize", projectRoot)
+	// Load existing config if present, so we can append.
+	var existing *config.ProjectConfig
+	if config.HasProjectConfig(projectRoot) {
+		existing, err = config.ReadProjectConfig(projectRoot)
+		if err != nil {
+			return fmt.Errorf("failed to read existing mori.yaml: %w", err)
+		}
 	}
 
-	result, err := postgres.Init(cmd.Context(), postgres.InitOptions{
-		ProdConnStr:   from,
-		ImageOverride: image,
-		ProjectRoot:   projectRoot,
-	})
+	from, _ := cmd.Flags().GetString("from")
+	name, _ := cmd.Flags().GetString("name")
+
+	// Non-interactive mode: --from flag provided.
+	if from != "" {
+		return runNonInteractiveInit(projectRoot, existing, from, name)
+	}
+
+	// Interactive mode (default).
+	return runInteractiveInit(projectRoot, existing)
+}
+
+// runNonInteractiveInit parses a connection string and saves it to mori.yaml.
+// Requires --name when used non-interactively.
+func runNonInteractiveInit(projectRoot string, existing *config.ProjectConfig, connStr, name string) error {
+	if name == "" {
+		return fmt.Errorf("--name is required when using --from")
+	}
+
+	if !nameRe.MatchString(name) {
+		return fmt.Errorf("invalid connection name %q: must be 1-40 lowercase alphanumeric chars or hyphens", name)
+	}
+
+	if existing != nil && existing.GetConnection(name) != nil {
+		return fmt.Errorf("connection %q already exists in mori.yaml", name)
+	}
+
+	// Parse the connection string into fields.
+	dsn, err := connstr.Parse(connStr)
 	if err != nil {
-		return err
+		return fmt.Errorf("invalid connection string: %w", err)
+	}
+
+	conn := &config.Connection{
+		Engine:   "postgres",
+		Provider: "direct",
+		Host:     dsn.Host,
+		Port:     dsn.Port,
+		User:     dsn.User,
+		Password: dsn.Password,
+		Database: dsn.DBName,
+		SSLMode:  dsn.SSLMode,
+	}
+
+	if existing == nil {
+		existing = config.NewProjectConfig()
+	}
+	existing.AddConnection(name, conn)
+
+	if err := config.WriteProjectConfig(projectRoot, existing); err != nil {
+		return fmt.Errorf("failed to write mori.yaml: %w", err)
 	}
 
 	fmt.Println()
-	fmt.Println("Mori initialized successfully!")
-	fmt.Printf("  Engine:     PostgreSQL %s\n", result.Config.EngineVersion)
-	fmt.Printf("  Shadow:     localhost:%d (container: %s)\n", result.Container.HostPort, result.Container.ContainerName)
-	fmt.Printf("  Image:      %s\n", result.Config.ShadowImage)
-	fmt.Printf("  Tables:     %d\n", len(result.Dump.Tables))
-	fmt.Printf("  Sequences:  %d offset\n", len(result.Dump.Sequences))
-	if len(result.Config.Extensions) > 0 {
-		fmt.Printf("  Extensions: %s\n", strings.Join(result.Config.Extensions, ", "))
-	}
+	fmt.Printf("  Connection %q saved to mori.yaml\n", name)
+	fmt.Printf("    Engine:   PostgreSQL\n")
+	fmt.Printf("    Provider: Direct / Self-Hosted\n")
+	fmt.Printf("    Host:     %s:%d\n", dsn.Host, dsn.Port)
+	fmt.Printf("    Database: %s\n", dsn.DBName)
 	fmt.Println()
-	fmt.Println("Next: run 'mori start' to begin proxying.")
+	fmt.Printf("  Next: run 'mori start %s' to begin proxying.\n", name)
+	fmt.Println()
 
 	return nil
 }

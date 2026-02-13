@@ -28,8 +28,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if !config.IsInitialized(projectRoot) {
-		fmt.Println("Mori is not initialized.")
-		fmt.Println("Run 'mori init --from <connection_string>' to get started.")
+		if config.HasProjectConfig(projectRoot) {
+			fmt.Println("Mori has connections configured but no active session.")
+			fmt.Println("Run 'mori start' to begin proxying.")
+		} else {
+			fmt.Println("Mori is not initialized.")
+			fmt.Println("Run 'mori init' to get started.")
+		}
 		return nil
 	}
 
@@ -39,6 +44,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	// Connection info.
+	if cfg.ActiveConnection != "" {
+		fmt.Printf("Connection:   %s\n", cfg.ActiveConnection)
+	}
 	fmt.Printf("Engine:       %s %s\n", cfg.Engine, cfg.EngineVersion)
 	fmt.Printf("Prod:         %s (read-only)\n", cfg.RedactedProdConnection())
 	fmt.Printf("Shadow:       localhost:%d\n", cfg.ShadowPort)

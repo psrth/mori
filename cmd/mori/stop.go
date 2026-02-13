@@ -67,7 +67,11 @@ func runStop(cmd *cobra.Command, args []string) error {
 	}
 
 	// 4. Send SIGTERM.
-	fmt.Printf("Sending SIGTERM to Mori proxy (PID %d)...\n", pid)
+	connLabel := ""
+	if cfg, err := config.ReadConfig(projectRoot); err == nil && cfg.ActiveConnection != "" {
+		connLabel = fmt.Sprintf(" [%s]", cfg.ActiveConnection)
+	}
+	fmt.Printf("Sending SIGTERM to Mori proxy%s (PID %d)...\n", connLabel, pid)
 	if err := process.Signal(syscall.SIGTERM); err != nil {
 		return fmt.Errorf("failed to send SIGTERM to PID %d: %w", pid, err)
 	}

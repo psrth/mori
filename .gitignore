@@ -16,3 +16,6 @@
 
 # Mori runtime
 .mori/
+
+# Mori project config (contains credentials)
+mori.yaml
