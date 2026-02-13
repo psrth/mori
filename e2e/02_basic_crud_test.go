@@ -14,7 +14,8 @@ func TestBasicSelect(t *testing.T) {
 	conn := connect(t)
 
 	t.Run("select_all_from_small_table", func(t *testing.T) {
-		assertQueryRowCount(t, conn, 10, "SELECT * FROM roles")
+		// Expect 11: 10 Prod rows + 1 Shadow row inserted by earlier lifecycle test.
+		assertQueryRowCount(t, conn, 11, "SELECT * FROM roles")
 	})
 
 	t.Run("select_count_star_users", func(t *testing.T) {

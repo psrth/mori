@@ -44,8 +44,13 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 		return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
 	}
 
+	// Step 0: Inject PK columns for delta tables if not in SELECT list.
+	effectiveSQL := querySQL
+	var injectedPKs map[string]string
+	effectiveSQL, injectedPKs = rh.injectJoinPKs(querySQL, deltaTables)
+
 	// Step 1: Execute JOIN on Prod.
-	prodResult, err := execQuery(rh.prodConn, querySQL)
+	prodResult, err := execQuery(rh.prodConn, effectiveSQL)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("prod JOIN query: %w", err)
 	}
@@ -53,12 +58,13 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 		return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
 	}
 
-	// Step 2: Find PK column indices for each delta table in the result set.
-	pkIndices := rh.findPKIndicesForTables(deltaTables, prodResult.Columns)
+	// Step 2: Find PK column indices (including injected PKs).
+	pkIndices := rh.findPKIndicesForJoin(deltaTables, prodResult.Columns, injectedPKs)
 
 	// Steps 3-4: Classify each Prod row (clean / delta / dead) and patch delta rows.
 	var patchedValues [][]string
 	var patchedNulls [][]bool
+	var deltaRowIndices []int // Indices of patched (delta) rows in patchedValues.
 
 	for i, row := range prodResult.RowValues {
 		action := rh.classifyJoinRow(deltaTables, pkIndices, row)
@@ -78,6 +84,7 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 				continue
 			}
 			if patched != nil {
+				deltaRowIndices = append(deltaRowIndices, len(patchedValues))
 				patchedValues = append(patchedValues, patched)
 				patchedNulls = append(patchedNulls, patchedN)
 			}
@@ -88,8 +95,18 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 		}
 	}
 
+	// Step 4.5: Re-evaluate WHERE on patched delta rows.
+	// After column replacement, a patched row may no longer satisfy the WHERE clause.
+	if len(deltaRowIndices) > 0 {
+		whereAST := extractWhereAST(querySQL)
+		if whereAST != nil {
+			patchedValues, patchedNulls = filterByWhere(
+				whereAST, prodResult.Columns, patchedValues, patchedNulls, deltaRowIndices)
+		}
+	}
+
 	// Step 5: Execute same JOIN on Shadow (catches locally-inserted rows).
-	shadowResult, err := execQuery(rh.shadowConn, querySQL)
+	shadowResult, err := execQuery(rh.shadowConn, effectiveSQL)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("shadow JOIN query: %w", err)
 	}
@@ -111,7 +128,7 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 	mergedNulls = append(mergedNulls, patchedNulls...)
 
 	// Step 7: Deduplicate by composite key (PK columns from ALL joined tables).
-	allPKIndices := rh.findPKIndicesForTables(cl.Tables, resultColumns)
+	allPKIndices := rh.findPKIndicesForJoin(cl.Tables, resultColumns, injectedPKs)
 	mergedValues, mergedNulls = rh.dedupJoin(cl.Tables, allPKIndices, resultColumns, mergedValues, mergedNulls)
 
 	// Step 8: Re-sort by ORDER BY.
@@ -125,7 +142,105 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 		mergedNulls = mergedNulls[:cl.Limit]
 	}
 
+	// Step 10: Strip injected PK columns.
+	for _, alias := range injectedPKs {
+		resultColumns, mergedValues, mergedNulls = stripInjectedColumn(
+			resultColumns, mergedValues, mergedNulls, alias)
+	}
+
 	return resultColumns, mergedValues, mergedNulls, nil
+}
+
+// injectJoinPKs injects PK columns for delta tables into the SELECT list of a JOIN query.
+// Returns the modified SQL and a map from table name to injected alias column name.
+func (rh *ReadHandler) injectJoinPKs(sql string, deltaTables []string) (string, map[string]string) {
+	aliases := extractJoinTableAliases(sql)
+	if aliases == nil {
+		return sql, nil
+	}
+
+	upper := strings.ToUpper(strings.TrimSpace(sql))
+	selectIdx := strings.Index(upper, "SELECT")
+	fromIdx := strings.Index(upper, " FROM ")
+	if selectIdx < 0 || fromIdx <= selectIdx {
+		return sql, nil
+	}
+
+	// SELECT * includes everything, no injection needed.
+	selectPart := strings.TrimSpace(upper[selectIdx+6 : fromIdx])
+	if selectPart == "*" || strings.HasPrefix(selectPart, "DISTINCT *") {
+		return sql, nil
+	}
+
+	selectList := strings.ToLower(sql[selectIdx+6 : fromIdx])
+
+	injected := make(map[string]string) // table name → injected alias column name
+	result := sql
+	for _, table := range deltaTables {
+		meta, ok := rh.tables[table]
+		if !ok || len(meta.PKColumns) == 0 {
+			continue
+		}
+		pkCol := meta.PKColumns[0]
+		if containsColumn(selectList, pkCol) {
+			continue
+		}
+
+		alias, ok := aliases[table]
+		if !ok || alias == "" {
+			alias = table
+		}
+
+		// Use a unique alias to avoid collision with same-named PKs.
+		injectedAlias := "_mori_pk_" + strings.ReplaceAll(table, ".", "_")
+		expr := quoteIdent(alias) + "." + quoteIdent(pkCol) + " AS " + quoteIdent(injectedAlias)
+		result = injectSelectExpr(result, expr)
+		injected[table] = injectedAlias
+
+		// Update selectList for subsequent column checks.
+		selectList = injectedAlias + "," + selectList
+	}
+
+	if len(injected) == 0 {
+		return sql, nil
+	}
+	return result, injected
+}
+
+// findPKIndicesForJoin extends findPKIndicesForTables with injected PK columns.
+func (rh *ReadHandler) findPKIndicesForJoin(
+	tables []string, columns []ColumnInfo, injectedPKs map[string]string,
+) map[string]int {
+	result := rh.findPKIndicesForTables(tables, columns)
+
+	for table, alias := range injectedPKs {
+		if _, found := result[table]; found {
+			continue
+		}
+		for i, col := range columns {
+			if col.Name == alias {
+				result[table] = i
+				break
+			}
+		}
+	}
+
+	return result
+}
+
+// injectSelectExpr injects a raw SQL expression at the beginning of the SELECT list.
+func injectSelectExpr(sql, expr string) string {
+	upper := strings.ToUpper(sql)
+	selectIdx := strings.Index(upper, "SELECT")
+	if selectIdx < 0 {
+		return sql
+	}
+	insertPos := selectIdx + 6
+	afterSelect := strings.TrimSpace(sql[insertPos:])
+	if strings.HasPrefix(strings.ToUpper(afterSelect), "DISTINCT") {
+		insertPos += (len(sql[insertPos:]) - len(afterSelect)) + 8
+	}
+	return sql[:insertPos] + " " + expr + "," + sql[insertPos:]
 }
 
 type joinRowAction int

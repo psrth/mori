@@ -57,15 +57,15 @@ func parseParseMsgPayload(payload []byte) (stmtName, sql string, paramOIDs []uin
 	return stmtName, sql, paramOIDs, nil
 }
 
-// parseBindMsgPayload extracts the portal name, statement name, and parameter
-// values from a Bind ('B') message payload.
+// parseBindMsgPayload extracts the portal name, statement name, format codes,
+// and parameter values from a Bind ('B') message payload.
 // Format: portal\0 + stmt\0 + int16(fmtCount) + int16(fmt)*N +
 //
 //	int16(paramCount) + [int32(len) + bytes(len)]*N +
 //	int16(resFmtCount) + int16(resFmt)*N
-func parseBindMsgPayload(payload []byte) (portal, stmtName string, params [][]byte, err error) {
+func parseBindMsgPayload(payload []byte) (portal, stmtName string, formatCodes []int16, params [][]byte, err error) {
 	if len(payload) == 0 {
-		return "", "", nil, fmt.Errorf("empty Bind payload")
+		return "", "", nil, nil, fmt.Errorf("empty Bind payload")
 	}
 
 	pos := 0
@@ -73,29 +73,33 @@ func parseBindMsgPayload(payload []byte) (portal, stmtName string, params [][]by
 	// Read null-terminated portal name.
 	portal, pos, err = readNullTerminated(payload, pos)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("reading portal name: %w", err)
+		return "", "", nil, nil, fmt.Errorf("reading portal name: %w", err)
 	}
 
 	// Read null-terminated statement name.
 	stmtName, pos, err = readNullTerminated(payload, pos)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("reading statement name: %w", err)
+		return "", "", nil, nil, fmt.Errorf("reading statement name: %w", err)
 	}
 
 	// Read format codes.
 	if pos+2 > len(payload) {
-		return portal, stmtName, nil, fmt.Errorf("truncated format count")
+		return portal, stmtName, nil, nil, fmt.Errorf("truncated format count")
 	}
 	fmtCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 	pos += 2
 	if pos+fmtCount*2 > len(payload) {
-		return portal, stmtName, nil, fmt.Errorf("truncated format codes")
+		return portal, stmtName, nil, nil, fmt.Errorf("truncated format codes")
 	}
-	pos += fmtCount * 2 // skip int16 format codes
+	formatCodes = make([]int16, fmtCount)
+	for i := 0; i < fmtCount; i++ {
+		formatCodes[i] = int16(binary.BigEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+	}
 
 	// Read parameter values.
 	if pos+2 > len(payload) {
-		return portal, stmtName, nil, fmt.Errorf("truncated param count")
+		return portal, stmtName, formatCodes, nil, fmt.Errorf("truncated param count")
 	}
 	paramCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 	pos += 2
@@ -103,7 +107,7 @@ func parseBindMsgPayload(payload []byte) (portal, stmtName string, params [][]by
 	params = make([][]byte, 0, paramCount)
 	for i := 0; i < paramCount; i++ {
 		if pos+4 > len(payload) {
-			return portal, stmtName, params, fmt.Errorf("truncated param length at index %d", i)
+			return portal, stmtName, formatCodes, params, fmt.Errorf("truncated param length at index %d", i)
 		}
 		paramLen := int(int32(binary.BigEndian.Uint32(payload[pos : pos+4])))
 		pos += 4
@@ -114,7 +118,7 @@ func parseBindMsgPayload(payload []byte) (portal, stmtName string, params [][]by
 		}
 
 		if pos+paramLen > len(payload) {
-			return portal, stmtName, params, fmt.Errorf("truncated param data at index %d", i)
+			return portal, stmtName, formatCodes, params, fmt.Errorf("truncated param data at index %d", i)
 		}
 		param := make([]byte, paramLen)
 		copy(param, payload[pos:pos+paramLen])
@@ -122,7 +126,7 @@ func parseBindMsgPayload(payload []byte) (portal, stmtName string, params [][]by
 		params = append(params, param)
 	}
 
-	return portal, stmtName, params, nil
+	return portal, stmtName, formatCodes, params, nil
 }
 
 // parseDescribeMsgPayload extracts the target type and name from a Describe ('D') payload.
@@ -219,12 +223,18 @@ func hasBinaryParams(payload []byte) bool {
 }
 
 // resolveParams converts raw Bind parameter values to []interface{} for ClassifyWithParams.
-// Text-format parameters are used as-is. NULL parameters become nil.
-func resolveParams(rawParams [][]byte) []interface{} {
+// Text-format parameters are used as-is. Binary-format parameters are decoded
+// based on byte length (int2=2, int4=4, int8=8, bool=1, UUID=16).
+// NULL parameters become nil.
+func resolveParams(rawParams [][]byte, formatCodes []int16) []interface{} {
 	params := make([]interface{}, len(rawParams))
 	for i, p := range rawParams {
 		if p == nil {
 			params[i] = nil
+			continue
+		}
+		if isBinaryFormat(formatCodes, i) {
+			params[i] = decodeBinaryParam(p)
 		} else {
 			params[i] = string(p)
 		}
@@ -232,17 +242,80 @@ func resolveParams(rawParams [][]byte) []interface{} {
 	return params
 }
 
+// isBinaryFormat returns true if the parameter at index i is in binary format.
+// PG wire protocol format code rules:
+//   - 0 format codes: all parameters are text
+//   - 1 format code: applies to all parameters
+//   - N format codes: each parameter has its own format code
+func isBinaryFormat(formatCodes []int16, i int) bool {
+	if len(formatCodes) == 0 {
+		return false
+	}
+	if len(formatCodes) == 1 {
+		return formatCodes[0] != 0
+	}
+	if i < len(formatCodes) {
+		return formatCodes[i] != 0
+	}
+	return false
+}
+
+// decodeBinaryParam decodes a binary-format parameter value to its string representation.
+// Uses byte length to infer the type:
+//
+//	1 byte  → bool
+//	2 bytes → int16
+//	4 bytes → int32
+//	8 bytes → int64
+//	16 bytes → UUID
+//	other   → raw text (best effort)
+func decodeBinaryParam(p []byte) string {
+	switch len(p) {
+	case 1:
+		if p[0] == 0 {
+			return "false"
+		}
+		return "true"
+	case 2:
+		v := int16(binary.BigEndian.Uint16(p))
+		return fmt.Sprintf("%d", v)
+	case 4:
+		v := int32(binary.BigEndian.Uint32(p))
+		return fmt.Sprintf("%d", v)
+	case 8:
+		v := int64(binary.BigEndian.Uint64(p))
+		return fmt.Sprintf("%d", v)
+	case 16:
+		// UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			binary.BigEndian.Uint32(p[0:4]),
+			binary.BigEndian.Uint16(p[4:6]),
+			binary.BigEndian.Uint16(p[6:8]),
+			binary.BigEndian.Uint16(p[8:10]),
+			p[10:16])
+	default:
+		return string(p)
+	}
+}
+
 // reconstructSQL substitutes parameter placeholders ($1, $2, ...) in a SQL
 // template with quoted literal values. Replaces from highest index down to
 // prevent $1 from partially matching $10, $11, etc.
-func reconstructSQL(sql string, params [][]byte) string {
+// Binary-format parameters are decoded before substitution.
+func reconstructSQL(sql string, params [][]byte, formatCodes []int16) string {
 	result := sql
 	for i := len(params) - 1; i >= 0; i-- {
 		placeholder := fmt.Sprintf("$%d", i+1)
 		if params[i] == nil {
 			result = strings.ReplaceAll(result, placeholder, "NULL")
 		} else {
-			result = strings.ReplaceAll(result, placeholder, quoteLiteral(string(params[i])))
+			var val string
+			if isBinaryFormat(formatCodes, i) {
+				val = decodeBinaryParam(params[i])
+			} else {
+				val = string(params[i])
+			}
+			result = strings.ReplaceAll(result, placeholder, quoteLiteral(val))
 		}
 	}
 	return result

@@ -150,8 +150,14 @@ func TestParseDDLChangesCreateTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseDDLChanges() error: %v", err)
 	}
-	if len(changes) != 0 {
-		t.Errorf("got %d changes for CREATE TABLE, want 0", len(changes))
+	if len(changes) != 1 {
+		t.Fatalf("got %d changes for CREATE TABLE, want 1", len(changes))
+	}
+	if changes[0].Kind != ddlCreateTable {
+		t.Errorf("got kind %v, want ddlCreateTable", changes[0].Kind)
+	}
+	if changes[0].Table != "new_table" {
+		t.Errorf("got table %q, want %q", changes[0].Table, "new_table")
 	}
 }
 

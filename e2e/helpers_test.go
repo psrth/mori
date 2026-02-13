@@ -122,10 +122,18 @@ func assertQueryError(t *testing.T, conn *pgx.Conn, sql string, args ...any) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	rows, err := conn.Query(ctx, sql, args...)
-	if err == nil {
-		rows.Close()
-		t.Errorf("assertQueryError(%q): expected error, got nil", truncSQL(sql))
+	if err != nil {
+		return // Got error from Query, as expected.
 	}
+	// In pgx v5, backend errors may be deferred to rows.Err().
+	for rows.Next() {
+	}
+	if rows.Err() != nil {
+		rows.Close()
+		return // Got error from rows, as expected.
+	}
+	rows.Close()
+	t.Errorf("assertQueryError(%q): expected error, got nil", truncSQL(sql))
 }
 
 // queryScalar runs a query that returns a single value.
@@ -171,10 +179,90 @@ func truncSQL(sql string) string {
 	return sql
 }
 
+// mcpSessionID caches the MCP session ID for reuse across test calls.
+var mcpSessionID string
+
+// mcpInitialize performs the MCP initialize handshake if not already done.
+// Returns the session ID or an error.
+func mcpInitialize(t *testing.T) (string, error) {
+	t.Helper()
+	if mcpSessionID != "" {
+		return mcpSessionID, nil
+	}
+
+	// Step 1: Send initialize request.
+	initReq := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      0,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities":   map[string]any{},
+			"clientInfo": map[string]any{
+				"name":    "mori-e2e-test",
+				"version": "1.0.0",
+			},
+		},
+	}
+
+	bodyBytes, err := json.Marshal(initReq)
+	if err != nil {
+		return "", fmt.Errorf("marshal init request: %w", err)
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/mcp", mcpPort)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("create init request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("init HTTP request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response body (discard content, we just need the session header).
+	io.ReadAll(resp.Body)
+
+	sessionID := resp.Header.Get("Mcp-Session-Id")
+	if sessionID == "" {
+		return "", fmt.Errorf("no Mcp-Session-Id in init response (status %d)", resp.StatusCode)
+	}
+
+	// Step 2: Send initialized notification.
+	notifReq := map[string]any{
+		"jsonrpc": "2.0",
+		"method":  "notifications/initialized",
+	}
+	notifBytes, _ := json.Marshal(notifReq)
+	notifHTTP, _ := http.NewRequest("POST", url, bytes.NewReader(notifBytes))
+	notifHTTP.Header.Set("Content-Type", "application/json")
+	notifHTTP.Header.Set("Accept", "application/json, text/event-stream")
+	notifHTTP.Header.Set("Mcp-Session-Id", sessionID)
+	notifResp, err := client.Do(notifHTTP)
+	if err != nil {
+		return "", fmt.Errorf("initialized notification: %w", err)
+	}
+	notifResp.Body.Close()
+
+	mcpSessionID = sessionID
+	return sessionID, nil
+}
+
 // queryMCP sends a db_query tool call to the MCP server via HTTP.
 // Returns the text content from the response.
 func queryMCP(t *testing.T, sql string) (string, error) {
 	t.Helper()
+
+	// Ensure MCP session is initialized.
+	sessionID, err := mcpInitialize(t)
+	if err != nil {
+		return "", fmt.Errorf("MCP initialize: %w", err)
+	}
 
 	// Build MCP JSON-RPC request for the tools/call method.
 	reqBody := map[string]any{
@@ -201,6 +289,7 @@ func queryMCP(t *testing.T, sql string) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Session-Id", sessionID)
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)

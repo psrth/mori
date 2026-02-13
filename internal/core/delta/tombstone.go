@@ -36,6 +36,9 @@ func (t *TombstoneSet) AnyTableTombstone(tables []string) bool {
 	return false
 }
 
+// ClearTable removes all tombstone entries for the given table.
+func (t *TombstoneSet) ClearTable(table string) { t.s.clearTable(table) }
+
 // Stage adds (table, pk) to the per-transaction staging buffer.
 func (t *TombstoneSet) Stage(table, pk string) { t.s.stage(table, pk) }
 

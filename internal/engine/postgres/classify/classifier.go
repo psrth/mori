@@ -150,6 +150,7 @@ func (c *PgClassifier) classifySelect(sel *pg_query.SelectStmt, cl *core.Classif
 	if sel.GetOp() != pg_query.SetOperation_SETOP_NONE {
 		cl.OpType = core.OpRead
 		cl.SubType = core.SubSelect
+		cl.HasSetOp = true
 		if sel.GetLarg() != nil {
 			c.classifySelect(sel.GetLarg(), cl)
 		}
@@ -173,6 +174,7 @@ func (c *PgClassifier) classifySelect(sel *pg_query.SelectStmt, cl *core.Classif
 	// Collect CTE names so we can exclude them from the real table list.
 	var cteNames map[string]bool
 	if wc := sel.GetWithClause(); wc != nil {
+		cl.IsComplexRead = true
 		cteNames = make(map[string]bool)
 		for _, cteNode := range wc.GetCtes() {
 			cte := cteNode.GetCommonTableExpr()
@@ -187,6 +189,11 @@ func (c *PgClassifier) classifySelect(sel *pg_query.SelectStmt, cl *core.Classif
 			}
 			c.extractTablesFromCTE(cteQuery, cl)
 		}
+	}
+
+	// Detect derived tables (subqueries in FROM clause).
+	if hasRangeSubselect(sel.GetFromClause()) {
+		cl.IsComplexRead = true
 	}
 
 	// Extract tables from FROM clause, filtering out CTE names.
@@ -224,6 +231,62 @@ func (c *PgClassifier) classifySelect(sel *pg_query.SelectStmt, cl *core.Classif
 		pks := c.extractPKsFromExpr(sel.GetWhereClause(), cl.Tables)
 		cl.PKs = append(cl.PKs, pks...)
 	}
+
+	// Detect aggregates: GROUP BY or aggregate functions in target list.
+	if len(sel.GetGroupClause()) > 0 {
+		cl.HasAggregate = true
+	}
+	if !cl.HasAggregate {
+		for _, target := range sel.GetTargetList() {
+			if hasAggregateFunc(target) {
+				cl.HasAggregate = true
+				break
+			}
+		}
+	}
+}
+
+// hasAggregateFunc recursively checks if a node contains an aggregate function call.
+func hasAggregateFunc(node *pg_query.Node) bool {
+	if node == nil {
+		return false
+	}
+	if rt := node.GetResTarget(); rt != nil {
+		return hasAggregateFunc(rt.GetVal())
+	}
+	if fc := node.GetFuncCall(); fc != nil {
+		// Window functions (SUM(...) OVER (...)) are NOT aggregates — they
+		// don't reduce row count. Skip if an OVER clause is present.
+		if fc.GetOver() != nil {
+			return false
+		}
+		// Check if the function name is a known aggregate.
+		for _, nameNode := range fc.GetFuncname() {
+			if s := nameNode.GetString_(); s != nil {
+				name := strings.ToLower(s.GetSval())
+				switch name {
+				case "count", "sum", "avg", "min", "max",
+					"array_agg", "string_agg", "bool_and", "bool_or",
+					"json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg":
+					return true
+				}
+			}
+		}
+		// Also check arguments for nested aggregates.
+		for _, arg := range fc.GetArgs() {
+			if hasAggregateFunc(arg) {
+				return true
+			}
+		}
+	}
+	// Check common expression wrappers.
+	if ae := node.GetAExpr(); ae != nil {
+		return hasAggregateFunc(ae.GetLexpr()) || hasAggregateFunc(ae.GetRexpr())
+	}
+	if tc := node.GetTypeCast(); tc != nil {
+		return hasAggregateFunc(tc.GetArg())
+	}
+	return false
 }
 
 // extractTablesFromCTE extracts tables referenced in a CTE subquery.
