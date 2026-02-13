@@ -343,8 +343,10 @@ func extractFromTables(upper string) []string {
 	if m := reFromClause.FindStringSubmatch(upper); len(m) > 1 {
 		fromPart := m[1]
 		// Stop at keywords that end the FROM clause.
+		// Use word-boundary check to avoid matching keywords as prefixes of
+		// table names (e.g. "ORDER" inside "ORDERS").
 		for _, kw := range []string{"WHERE", "GROUP", "HAVING", "ORDER", "UNION", "INTERSECT", "EXCEPT", "FOR", "OPTION"} {
-			if idx := strings.Index(strings.ToUpper(fromPart), kw); idx >= 0 {
+			if idx := indexKeyword(fromPart, kw); idx >= 0 {
 				fromPart = fromPart[:idx]
 			}
 		}
@@ -419,7 +421,7 @@ func extractDeleteTables(upper string) []string {
 
 	// Cut at WHERE, ORDER, OPTION.
 	for _, kw := range []string{"WHERE", "ORDER", "OPTION"} {
-		if idx := strings.Index(rest, kw); idx >= 0 {
+		if idx := indexKeyword(rest, kw); idx >= 0 {
 			rest = rest[:idx]
 		}
 	}
@@ -521,6 +523,40 @@ func stripLeadingComments(s string) string {
 		} else {
 			return s
 		}
+	}
+}
+
+// indexKeyword finds the keyword kw in s only at a word boundary.
+// It returns -1 if the keyword is not found as a standalone word.
+func indexKeyword(s, kw string) int {
+	upper := strings.ToUpper(s)
+	kw = strings.ToUpper(kw)
+	off := 0
+	for {
+		idx := strings.Index(upper[off:], kw)
+		if idx < 0 {
+			return -1
+		}
+		absIdx := off + idx
+		end := absIdx + len(kw)
+		// Check that the character after the keyword is not a letter/digit/underscore
+		// (i.e. it's a word boundary).
+		if end < len(upper) {
+			ch := upper[end]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+				off = absIdx + 1
+				continue
+			}
+		}
+		// Also check that the character before is a word boundary.
+		if absIdx > 0 {
+			ch := upper[absIdx-1]
+			if (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+				off = absIdx + 1
+				continue
+			}
+		}
+		return absIdx
 	}
 }
 

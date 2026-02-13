@@ -1,10 +1,19 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"time"
+)
+
+// PRELOGIN encryption negotiation values.
+const (
+	preloginEncryptOff    byte = 0x00
+	preloginEncryptOn     byte = 0x01
+	preloginEncryptNotSup byte = 0x02
+	preloginEncryptReq    byte = 0x03
 )
 
 // relayHandshake relays the TDS handshake between client and production server.
@@ -23,6 +32,19 @@ func relayHandshake(clientConn, prodConn net.Conn) error {
 		return fmt.Errorf("empty prelogin from client")
 	}
 
+	// Strip encryption and MARS from client's PRELOGIN before forwarding to prod.
+	// Encryption: prevents TLS-within-TDS negotiation that the proxy cannot relay.
+	// MARS: the proxy sends its own SQL_BATCH messages for internal queries
+	// (shadow reads, prod reads during merge) and cannot generate MARS transaction
+	// descriptor headers. Disabling MARS keeps the TDS session simple.
+	for _, pkt := range preloginReq {
+		if pkt.Type == typePrelogin {
+			setPreloginEncryption(pkt.Payload, preloginEncryptNotSup)
+			setPreloginOption(pkt.Payload, 0x04, 0x00) // MARS off (preloginMARS = 4)
+			copy(pkt.Raw[tdsHeaderSize:], pkt.Payload)
+		}
+	}
+
 	// Forward to prod.
 	if err := writeTDSPackets(prodConn, preloginReq); err != nil {
 		return fmt.Errorf("forwarding prelogin to prod: %w", err)
@@ -32,6 +54,15 @@ func relayHandshake(clientConn, prodConn net.Conn) error {
 	preloginResp, err := readTDSMessage(prodConn)
 	if err != nil {
 		return fmt.Errorf("reading prod prelogin response: %w", err)
+	}
+
+	// Strip encryption and MARS from prod's response before forwarding to client.
+	for _, pkt := range preloginResp {
+		if pkt.Type == typePrelogin {
+			setPreloginEncryption(pkt.Payload, preloginEncryptNotSup)
+			setPreloginOption(pkt.Payload, 0x04, 0x00) // MARS off (preloginMARS = 4)
+			copy(pkt.Raw[tdsHeaderSize:], pkt.Payload)
+		}
 	}
 
 	// Forward to client.
@@ -93,23 +124,42 @@ func connectShadow(shadowAddr, dbName string) (net.Conn, error) {
 		return nil, fmt.Errorf("sending shadow prelogin: %w", err)
 	}
 
-	// 2. Read PRELOGIN response.
-	_, err = readTDSMessage(shadowConn)
+	// 2. Read PRELOGIN response and check encryption requirement.
+	preloginResp, err := readTDSMessage(shadowConn)
 	if err != nil {
 		shadowConn.Close()
 		return nil, fmt.Errorf("reading shadow prelogin response: %w", err)
 	}
 
-	// 3. Send LOGIN7.
+	// Parse encryption option from the PRELOGIN response.
+	var encryptionVal byte = preloginEncryptNotSup
+	if len(preloginResp) > 0 && len(preloginResp[0].Payload) > 0 {
+		encryptionVal = parsePreloginEncryption(preloginResp[0].Payload)
+	}
+
+	// If the server requires or defaults to encryption, upgrade to TLS.
+	var loginConn net.Conn = shadowConn
+	if encryptionVal == preloginEncryptOn || encryptionVal == preloginEncryptReq {
+		tlsConn := tls.Client(shadowConn, &tls.Config{
+			InsecureSkipVerify: true,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			shadowConn.Close()
+			return nil, fmt.Errorf("TLS handshake with shadow: %w", err)
+		}
+		loginConn = tlsConn
+	}
+
+	// 3. Send LOGIN7 over the (possibly TLS-wrapped) connection.
 	login7Payload := buildLogin7Payload("sa", "Mori_P@ss1", dbName)
 	login7Pkt := buildTDSPacket(typeLogin7, statusEOM, login7Payload)
-	if _, err := shadowConn.Write(login7Pkt); err != nil {
+	if _, err := loginConn.Write(login7Pkt); err != nil {
 		shadowConn.Close()
 		return nil, fmt.Errorf("sending shadow login7: %w", err)
 	}
 
 	// 4. Read login response.
-	loginResp, err := readTDSMessage(shadowConn)
+	loginResp, err := readTDSMessage(loginConn)
 	if err != nil {
 		shadowConn.Close()
 		return nil, fmt.Errorf("reading shadow login response: %w", err)
@@ -123,33 +173,91 @@ func connectShadow(shadowAddr, dbName string) (net.Conn, error) {
 		}
 	}
 
-	return shadowConn, nil
+	return loginConn, nil
 }
 
-// buildPreloginPayload constructs a minimal PRELOGIN token stream.
+// buildPreloginPayload constructs a PRELOGIN token stream with VERSION and ENCRYPTION options.
 func buildPreloginPayload() []byte {
 	// PRELOGIN is a set of option tokens. Each option: type(1) + offset(2 BE) + length(2 BE).
 	// Terminated by 0xFF.
 
-	// We send VERSION and TERMINATOR only.
-	dataOffset := 6 // 1 option header (5 bytes) + terminator (1 byte)
+	// Option headers: VERSION(5 bytes) + ENCRYPTION(5 bytes) + terminator(1 byte) = 11 bytes
+	dataOffset := 11
 
 	var payload []byte
 
-	// VERSION option: type=0x00, offset, length=6.
-	payload = append(payload, 0x00)                       // type: VERSION
-	payload = append(payload, byte(dataOffset>>8), byte(dataOffset)) // offset (2 bytes BE)
-	payload = append(payload, 0x00, 0x06)                // length (6 bytes)
+	// VERSION option: type=0x00, offset=dataOffset, length=6.
+	payload = append(payload, 0x00)                                    // type: VERSION
+	payload = append(payload, byte(dataOffset>>8), byte(dataOffset))   // offset (2 bytes BE)
+	payload = append(payload, 0x00, 0x06)                              // length (6 bytes)
+
+	// ENCRYPTION option: type=0x01, offset=dataOffset+6, length=1.
+	encOffset := dataOffset + 6
+	payload = append(payload, 0x01)                                    // type: ENCRYPTION
+	payload = append(payload, byte(encOffset>>8), byte(encOffset))     // offset (2 bytes BE)
+	payload = append(payload, 0x00, 0x01)                              // length (1 byte)
 
 	// Terminator.
 	payload = append(payload, 0xFF)
 
 	// VERSION data: UL_VERSION(4) + US_SUBBUILD(2).
-	// Use TDS 7.4 version: 0x74000004 -> 7.4.0.4 or just provide reasonable values.
 	payload = append(payload, 0x0F, 0x00, 0x10, 0x46) // Version bytes
 	payload = append(payload, 0x00, 0x00)               // Sub-build
 
+	// ENCRYPTION data: ENCRYPT_NOT_SUP (we prefer no encryption).
+	payload = append(payload, preloginEncryptNotSup)
+
 	return payload
+}
+
+// parsePreloginEncryption parses a PRELOGIN response payload and returns the ENCRYPTION option value.
+// Returns preloginEncryptNotSup if the ENCRYPTION option is not found.
+func parsePreloginEncryption(payload []byte) byte {
+	i := 0
+	for i < len(payload) {
+		optType := payload[i]
+		if optType == 0xFF {
+			break
+		}
+		if i+5 > len(payload) {
+			break
+		}
+		optOffset := int(payload[i+1])<<8 | int(payload[i+2])
+		optLen := int(payload[i+3])<<8 | int(payload[i+4])
+		if optType == 0x01 && optLen >= 1 && optOffset < len(payload) {
+			return payload[optOffset]
+		}
+		i += 5
+	}
+	return preloginEncryptNotSup
+}
+
+// setPreloginEncryption finds the ENCRYPTION option in a PRELOGIN payload and
+// sets it to the given value. No-ops if the option is not found.
+func setPreloginEncryption(payload []byte, val byte) {
+	setPreloginOption(payload, 0x01, val)
+}
+
+// setPreloginOption finds the given option type in a PRELOGIN payload and
+// sets the first byte of its data to val. No-ops if the option is not found.
+func setPreloginOption(payload []byte, optionType byte, val byte) {
+	i := 0
+	for i < len(payload) {
+		optType := payload[i]
+		if optType == 0xFF {
+			break
+		}
+		if i+5 > len(payload) {
+			break
+		}
+		optOffset := int(payload[i+1])<<8 | int(payload[i+2])
+		optLen := int(payload[i+3])<<8 | int(payload[i+4])
+		if optType == optionType && optLen >= 1 && optOffset < len(payload) {
+			payload[optOffset] = val
+			return
+		}
+		i += 5
+	}
 }
 
 // buildLogin7Payload constructs a LOGIN7 packet payload.

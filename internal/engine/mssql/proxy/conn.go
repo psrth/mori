@@ -5,10 +5,13 @@ import (
 	"io"
 	"log"
 	"net"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/mori-dev/mori/internal/core"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 )
 
 type routeTarget int
@@ -86,6 +89,38 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	}
 	defer closeAll()
 
+	// Create a WriteHandler for this connection.
+	var wh *WriteHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		wh = &WriteHandler{
+			prodConn:   prodConn,
+			shadowConn: shadowConn,
+			deltaMap:   p.deltaMap,
+			tombstones: p.tombstones,
+			tables:     p.tables,
+			moriDir:    p.moriDir,
+			connID:     connID,
+			verbose:    p.verbose,
+			logger:     p.logger,
+		}
+	}
+
+	// Create a ReadHandler for merged reads.
+	var rh *ReadHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		rh = &ReadHandler{
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+		}
+	}
+
 	for {
 		pkt, err := readTDSPacket(clientConn)
 		if err != nil {
@@ -127,6 +162,37 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			sql := extractSQLFromBatch(fullPayload)
 			decision := p.classifyAndRoute(sql, connID)
 
+			// Dispatch write strategies to WriteHandler.
+			if wh != nil && decision.classification != nil {
+				switch decision.strategy {
+				case core.StrategyShadowWrite,
+					core.StrategyHydrateAndWrite,
+					core.StrategyShadowDelete:
+					if err := wh.HandleWrite(clientConn, allRaw, decision.classification, decision.strategy); err != nil {
+						if p.verbose {
+							log.Printf("[conn %d] write handler error: %v", connID, err)
+						}
+						return
+					}
+					continue
+				}
+			}
+
+			// Dispatch merged read strategies to ReadHandler.
+			if rh != nil && decision.classification != nil {
+				switch decision.strategy {
+				case core.StrategyMergedRead,
+					core.StrategyJoinPatch:
+					if err := rh.HandleRead(clientConn, allRaw, fullPayload, decision.classification, decision.strategy); err != nil {
+						if p.verbose {
+							log.Printf("[conn %d] read handler error: %v", connID, err)
+						}
+						return
+					}
+					continue
+				}
+			}
+
 			switch decision.target {
 			case targetProd:
 				// WRITE GUARD L3: final check before prod dispatch.
@@ -151,6 +217,10 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 						log.Printf("[conn %d] shadow relay error: %v", connID, err)
 					}
 					return
+				}
+				// Track DDL effects in the schema registry.
+				if decision.strategy == core.StrategyShadowDDL && decision.classification != nil {
+					p.trackDDLEffects(decision.classification, connID)
 				}
 
 			case targetBoth:
@@ -278,9 +348,8 @@ func (p *Proxy) classifyAndRoute(sql string, connID int64) routeDecision {
 		return routeDecision{target: targetBoth, classification: classification, strategy: strategy}
 
 	case core.StrategyMergedRead, core.StrategyJoinPatch:
-		// For v1, fall back to prod for merged reads.
 		return routeDecision{
-			target:         targetProd,
+			target:         targetProd, // fallback if ReadHandler is nil
 			classification: classification,
 			strategy:       strategy,
 		}
@@ -331,4 +400,95 @@ func drainTDSResponse(conn net.Conn) error {
 			return nil
 		}
 	}
+}
+
+// trackDDLEffects updates the schema registry after a DDL statement executes on Shadow.
+func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
+	if p.schemaRegistry == nil {
+		return
+	}
+	sqlStr := cl.RawSQL
+	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
+
+	switch {
+	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, " ADD "):
+		table, col, colType := parseMSSQLAlterAddColumn(sqlStr)
+		if table != "" && col != "" {
+			p.schemaRegistry.RecordAddColumn(table, coreSchema.Column{Name: col, Type: colType})
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: ADD COLUMN %s.%s (%s)", connID, table, col, colType)
+			}
+		}
+
+	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "DROP COLUMN"):
+		table, col := parseMSSQLAlterDropColumn(sqlStr)
+		if table != "" && col != "" {
+			p.schemaRegistry.RecordDropColumn(table, col)
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: DROP COLUMN %s.%s", connID, table, col)
+			}
+		}
+
+	case strings.HasPrefix(upper, "CREATE TABLE"):
+		for _, table := range cl.Tables {
+			p.schemaRegistry.RecordNewTable(table)
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: CREATE TABLE %s", connID, table)
+			}
+		}
+
+	case strings.HasPrefix(upper, "DROP TABLE"):
+		for _, table := range cl.Tables {
+			p.schemaRegistry.RemoveTable(table)
+			if p.deltaMap != nil {
+				p.deltaMap.ClearTable(table)
+			}
+			if p.tombstones != nil {
+				p.tombstones.ClearTable(table)
+			}
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: DROP TABLE %s", connID, table)
+			}
+		}
+	}
+
+	// Persist the registry.
+	if err := coreSchema.WriteRegistry(p.moriDir, p.schemaRegistry); err != nil {
+		if p.verbose {
+			log.Printf("[conn %d] failed to persist schema registry: %v", connID, err)
+		}
+	}
+}
+
+// Regex for ALTER TABLE ... ADD column_name type
+var reAlterAdd = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+\[?(\w+)\]?\s+ADD\s+\[?(\w+)\]?\s+(\w[\w\(\),\s]*)`)
+
+// parseMSSQLAlterAddColumn parses "ALTER TABLE t ADD col TYPE" for MSSQL.
+func parseMSSQLAlterAddColumn(sql string) (table, col, colType string) {
+	m := reAlterAdd.FindStringSubmatch(sql)
+	if len(m) < 4 {
+		return "", "", ""
+	}
+	table = strings.ToLower(strings.Trim(m[1], "[]"))
+	col = strings.ToLower(strings.Trim(m[2], "[]"))
+	colType = strings.TrimSpace(m[3])
+	// Trim trailing keywords like DEFAULT, NOT NULL, etc.
+	for _, kw := range []string{"DEFAULT", "NOT NULL", "NULL", "CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "REFERENCES"} {
+		if idx := strings.Index(strings.ToUpper(colType), kw); idx > 0 {
+			colType = strings.TrimSpace(colType[:idx])
+		}
+	}
+	return table, col, colType
+}
+
+// Regex for ALTER TABLE ... DROP COLUMN column_name
+var reAlterDrop = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+\[?(\w+)\]?\s+DROP\s+COLUMN\s+\[?(\w+)\]?`)
+
+// parseMSSQLAlterDropColumn parses "ALTER TABLE t DROP COLUMN col" for MSSQL.
+func parseMSSQLAlterDropColumn(sql string) (table, col string) {
+	m := reAlterDrop.FindStringSubmatch(sql)
+	if len(m) < 3 {
+		return "", ""
+	}
+	return strings.ToLower(strings.Trim(m[1], "[]")), strings.ToLower(strings.Trim(m[2], "[]"))
 }

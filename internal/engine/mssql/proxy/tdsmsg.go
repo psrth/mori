@@ -120,19 +120,59 @@ func writeTDSPackets(w io.Writer, pkts []*tdsMsg) error {
 	return nil
 }
 
-// buildTDSPacket constructs a raw TDS packet.
+// maxTDSPacketPayload is the maximum payload per TDS packet.
+// The default negotiated packet size is 4096 bytes (8 header + up to 4088 payload).
+const maxTDSPacketPayload = 4088
+
+// buildTDSPacket constructs a raw TDS packet (single or multi-packet).
+// If the payload exceeds the max packet payload size, it's split across
+// multiple packets with EOM only on the final packet.
 func buildTDSPacket(pktType, status byte, payload []byte) []byte {
-	pktLen := tdsHeaderSize + len(payload)
-	raw := make([]byte, pktLen)
-	raw[0] = pktType
-	raw[1] = status
-	binary.BigEndian.PutUint16(raw[2:4], uint16(pktLen))
-	raw[4] = 0 // SPID high
-	raw[5] = 0 // SPID low
-	raw[6] = 1 // PacketID
-	raw[7] = 0 // Window
-	copy(raw[tdsHeaderSize:], payload)
-	return raw
+	if len(payload) <= maxTDSPacketPayload {
+		// Single packet.
+		pktLen := tdsHeaderSize + len(payload)
+		raw := make([]byte, pktLen)
+		raw[0] = pktType
+		raw[1] = status
+		binary.BigEndian.PutUint16(raw[2:4], uint16(pktLen))
+		raw[4] = 0 // SPID high
+		raw[5] = 0 // SPID low
+		raw[6] = 1 // PacketID
+		raw[7] = 0 // Window
+		copy(raw[tdsHeaderSize:], payload)
+		return raw
+	}
+
+	// Multi-packet: split payload.
+	var result []byte
+	packetID := byte(1)
+	for len(payload) > 0 {
+		chunkSize := len(payload)
+		if chunkSize > maxTDSPacketPayload {
+			chunkSize = maxTDSPacketPayload
+		}
+
+		pktStatus := statusNormal
+		if len(payload)-chunkSize == 0 {
+			pktStatus = status // Apply EOM only on the last packet.
+		}
+
+		pktLen := tdsHeaderSize + chunkSize
+		pkt := make([]byte, pktLen)
+		pkt[0] = pktType
+		pkt[1] = pktStatus
+		binary.BigEndian.PutUint16(pkt[2:4], uint16(pktLen))
+		pkt[4] = 0
+		pkt[5] = 0
+		pkt[6] = packetID
+		pkt[7] = 0
+		copy(pkt[tdsHeaderSize:], payload[:chunkSize])
+
+		result = append(result, pkt...)
+		payload = payload[chunkSize:]
+		packetID++
+	}
+	return result
 }
 
 // rawBytesForPackets returns the concatenated raw bytes of all packets.
@@ -200,17 +240,54 @@ func encodeUTF16LE(s string) []byte {
 }
 
 // buildSQLBatchMessage constructs a complete SQL_BATCH TDS message.
+// Includes the required Transaction Descriptor header (dataStmHdrTransDescr type 2)
+// per the TDS 7.2+ spec.
 func buildSQLBatchMessage(sql string) []byte {
 	sqlBytes := encodeUTF16LE(sql)
 
-	// ALL_HEADERS: minimal header with just the total length (no actual headers).
-	allHeadersLen := uint32(4) // Just the total-length field itself.
+	// Transaction Descriptor Header:
+	// - headerLength (4 bytes LE) = 4 + 2 + 12 = 18
+	// - headerType (2 bytes LE) = 2 (dataStmHdrTransDescr)
+	// - transDescr (8 bytes LE) = 0 (no active transaction)
+	// - outstandingReqCnt (4 bytes LE) = 1
+	var transDescHdr [18]byte
+	binary.LittleEndian.PutUint32(transDescHdr[0:4], 18)  // header length
+	binary.LittleEndian.PutUint16(transDescHdr[4:6], 2)   // header type: trans descriptor
+	binary.LittleEndian.PutUint64(transDescHdr[6:14], 0)   // transaction descriptor = 0
+	binary.LittleEndian.PutUint32(transDescHdr[14:18], 1)  // outstanding request count = 1
+
+	// ALL_HEADERS total length = 4 (length field) + 18 (trans descriptor header) = 22
+	var allHeaders [4]byte
+	binary.LittleEndian.PutUint32(allHeaders[0:4], 22)
+
 	var payload []byte
-	lenBuf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(lenBuf, allHeadersLen)
-	payload = append(payload, lenBuf...)
+	payload = append(payload, allHeaders[:]...)
+	payload = append(payload, transDescHdr[:]...)
 	payload = append(payload, sqlBytes...)
 
+	return buildTDSPacket(typeSQLBatch, statusEOM, payload)
+}
+
+// extractAllHeaders returns the ALL_HEADERS bytes from a SQL_BATCH payload.
+// The ALL_HEADERS section starts at offset 0 and has a 4-byte LE total-length prefix.
+func extractAllHeaders(payload []byte) []byte {
+	if len(payload) < 4 {
+		return nil
+	}
+	totalLen := int(binary.LittleEndian.Uint32(payload[0:4]))
+	if totalLen < 4 || totalLen > len(payload) {
+		return nil
+	}
+	return payload[:totalLen]
+}
+
+// buildSQLBatchWithHeaders constructs a SQL_BATCH TDS message reusing
+// the given ALL_HEADERS bytes (which include MARS transaction descriptors).
+func buildSQLBatchWithHeaders(allHeaders []byte, sql string) []byte {
+	sqlBytes := encodeUTF16LE(sql)
+	var payload []byte
+	payload = append(payload, allHeaders...)
+	payload = append(payload, sqlBytes...)
 	return buildTDSPacket(typeSQLBatch, statusEOM, payload)
 }
 
