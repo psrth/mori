@@ -30,6 +30,9 @@ func init() {
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(logCmd)
 	rootCmd.AddCommand(inspectCmd)
+	rootCmd.AddCommand(lsCmd)
+	rootCmd.AddCommand(rmCmd)
+	rootCmd.AddCommand(configCmd)
 }
 
 func main() {

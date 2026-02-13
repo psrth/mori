@@ -24,15 +24,16 @@ const (
 
 // Config holds all Mori project configuration.
 type Config struct {
-	ProdConnection  string    `json:"prod_connection"`
-	ShadowPort      int       `json:"shadow_port"`
-	ShadowContainer string    `json:"shadow_container"`
-	ShadowImage     string    `json:"shadow_image"`
-	Engine          string    `json:"engine"`
-	EngineVersion   string    `json:"engine_version"`
-	ProxyPort       int       `json:"proxy_port"`
-	Extensions      []string  `json:"extensions"`
-	InitializedAt   time.Time `json:"initialized_at"`
+	ProdConnection   string    `json:"prod_connection"`
+	ShadowPort       int       `json:"shadow_port"`
+	ShadowContainer  string    `json:"shadow_container"`
+	ShadowImage      string    `json:"shadow_image"`
+	Engine           string    `json:"engine"`
+	EngineVersion    string    `json:"engine_version"`
+	ProxyPort        int       `json:"proxy_port"`
+	Extensions       []string  `json:"extensions"`
+	InitializedAt    time.Time `json:"initialized_at"`
+	ActiveConnection string    `json:"active_connection,omitempty"` // name from mori.yaml
 }
 
 // MoriDirPath returns the absolute path to the .mori/ directory
@@ -113,20 +114,25 @@ func (c *Config) RedactedProdConnection() string {
 }
 
 // FindProjectRoot walks up the directory tree from the current working directory
-// looking for a .mori/ directory. Returns the path to the project root, or
-// the current working directory if no .mori/ directory is found.
+// looking for a .mori/ directory or mori.yaml file. Returns the path to the
+// project root, or the current working directory if neither is found.
 func FindProjectRoot() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
 	for {
+		// Check for .mori/ directory (runtime state).
 		if _, err := os.Stat(filepath.Join(dir, MoriDir)); err == nil {
+			return dir, nil
+		}
+		// Check for mori.yaml (project config).
+		if _, err := os.Stat(filepath.Join(dir, ProjectConfigFile)); err == nil {
 			return dir, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			// Reached filesystem root without finding .mori/
+			// Reached filesystem root without finding either marker.
 			wd, err := os.Getwd()
 			if err != nil {
 				return "", err

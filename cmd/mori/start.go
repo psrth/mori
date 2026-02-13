@@ -7,28 +7,38 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/huh"
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/mori-dev/mori/internal/engine/postgres"
 	"github.com/mori-dev/mori/internal/engine/postgres/classify"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 	"github.com/mori-dev/mori/internal/engine/postgres/proxy"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/mori-dev/mori/internal/logging"
 	morimcp "github.com/mori-dev/mori/internal/mcp"
+	"github.com/mori-dev/mori/internal/registry"
 	"github.com/spf13/cobra"
 )
 
 var startCmd = &cobra.Command{
-	Use:   "start",
+	Use:   "start [connection-name]",
 	Short: "Start the Mori proxy",
-	Long: `Start the Mori proxy, which listens on localhost and accepts database
-connections from your application. All traffic is forwarded to the production
-database transparently.`,
+	Long: `Start the Mori proxy for a named connection from mori.yaml.
+
+If no connection name is given and only one connection exists, it is selected
+automatically. If multiple connections exist, an interactive picker is shown.
+
+On first start for a connection, the Shadow database container is created
+and the production schema is dumped. Subsequent starts reuse the existing
+Shadow.`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runStart,
 }
 
@@ -45,28 +55,86 @@ func runStart(cmd *cobra.Command, args []string) error {
 	mcpEnabled, _ := cmd.Flags().GetBool("mcp")
 	mcpPort, _ := cmd.Flags().GetInt("mcp-port")
 
-	// 1. Find project root and read config.
+	// 1. Find project root.
 	projectRoot, err := config.FindProjectRoot()
 	if err != nil {
 		return fmt.Errorf("failed to determine project root: %w", err)
 	}
-	if !config.IsInitialized(projectRoot) {
-		return fmt.Errorf("mori is not initialized — run 'mori init --from <conn_string>' first")
-	}
 
-	cfg, err := config.ReadConfig(projectRoot)
+	// 2. Read mori.yaml.
+	if !config.HasProjectConfig(projectRoot) {
+		return fmt.Errorf("no mori.yaml found — run 'mori init' to configure a connection")
+	}
+	projCfg, err := config.ReadProjectConfig(projectRoot)
 	if err != nil {
-		return fmt.Errorf("failed to read config: %w", err)
+		return fmt.Errorf("failed to read mori.yaml: %w", err)
+	}
+	if len(projCfg.Connections) == 0 {
+		return fmt.Errorf("no connections in mori.yaml — run 'mori init' to add one")
 	}
 
-	// 2. Parse prod address from config.
+	// 3. Determine which connection to start.
+	connName, err := resolveConnectionName(projCfg, args)
+	if err != nil {
+		return err
+	}
+	conn := projCfg.GetConnection(connName)
+	if conn == nil {
+		return fmt.Errorf("connection %q not found in mori.yaml", connName)
+	}
+
+	// 4. Check engine is supported.
+	if !registry.IsEngineSupported(registry.EngineID(conn.Engine)) {
+		return fmt.Errorf("engine %q is not yet supported — only PostgreSQL and CockroachDB connections can be started", conn.Engine)
+	}
+
+	// 5. Check for existing active connection.
+	var cfg *config.Config
+	if config.IsInitialized(projectRoot) {
+		cfg, err = config.ReadConfig(projectRoot)
+		if err != nil {
+			return fmt.Errorf("failed to read runtime config: %w", err)
+		}
+		if cfg.ActiveConnection != "" && cfg.ActiveConnection != connName {
+			return fmt.Errorf("connection %q is currently active — run 'mori stop' first, then 'mori start %s'",
+				cfg.ActiveConnection, connName)
+		}
+	}
+
+	// 6. If no runtime config exists, run the full postgres init (first start).
+	if cfg == nil {
+		fmt.Printf("First start for %q — setting up Shadow database...\n\n", connName)
+		result, err := postgres.Init(cmd.Context(), postgres.InitOptions{
+			ProdConnStr: conn.ToConnString(),
+			ProjectRoot: projectRoot,
+		})
+		if err != nil {
+			return err
+		}
+		cfg = result.Config
+		cfg.ActiveConnection = connName
+		if err := config.WriteConfig(projectRoot, cfg); err != nil {
+			return fmt.Errorf("failed to update config with active connection: %w", err)
+		}
+
+		fmt.Println()
+		fmt.Printf("Shadow ready — %s %s\n", cfg.Engine, cfg.EngineVersion)
+		fmt.Printf("  Shadow: localhost:%d (container: %s)\n", result.Container.HostPort, result.Container.ContainerName)
+		fmt.Printf("  Tables: %d\n", len(result.Dump.Tables))
+		if len(cfg.Extensions) > 0 {
+			fmt.Printf("  Extensions: %s\n", strings.Join(cfg.Extensions, ", "))
+		}
+		fmt.Println()
+	}
+
+	// 7. Parse prod address from config.
 	dsn, err := connstr.Parse(cfg.ProdConnection)
 	if err != nil {
 		return fmt.Errorf("invalid prod connection in config: %w", err)
 	}
 	prodAddr := dsn.Address()
 
-	// 3. Check for an existing proxy (stale PID file).
+	// 8. Check for an existing proxy (stale PID file).
 	pidPath := config.PidFilePath(projectRoot)
 	if data, err := os.ReadFile(pidPath); err == nil {
 		if pid, err := strconv.Atoi(string(data)); err == nil {
@@ -79,12 +147,12 @@ func runStart(cmd *cobra.Command, args []string) error {
 		os.Remove(pidPath)
 	}
 
-	// 4. Write PID file.
+	// 9. Write PID file.
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
 		return fmt.Errorf("failed to write PID file: %w", err)
 	}
 
-	// 5. Load table metadata for classifier.
+	// 10. Load table metadata for classifier.
 	moriDir := config.MoriDirPath(projectRoot)
 	tables, err := schema.ReadTables(moriDir)
 	if err != nil {
@@ -94,10 +162,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 		tables = make(map[string]schema.TableMeta)
 	}
 
-	// 6. Create classifier.
+	// 11. Create classifier.
 	classifier := classify.New(tables)
 
-	// 7. Load delta state.
+	// 12. Load delta state.
 	deltaMap := delta.NewMap()
 	if dm, err := delta.ReadDeltaMap(moriDir); err == nil {
 		deltaMap = dm
@@ -112,7 +180,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("No existing tombstones found (starting clean): %v", err)
 	}
 
-	// 8. Load schema registry.
+	// 13. Load schema registry.
 	schemaReg := coreSchema.NewRegistry()
 	if sr, err := coreSchema.ReadRegistry(moriDir); err == nil {
 		schemaReg = sr
@@ -120,13 +188,13 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("No existing schema registry found (starting clean): %v", err)
 	}
 
-	// 9. Create router.
+	// 14. Create router.
 	router := core.NewRouter(deltaMap, tombstones, schemaReg)
 
-	// 10. Compute Shadow address.
+	// 15. Compute Shadow address.
 	shadowAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ShadowPort)
 
-	// 10b. Create structured logger.
+	// 16. Create structured logger.
 	var logger *logging.Logger
 	if l, err := logging.New(config.LogFilePath(projectRoot)); err != nil {
 		log.Printf("Warning: could not create log file: %v (structured logging disabled)", err)
@@ -134,11 +202,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		logger = l
 	}
 
-	// 11. Create proxy.
+	// 17. Create proxy.
 	p := proxy.New(prodAddr, shadowAddr, dsn.DBName, port, verbose, classifier, router,
 		deltaMap, tombstones, tables, moriDir, schemaReg, logger)
 
-	// 11. Set up signal handling.
+	// 18. Set up signal handling.
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
@@ -150,7 +218,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		errCh <- p.ListenAndServe(ctx)
 	}()
 
-	// 12. Optionally start MCP server.
+	// 19. Optionally start MCP server.
 	var mcpSrv *morimcp.Server
 	if mcpEnabled {
 		mcpSrv = morimcp.New(mcpPort, port, dsn.DBName, dsn.User, dsn.Password)
@@ -161,7 +229,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	fmt.Printf("Mori proxy started on 127.0.0.1:%d → %s\n", port, prodAddr)
+	fmt.Printf("Mori proxy started on 127.0.0.1:%d → %s [%s]\n", port, prodAddr, connName)
 	fmt.Printf("  Prod:   %s\n", cfg.RedactedProdConnection())
 	fmt.Printf("  Shadow: %s\n", shadowAddr)
 	if mcpEnabled {
@@ -172,7 +240,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println("Press Ctrl+C to stop.")
 
-	// 12. Wait for signal or error.
+	// 20. Wait for signal or error.
 	select {
 	case sig := <-sigCh:
 		fmt.Printf("\nReceived %s, shutting down...\n", sig)
@@ -182,7 +250,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 13. Graceful shutdown with 10-second timeout.
+	// 21. Graceful shutdown with 10-second timeout.
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -196,9 +264,50 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("Shutdown timeout: %v", err)
 	}
 
-	// 14. Remove PID file.
+	// 22. Remove PID file.
 	os.Remove(pidPath)
-	fmt.Println("Mori proxy stopped.")
+	fmt.Printf("Mori proxy stopped [%s].\n", connName)
 
 	return nil
+}
+
+// resolveConnectionName determines which connection to use based on args and config.
+func resolveConnectionName(projCfg *config.ProjectConfig, args []string) (string, error) {
+	// Explicit name provided.
+	if len(args) == 1 {
+		return args[0], nil
+	}
+
+	names := projCfg.ConnectionNames()
+
+	// Only one connection — auto-select.
+	if len(names) == 1 {
+		return names[0], nil
+	}
+
+	// Multiple connections — interactive picker.
+	var options []huh.Option[string]
+	for _, name := range names {
+		conn := projCfg.GetConnection(name)
+		label := fmt.Sprintf("%s  (%s / %s)", name, conn.Engine, conn.Provider)
+		if conn.Host != "" {
+			label = fmt.Sprintf("%s  (%s @ %s)", name, conn.Engine, conn.Host)
+		}
+		options = append(options, huh.NewOption(label, name))
+	}
+
+	var selected string
+	err := huh.NewForm(
+		huh.NewGroup(
+			huh.NewSelect[string]().
+				Title("Select connection to start").
+				Options(options...).
+				Value(&selected),
+		),
+	).Run()
+	if err != nil {
+		return "", err
+	}
+
+	return selected, nil
 }
