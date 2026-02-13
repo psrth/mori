@@ -120,9 +120,25 @@ func (pc *ProjectConfig) GetConnection(name string) *Connection {
 	return pc.Connections[name]
 }
 
-// ToConnString builds a postgres:// connection string from the connection fields.
-// Only valid for postgres-compatible engines (postgres, cockroachdb).
+// ToConnString builds a connection string from the connection fields.
+// Dispatches based on the Engine field to produce the correct format.
 func (c *Connection) ToConnString() string {
+	switch c.Engine {
+	case "mssql":
+		return c.toMSSQLConnString()
+	case "mysql", "mariadb":
+		return c.toMySQLConnString()
+	case "oracle":
+		return c.toOracleConnString()
+	case "sqlite":
+		return c.toSQLiteConnString()
+	default:
+		// postgres, cockroachdb, and any other pg-compatible engine.
+		return c.toPostgresConnString()
+	}
+}
+
+func (c *Connection) toPostgresConnString() string {
 	sslMode := c.SSLMode
 	if sslMode == "" {
 		sslMode = "disable"
@@ -141,6 +157,73 @@ func (c *Connection) ToConnString() string {
 	q.Set("sslmode", sslMode)
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+func (c *Connection) toMSSQLConnString() string {
+	host := c.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := c.Port
+	if port == 0 {
+		port = 1433
+	}
+	u := &url.URL{
+		Scheme: "sqlserver",
+		User:   url.UserPassword(c.User, c.Password),
+		Host:   fmt.Sprintf("%s:%d", host, port),
+	}
+	q := u.Query()
+	if c.Database != "" {
+		q.Set("database", c.Database)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func (c *Connection) toMySQLConnString() string {
+	host := c.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := c.Port
+	if port == 0 {
+		port = 3306
+	}
+	// Format: user:pass@tcp(host:port)/database
+	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s",
+		url.PathEscape(c.User), url.PathEscape(c.Password),
+		host, port, c.Database)
+}
+
+func (c *Connection) toOracleConnString() string {
+	host := c.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := c.Port
+	if port == 0 {
+		port = 1521
+	}
+	svcName := c.Extra["service_name"]
+	if svcName == "" {
+		svcName = c.Database
+	}
+	u := &url.URL{
+		Scheme: "oracle",
+		User:   url.UserPassword(c.User, c.Password),
+		Host:   fmt.Sprintf("%s:%d", host, port),
+		Path:   svcName,
+	}
+	return u.String()
+}
+
+func (c *Connection) toSQLiteConnString() string {
+	// SQLite connection string is just the file path.
+	if p, ok := c.Extra["path"]; ok {
+		return p
+	}
+	return c.Database
 }
 
 // RedactedPassword returns the password masked for display.
