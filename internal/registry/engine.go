@@ -46,7 +46,7 @@ var engines = []Engine{
 	{Postgres, "PostgreSQL", EngineTierT1, "SQL/PGWIRE", 5432, true},
 	{CockroachDB, "CockroachDB", EngineTierT1, "SQL/PGWIRE", 26257, true},
 	{MySQL, "MySQL", EngineTierT1, "SQL/MYSQL", 3306, true},
-	{MariaDB, "MariaDB", EngineTierT1, "SQL/MYSQL", 3306, false},
+	{MariaDB, "MariaDB", EngineTierT1, "SQL/MYSQL", 3306, true},
 
 	// T2 — SQL / new wire protocols
 	{MSSQL, "MS SQL Server", EngineTierT2, "SQL/TDS", 1433, false},
