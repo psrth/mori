@@ -5,6 +5,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	_ "github.com/mori-dev/mori/internal/auth/providers"
 )
 
 // Version is set at build time via ldflags.

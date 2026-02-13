@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh"
+	"github.com/mori-dev/mori/internal/auth"
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/core/delta"
@@ -104,8 +105,13 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 6. If no runtime config exists, run the full postgres init (first start).
 	if cfg == nil {
 		fmt.Printf("First start for %q — setting up Shadow database...\n\n", connName)
+		authProvider := auth.Lookup(registry.ProviderID(conn.Provider))
+		connStr, err := authProvider.ConnString(cmd.Context(), conn)
+		if err != nil {
+			return fmt.Errorf("failed to build connection string: %w", err)
+		}
 		result, err := postgres.Init(cmd.Context(), postgres.InitOptions{
-			ProdConnStr: conn.ToConnString(),
+			ProdConnStr: connStr,
 			ProjectRoot: projectRoot,
 		})
 		if err != nil {
