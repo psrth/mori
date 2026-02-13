@@ -7,6 +7,7 @@ import (
 
 	"github.com/charmbracelet/huh"
 
+	"github.com/mori-dev/mori/internal/auth"
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/registry"
 )
@@ -59,10 +60,14 @@ func runInteractiveInit(projectRoot string, existingCfg *config.ProjectConfig) e
 	}
 
 	// ── Step 3: Collect connection fields ────────────────────────
-	fields := registry.FieldsWithProviderDefaults(
-		registry.EngineID(engineID),
-		registry.ProviderID(providerID),
-	)
+	authProvider := auth.Lookup(registry.ProviderID(providerID))
+	fields := authProvider.Fields(registry.EngineID(engineID))
+	if fields == nil {
+		fields = registry.FieldsWithProviderDefaults(
+			registry.EngineID(engineID),
+			registry.ProviderID(providerID),
+		)
+	}
 
 	// Allocate string pointers for each field so huh can bind to them.
 	fieldPtrs := make([]*string, len(fields))
