@@ -58,8 +58,6 @@ func readTNSPacketWith(r io.Reader, use32bitLen bool) (*tnsMsg, error) {
 	}
 	packetType := header[4]
 
-	log.Printf("[tns] readPacket: use32bit=%v header=%x packetLen=%d type=%d", use32bitLen, header, packetLen, packetType)
-
 	if packetLen < 8 {
 		return nil, fmt.Errorf("invalid TNS packet length: %d (header=%x, use32bit=%v)", packetLen, header, use32bitLen)
 	}
