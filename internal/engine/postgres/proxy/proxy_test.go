@@ -48,10 +48,11 @@ func waitForListener(t *testing.T, p *Proxy, timeout time.Duration) {
 	}
 }
 
-func TestProxyRelay(t *testing.T) {
+func TestProxyRelay_RefusesWithoutShadow(t *testing.T) {
 	echoAddr, cleanup := startEchoServer(t)
 	defer cleanup()
 
+	// Without shadow/classifier/router, the write guard should refuse connections.
 	p := New(echoAddr, "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -66,18 +67,16 @@ func TestProxyRelay(t *testing.T) {
 	}
 	defer conn.Close()
 
-	msg := []byte("hello proxy")
-	if _, err := conn.Write(msg); err != nil {
-		t.Fatal(err)
-	}
-
-	buf := make([]byte, len(msg))
+	// The proxy should send an error response and close the connection.
+	buf := make([]byte, 256)
 	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, err := io.ReadFull(conn, buf); err != nil {
+	n, err := conn.Read(buf)
+	if err != nil && n == 0 {
 		t.Fatal(err)
 	}
-	if string(buf) != string(msg) {
-		t.Errorf("got %q, want %q", buf, msg)
+	// The response should start with 'E' (ErrorResponse).
+	if n > 0 && buf[0] != 'E' {
+		t.Errorf("expected ErrorResponse ('E'), got %q", buf[0])
 	}
 
 	cancel()
@@ -167,10 +166,11 @@ func TestProxyShutdownDrains(t *testing.T) {
 	}
 }
 
-func TestProxyConcurrentConns(t *testing.T) {
+func TestProxyConcurrentConns_RefusesWithoutShadow(t *testing.T) {
 	echoAddr, cleanup := startEchoServer(t)
 	defer cleanup()
 
+	// Without shadow, all connections should be refused with an error response.
 	p := New(echoAddr, "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -193,20 +193,16 @@ func TestProxyConcurrentConns(t *testing.T) {
 			}
 			defer conn.Close()
 
-			msg := []byte("ping")
-			if _, err := conn.Write(msg); err != nil {
-				t.Errorf("conn %d: write error: %v", id, err)
-				return
-			}
-
-			buf := make([]byte, len(msg))
+			// Each connection should receive an error response.
+			buf := make([]byte, 256)
 			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-			if _, err := io.ReadFull(conn, buf); err != nil {
+			n, err := conn.Read(buf)
+			if err != nil && n == 0 {
 				t.Errorf("conn %d: read error: %v", id, err)
 				return
 			}
-			if string(buf) != string(msg) {
-				t.Errorf("conn %d: got %q, want %q", id, buf, msg)
+			if n > 0 && buf[0] != 'E' {
+				t.Errorf("conn %d: expected ErrorResponse ('E'), got %q", id, buf[0])
 			}
 		}(i)
 	}

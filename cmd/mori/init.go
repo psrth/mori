@@ -4,8 +4,12 @@ import (
 	"fmt"
 
 	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
+	"github.com/mori-dev/mori/internal/engine"
+	"github.com/mori-dev/mori/internal/registry"
 	"github.com/spf13/cobra"
+
+	// Register engine implementations via side-effect imports.
+	_ "github.com/mori-dev/mori/internal/engine/postgres"
 )
 
 var initCmd = &cobra.Command{
@@ -69,8 +73,13 @@ func runNonInteractiveInit(projectRoot string, existing *config.ProjectConfig, c
 		return fmt.Errorf("connection %q already exists in mori.yaml", name)
 	}
 
-	// Parse the connection string into fields.
-	dsn, err := connstr.Parse(connStr)
+	// Parse the connection string via the engine interface.
+	// The --from flag assumes postgres for connection string parsing.
+	eng, err := engine.Lookup(registry.Postgres)
+	if err != nil {
+		return fmt.Errorf("postgres engine not available: %w", err)
+	}
+	connInfo, err := eng.ParseConnStr(connStr)
 	if err != nil {
 		return fmt.Errorf("invalid connection string: %w", err)
 	}
@@ -78,12 +87,12 @@ func runNonInteractiveInit(projectRoot string, existing *config.ProjectConfig, c
 	conn := &config.Connection{
 		Engine:   "postgres",
 		Provider: "direct",
-		Host:     dsn.Host,
-		Port:     dsn.Port,
-		User:     dsn.User,
-		Password: dsn.Password,
-		Database: dsn.DBName,
-		SSLMode:  dsn.SSLMode,
+		Host:     connInfo.Host,
+		Port:     connInfo.Port,
+		User:     connInfo.User,
+		Password: connInfo.Password,
+		Database: connInfo.DBName,
+		SSLMode:  connInfo.SSLMode,
 	}
 
 	if existing == nil {
@@ -99,8 +108,8 @@ func runNonInteractiveInit(projectRoot string, existing *config.ProjectConfig, c
 	fmt.Printf("  Connection %q saved to mori.yaml\n", name)
 	fmt.Printf("    Engine:   PostgreSQL\n")
 	fmt.Printf("    Provider: Direct / Self-Hosted\n")
-	fmt.Printf("    Host:     %s:%d\n", dsn.Host, dsn.Port)
-	fmt.Printf("    Database: %s\n", dsn.DBName)
+	fmt.Printf("    Host:     %s:%d\n", connInfo.Host, connInfo.Port)
+	fmt.Printf("    Database: %s\n", connInfo.DBName)
 	fmt.Println()
 	fmt.Printf("  Next: run 'mori start %s' to begin proxying.\n", name)
 	fmt.Println()
