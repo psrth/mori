@@ -17,15 +17,14 @@ import (
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/engine/postgres"
-	"github.com/mori-dev/mori/internal/engine/postgres/classify"
-	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
-	"github.com/mori-dev/mori/internal/engine/postgres/proxy"
-	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/engine"
 	"github.com/mori-dev/mori/internal/logging"
 	morimcp "github.com/mori-dev/mori/internal/mcp"
 	"github.com/mori-dev/mori/internal/registry"
 	"github.com/spf13/cobra"
+
+	// Register engine implementations via side-effect imports.
+	_ "github.com/mori-dev/mori/internal/engine/postgres"
 )
 
 var startCmd = &cobra.Command{
@@ -84,8 +83,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("connection %q not found in mori.yaml", connName)
 	}
 
-	// 4. Check engine is supported.
-	if !registry.IsEngineSupported(registry.EngineID(conn.Engine)) {
+	// 4. Look up the engine implementation.
+	eng, err := engine.Lookup(registry.EngineID(conn.Engine))
+	if err != nil {
 		return fmt.Errorf("engine %q is not yet supported — only PostgreSQL and CockroachDB connections can be started", conn.Engine)
 	}
 
@@ -102,7 +102,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 6. If no runtime config exists, run the full postgres init (first start).
+	// 6. If no runtime config exists, run the engine init (first start).
 	if cfg == nil {
 		fmt.Printf("First start for %q — setting up Shadow database...\n\n", connName)
 		authProvider := auth.Lookup(registry.ProviderID(conn.Provider))
@@ -110,7 +110,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to build connection string: %w", err)
 		}
-		result, err := postgres.Init(cmd.Context(), postgres.InitOptions{
+		result, err := eng.Init(cmd.Context(), engine.InitOptions{
 			ProdConnStr: connStr,
 			ProjectRoot: projectRoot,
 		})
@@ -125,8 +125,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 		fmt.Println()
 		fmt.Printf("Shadow ready — %s %s\n", cfg.Engine, cfg.EngineVersion)
-		fmt.Printf("  Shadow: localhost:%d (container: %s)\n", result.Container.HostPort, result.Container.ContainerName)
-		fmt.Printf("  Tables: %d\n", len(result.Dump.Tables))
+		fmt.Printf("  Shadow: localhost:%d (container: %s)\n", result.ContainerPort, result.ContainerName)
+		fmt.Printf("  Tables: %d\n", result.TableCount)
 		if len(cfg.Extensions) > 0 {
 			fmt.Printf("  Extensions: %s\n", strings.Join(cfg.Extensions, ", "))
 		}
@@ -134,11 +134,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// 7. Parse prod address from config.
-	dsn, err := connstr.Parse(cfg.ProdConnection)
+	connInfo, err := eng.ParseConnStr(cfg.ProdConnection)
 	if err != nil {
 		return fmt.Errorf("invalid prod connection in config: %w", err)
 	}
-	prodAddr := dsn.Address()
+	prodAddr := connInfo.Addr
 
 	// 8. Check for an existing proxy (stale PID file).
 	pidPath := config.PidFilePath(projectRoot)
@@ -160,16 +160,16 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	// 10. Load table metadata for classifier.
 	moriDir := config.MoriDirPath(projectRoot)
-	tables, err := schema.ReadTables(moriDir)
+	tables, err := eng.LoadTableMeta(moriDir)
 	if err != nil {
 		if verbose {
 			log.Printf("Warning: could not load table metadata: %v (classifier will run without PK info)", err)
 		}
-		tables = make(map[string]schema.TableMeta)
+		tables = make(map[string]engine.TableMeta)
 	}
 
 	// 11. Create classifier.
-	classifier := classify.New(tables)
+	classifier := eng.NewClassifier(tables)
 
 	// 12. Load delta state.
 	deltaMap := delta.NewMap()
@@ -209,8 +209,20 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// 17. Create proxy.
-	p := proxy.New(prodAddr, shadowAddr, dsn.DBName, port, verbose, classifier, router,
-		deltaMap, tombstones, tables, moriDir, schemaReg, logger)
+	p := eng.NewProxy(engine.ProxyDeps{
+		ProdAddr:   prodAddr,
+		ShadowAddr: shadowAddr,
+		DBName:     connInfo.DBName,
+		ListenPort: port,
+		Verbose:    verbose,
+		Classifier: classifier,
+		Router:     router,
+		DeltaMap:   deltaMap,
+		Tombstones: tombstones,
+		SchemaReg:  schemaReg,
+		MoriDir:    moriDir,
+		Logger:     logger,
+	}, tables)
 
 	// 18. Set up signal handling.
 	ctx, cancel := context.WithCancel(cmd.Context())
@@ -227,7 +239,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 19. Optionally start MCP server.
 	var mcpSrv *morimcp.Server
 	if mcpEnabled {
-		mcpSrv = morimcp.New(mcpPort, port, dsn.DBName, dsn.User, dsn.Password)
+		mcpSrv = morimcp.New(mcpPort, port, connInfo.DBName, connInfo.User, connInfo.Password)
 		go func() {
 			if err := mcpSrv.ListenAndServe(ctx); err != nil {
 				log.Printf("MCP server error: %v", err)

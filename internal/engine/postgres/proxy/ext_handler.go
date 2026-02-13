@@ -160,6 +160,11 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) error {
 
 	strategy := eh.router.Route(cl)
 
+	// WRITE GUARD L1: validate routing decision.
+	if err := validateRouteDecision(cl, strategy, eh.connID, eh.logger); err != nil {
+		strategy = core.StrategyShadowWrite
+	}
+
 	if eh.verbose {
 		log.Printf("[conn %d] ext: %s/%s tables=%v → %s | %s",
 			eh.connID, cl.OpType, cl.SubType,

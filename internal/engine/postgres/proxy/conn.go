@@ -28,62 +28,29 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 		return
 	}
 
-	// If routing is not available, fall back to relay mode.
+	// WRITE GUARD: if routing is not available, refuse the connection to protect production.
 	if !p.canRoute() {
-		p.relayConn(clientConn, prodConn, connID)
+		log.Printf("[conn %d] WRITE GUARD: shadow unavailable, refusing connection", connID)
+		errResp := buildGuardErrorResponse("mori: shadow database unavailable, refusing connection to protect production")
+		clientConn.Write(errResp)
+		clientConn.Close()
+		prodConn.Close()
 		return
 	}
 
 	// Perform the startup handshake and connect to Shadow.
 	shadowConn, err := p.performStartup(clientConn, prodConn, connID)
 	if err != nil || shadowConn == nil {
-		if p.verbose && err != nil {
-			log.Printf("[conn %d] Shadow handshake failed, degrading to relay: %v", connID, err)
-		}
-		p.relayConn(clientConn, prodConn, connID)
+		log.Printf("[conn %d] WRITE GUARD: shadow handshake failed, refusing connection: %v", connID, err)
+		errResp := buildGuardErrorResponse("mori: shadow database unavailable, refusing connection to protect production")
+		clientConn.Write(errResp)
+		clientConn.Close()
+		prodConn.Close()
 		return
 	}
 
-	p.routeLoop(clientConn, prodConn, shadowConn, connID)
-}
-
-// relayConn is the Phase 3 fallback: bidirectional io.Copy between client and Prod.
-func (p *Proxy) relayConn(clientConn, prodConn net.Conn, connID int64) {
-	var closeOnce sync.Once
-	closeBoth := func() {
-		closeOnce.Do(func() {
-			clientConn.Close()
-			prodConn.Close()
-		})
-	}
-	defer closeBoth()
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(prodConn, clientConn)
-		if p.verbose && err != nil {
-			log.Printf("[conn %d] client→prod: %v", connID, err)
-		}
-		closeBoth()
-	}()
-
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(clientConn, prodConn)
-		if p.verbose && err != nil {
-			log.Printf("[conn %d] prod→client: %v", connID, err)
-		}
-		closeBoth()
-	}()
-
-	wg.Wait()
-
-	if p.verbose {
-		log.Printf("[conn %d] closed (relay mode)", connID)
-	}
+	guardedProd := NewSafeProdConn(prodConn, connID, p.verbose, p.logger)
+	p.routeLoop(clientConn, guardedProd, shadowConn, connID)
 }
 
 // performStartup handles the PG startup handshake phase.
@@ -438,6 +405,15 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 
 		switch decision.target {
 		case targetProd:
+			// WRITE GUARD L3: final check before prod dispatch.
+			if decision.classification != nil &&
+				(decision.classification.OpType == core.OpWrite || decision.classification.OpType == core.OpDDL) {
+				log.Printf("[CRITICAL] [conn %d] WRITE GUARD L3: %s/%s reached targetProd — BLOCKED",
+					connID, decision.classification.OpType, decision.classification.SubType)
+				errResp := buildGuardErrorResponse("mori: write operation blocked — internal routing error detected")
+				clientConn.Write(errResp)
+				continue
+			}
 			if err := forwardAndRelay(msg.Raw, prodConn, clientConn); err != nil {
 				if p.verbose {
 					log.Printf("[conn %d] prod relay error: %v", connID, err)
@@ -495,6 +471,16 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 	}
 
 	strategy := p.router.Route(classification)
+
+	// WRITE GUARD L1: validate routing decision.
+	if err := validateRouteDecision(classification, strategy, connID, p.logger); err != nil {
+		return routeDecision{
+			target:         targetShadow,
+			classification: classification,
+			strategy:       core.StrategyShadowWrite,
+		}
+	}
+
 	elapsed := time.Since(start)
 
 	if p.verbose {
