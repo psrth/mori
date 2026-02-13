@@ -186,9 +186,9 @@ func seedProdDatabase(ctx context.Context) error {
 	return nil
 }
 
-// runMoriInit runs `mori init --from <prodDSN>` from the project directory.
+// runMoriInit runs `mori init --from <prodDSN> --name e2e` from the project directory.
 func runMoriInit(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, moriBin, "init", "--from", prodDSN)
+	cmd := exec.CommandContext(ctx, moriBin, "init", "--from", prodDSN, "--name", "e2e")
 	cmd.Dir = projectDir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

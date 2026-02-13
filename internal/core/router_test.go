@@ -195,9 +195,9 @@ func TestRouterSchemaDiffTriggersMergedRead(t *testing.T) {
 		t.Errorf("SELECT on clean table: got %s, want PROD_DIRECT", got)
 	}
 
-	// JOIN where one table has schema diff → JoinPatch.
+	// JOIN where one table has schema diff → MergedRead (Prod would reject new columns).
 	cl3 := &Classification{OpType: OpRead, SubType: SubSelect, Tables: []string{"users", "orders"}, IsJoin: true}
-	if got := r.Route(cl3); got != StrategyJoinPatch {
-		t.Errorf("JOIN with schema-diff table: got %s, want JOIN_PATCH", got)
+	if got := r.Route(cl3); got != StrategyMergedRead {
+		t.Errorf("JOIN with schema-diff table: got %s, want MERGED_READ", got)
 	}
 }
