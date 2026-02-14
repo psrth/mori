@@ -35,6 +35,7 @@ func init() {
 	rootCmd.AddCommand(lsCmd)
 	rootCmd.AddCommand(rmCmd)
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(dashCmd)
 }
 
 func main() {
