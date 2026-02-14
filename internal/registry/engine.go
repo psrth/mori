@@ -54,11 +54,11 @@ var engines = []Engine{
 	{SQLite, "SQLite", EngineTierT2, "SQL/EMBEDDED", 0, true},
 
 	// T3 — NoSQL
-	{Redis, "Redis", EngineTierT3, "NOSQL", 6379, false},
+	{Redis, "Redis", EngineTierT3, "NOSQL", 6379, true},
 	{MongoDB, "MongoDB", EngineTierT3, "NOSQL", 27017, false},
 	{Elasticsearch, "Elasticsearch", EngineTierT3, "NOSQL", 9200, false},
 	{DynamoDB, "DynamoDB", EngineTierT3, "NOSQL", 0, false},
-	{Firestore, "Firestore", EngineTierT3, "NOSQL", 0, false},
+	{Firestore, "Firestore", EngineTierT3, "NOSQL", 0, true},
 
 	// T4 — Specialized
 	{Cassandra, "Cassandra / ScyllaDB", EngineTierT4, "SPECIALIZED", 9042, false},
