@@ -7,12 +7,14 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// RenderTopBar renders the top status bar inside a box border line.
-// Format: ╭─ mori ● running ─── postgres/direct ─── my-conn ─── localhost:19099 ─╮
+// RenderTopBar renders a two-line top bar:
+//
+//	Line 1: ╭─ mori ● running ───────────╮
+//	Line 2: │  DB  engine/provider  :port          PROXY  mori/conn  :port  │
 func RenderTopBar(width int, snap Snapshot) string {
 	innerW := width - 2
 
-	// Status.
+	// --- Line 1: status ---
 	var status string
 	if snap.ProxyRunning {
 		status = TopBarRunning.Render("● running")
@@ -20,56 +22,85 @@ func RenderTopBar(width int, snap Snapshot) string {
 		status = TopBarStopped.Render("○ stopped")
 	}
 	left := lipgloss.NewStyle().Bold(true).Foreground(ColorWhite).Render("mori") + " " + status
+	leftW := lipgloss.Width(left)
 
-	// Engine/provider.
-	var center string
+	fill1 := innerW - leftW - 2 // -2 for the spaces around content
+	if fill1 < 0 {
+		fill1 = 0
+	}
+
+	line1 := BorderStyle.Render("╭─") + " " + left + " " +
+		BorderStyle.Render(strings.Repeat("─", fill1)+"╮")
+
+	// --- Line 2: DB + PROXY info ---
+	pipe := BorderStyle.Render("│")
+
+	// DB section.
+	dbLabel := LabelBold.Render("DB")
+	var dbInfo string
 	if snap.Config != nil {
 		engine := snap.Config.Engine
 		provider := ""
+		dbPort := 0
 		if snap.ProjConfig != nil && snap.Config.ActiveConnection != "" {
 			if conn := snap.ProjConfig.GetConnection(snap.Config.ActiveConnection); conn != nil {
 				provider = conn.Provider
+				dbPort = conn.Port
 			}
 		}
 		if provider != "" {
-			center = fmt.Sprintf("%s/%s", engine, provider)
+			dbInfo = fmt.Sprintf("%s/%s", engine, provider)
 		} else if engine != "" {
-			center = engine
+			dbInfo = engine
+		}
+		if dbPort > 0 {
+			dbInfo += "  " + lipgloss.NewStyle().Foreground(ColorWhite).Render(fmt.Sprintf(":%d", dbPort))
 		}
 	}
 
-	// Connection name.
-	var connName string
-	if snap.Config != nil && snap.Config.ActiveConnection != "" {
-		connName = snap.Config.ActiveConnection
+	// PROXY section.
+	proxyLabel := LabelBold.Render("PROXY")
+	var proxyInfo string
+	if snap.Config != nil {
+		connName := snap.Config.ActiveConnection
+		if connName != "" {
+			proxyInfo = fmt.Sprintf("mori/%s", connName)
+		} else {
+			proxyInfo = "mori"
+		}
+		if snap.Config.ProxyPort > 0 {
+			proxyInfo += "  " + lipgloss.NewStyle().Foreground(ColorWhite).Render(fmt.Sprintf(":%d", snap.Config.ProxyPort))
+		}
 	}
 
-	// Proxy address.
-	var right string
-	if snap.Config != nil && snap.Config.ProxyPort > 0 {
-		right = fmt.Sprintf("localhost:%d", snap.Config.ProxyPort)
+	// Compose line 2 content.
+	var line2Content string
+	if dbInfo != "" && proxyInfo != "" {
+		// Space between DB and PROXY sections.
+		dbPart := "  " + dbLabel + "  " + dbInfo
+		proxyPart := proxyLabel + "  " + proxyInfo
+		dbPartW := lipgloss.Width(dbPart)
+		proxyPartW := lipgloss.Width(proxyPart)
+
+		gap := innerW - dbPartW - proxyPartW - 2 // -2 for trailing pad
+		if gap < 4 {
+			gap = 4
+		}
+		line2Content = dbPart + strings.Repeat(" ", gap) + proxyPart
+	} else if dbInfo != "" {
+		line2Content = "  " + dbLabel + "  " + dbInfo
+	} else if proxyInfo != "" {
+		line2Content = "  " + proxyLabel + "  " + proxyInfo
+	} else {
+		line2Content = "  " + DimText.Render("(not configured)")
 	}
 
-	// Build: ╭─ left ─── center ─── conn ─── right ─╮
-	parts := []string{left}
-	if center != "" {
-		parts = append(parts, center)
+	contentW := lipgloss.Width(line2Content)
+	pad2 := innerW - contentW
+	if pad2 < 0 {
+		pad2 = 0
 	}
-	if connName != "" {
-		parts = append(parts, connName)
-	}
-	if right != "" {
-		parts = append(parts, right)
-	}
+	line2 := pipe + line2Content + strings.Repeat(" ", pad2) + pipe
 
-	contentParts := strings.Join(parts, BorderStyle.Render(" ─── "))
-	contentW := lipgloss.Width(contentParts)
-
-	fill := innerW - contentW - 2
-	if fill < 0 {
-		fill = 0
-	}
-
-	return BorderStyle.Render("╭─") + " " + contentParts + " " +
-		BorderStyle.Render(strings.Repeat("─", fill)+"╮")
+	return line1 + "\n" + line2
 }

@@ -2,12 +2,8 @@ package tui
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"time"
-
-	"github.com/charmbracelet/lipgloss"
-	"github.com/mori-dev/mori/internal/logging"
 )
 
 // RenderSummary renders the session summary content (no box — composed by dashboard).
@@ -69,70 +65,6 @@ func RenderSummary(innerW, innerH int, snap Snapshot, totalQueries int) string {
 	if snap.Config != nil && !snap.Config.InitializedAt.IsZero() && snap.ProxyRunning {
 		uptime := time.Since(snap.Config.InitializedAt).Round(time.Second)
 		rows = append(rows, fmt.Sprintf(" %-*s%s", labelW, "Uptime", formatDuration(uptime)))
-	}
-
-	return strings.Join(rows, "\n")
-}
-
-// RenderRoutingChart renders a horizontal bar chart of routing strategy distribution.
-func RenderRoutingChart(innerW, innerH int, entries []logging.LogEntry) string {
-	type stratCount struct {
-		name  string
-		count int
-	}
-
-	counts := make(map[string]int)
-	total := 0
-	for _, e := range entries {
-		if e.Strategy != "" {
-			counts[e.Strategy]++
-			total++
-		}
-	}
-
-	if total == 0 {
-		return DimText.Render(" (no routing data)")
-	}
-
-	var sorted []stratCount
-	for name, count := range counts {
-		sorted = append(sorted, stratCount{name, count})
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].count > sorted[j].count
-	})
-
-	if len(sorted) > innerH {
-		sorted = sorted[:innerH]
-	}
-
-	const nameW = 18
-	barMaxW := innerW - nameW - 8
-	if barMaxW < 3 {
-		barMaxW = 3
-	}
-
-	maxCount := sorted[0].count
-
-	var rows []string
-	for _, sc := range sorted {
-		pct := float64(sc.count) / float64(total) * 100
-		barLen := int(float64(sc.count) / float64(maxCount) * float64(barMaxW))
-		if barLen < 1 && sc.count > 0 {
-			barLen = 1
-		}
-
-		style := lipgloss.NewStyle().Foreground(ColorMuted)
-		if c, ok := StrategyColor[sc.name]; ok {
-			style = lipgloss.NewStyle().Foreground(c)
-		}
-
-		nameStr := style.Render(PadRight(sc.name, nameW))
-		barStr := style.Render(strings.Repeat("█", barLen))
-		barPad := strings.Repeat(" ", barMaxW-barLen)
-		pctStr := DimText.Render(fmt.Sprintf("%3.0f%%", pct))
-
-		rows = append(rows, " "+nameStr+" "+barStr+barPad+" "+pctStr)
 	}
 
 	return strings.Join(rows, "\n")

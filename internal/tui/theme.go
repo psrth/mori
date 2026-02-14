@@ -17,7 +17,20 @@ var (
 	ColorPurple  = lipgloss.Color("#A855F7")
 	ColorWhite   = lipgloss.Color("#F9FAFB")
 	ColorDim     = lipgloss.Color("#4B5563")
-	ColorBorder  = lipgloss.Color("#555555")
+	ColorBorder  = lipgloss.Color("#3B3B3B")
+
+	// Chart colors.
+	ColorLatencyP50  = lipgloss.Color("#5B6078") // dim blue-gray
+	ColorLatencyP95  = lipgloss.Color("#8AADF4") // blue
+	ColorLatencyP99  = lipgloss.Color("#ED8796") // salmon/red
+	ColorThroughput  = lipgloss.Color("#A6DA95") // green
+
+	// Table indicator colors.
+	ColorInsert     = lipgloss.Color("#22C55E") // green (same as running)
+	ColorDelete     = lipgloss.Color("#EF4444") // red
+	ColorSchemaDiff = lipgloss.Color("#A855F7") // purple
+	ColorNewTable   = lipgloss.Color("#22C55E") // green
+	ColorDeadTable  = lipgloss.Color("#7F3333") // dim red (~50% opacity red)
 )
 
 // Strategy colors map routing strategies to colors.
@@ -71,6 +84,40 @@ var (
 
 	BorderStyle = lipgloss.NewStyle().
 			Foreground(ColorBorder)
+
+	ChartAxisStyle = lipgloss.NewStyle().
+			Foreground(ColorDim)
+
+	LegendP50 = lipgloss.NewStyle().
+			Foreground(ColorLatencyP50)
+
+	LegendP95 = lipgloss.NewStyle().
+			Foreground(ColorLatencyP95)
+
+	LegendP99 = lipgloss.NewStyle().
+			Foreground(ColorLatencyP99)
+
+	LegendThroughput = lipgloss.NewStyle().
+				Foreground(ColorThroughput)
+
+	LabelBold = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(ColorWhite)
+
+	InsertIndicator = lipgloss.NewStyle().
+			Foreground(ColorInsert)
+
+	DeleteIndicator = lipgloss.NewStyle().
+			Foreground(ColorDelete)
+
+	SchemaDiffIndicator = lipgloss.NewStyle().
+				Foreground(ColorSchemaDiff)
+
+	NewTableName = lipgloss.NewStyle().
+			Foreground(ColorNewTable)
+
+	DeadTableName = lipgloss.NewStyle().
+			Foreground(ColorDeadTable)
 )
 
 // Box renders a btop-style bordered box with a title in the top border.

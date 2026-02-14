@@ -24,16 +24,15 @@ func RenderQueryStream(innerW, innerH int, entries []logging.LogEntry) string {
 		sqlW = 10
 	}
 
-	// Show most recent entries that fit.
-	startIdx := 0
-	if len(entries) > innerH {
-		startIdx = len(entries) - innerH
-	}
-
+	// Show most recent entries first (reverse chronological).
 	var rows []string
-	for i := startIdx; i < len(entries); i++ {
-		entry := entries[i]
-		line := formatQueryLine(entry, tsW, stratW, durW, sqlW)
+	end := len(entries)
+	start := end - innerH
+	if start < 0 {
+		start = 0
+	}
+	for i := end - 1; i >= start; i-- {
+		line := formatQueryLine(entries[i], tsW, stratW, durW, sqlW)
 		rows = append(rows, line)
 	}
 

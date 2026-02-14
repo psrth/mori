@@ -78,25 +78,30 @@ func renderTableRow(table string, selected bool, nameW, totalW int, snap Snapsho
 	// Build indicator string.
 	var indicators []string
 
+	hasInserts := false
+	hasDeltaCount := false
 	if snap.DeltaMap != nil {
 		count := snap.DeltaMap.CountForTable(table)
-		hasInserts := snap.DeltaMap.HasInserts(table)
+		hasInserts = snap.DeltaMap.HasInserts(table)
 		if count > 0 {
-			indicators = append(indicators, DeltaStyle.Render(fmt.Sprintf("∆%d", count)))
+			hasDeltaCount = true
+			indicators = append(indicators, InsertIndicator.Render(fmt.Sprintf("+%d", count)))
 		} else if hasInserts {
-			indicators = append(indicators, DeltaStyle.Render("∆+"))
+			indicators = append(indicators, InsertIndicator.Render("+"))
 		}
 	}
 
+	hasTombstones := false
 	if snap.Tombstones != nil {
 		count := snap.Tombstones.CountForTable(table)
 		if count > 0 {
-			indicators = append(indicators, TombstoneStyle.Render(fmt.Sprintf("✗%d", count)))
+			hasTombstones = true
+			indicators = append(indicators, DeleteIndicator.Render(fmt.Sprintf("-%d", count)))
 		}
 	}
 
 	if snap.SchemaReg != nil && snap.SchemaReg.HasDiff(table) {
-		indicators = append(indicators, SchemaStyle.Render("~"))
+		indicators = append(indicators, SchemaDiffIndicator.Render("▲"))
 	}
 
 	prefix := " "
@@ -104,12 +109,31 @@ func renderTableRow(table string, selected bool, nameW, totalW int, snap Snapsho
 		prefix = "▸"
 	}
 
-	name := Ellipsis(table, nameW)
+	// Determine table name style.
+	_, inProd := snap.Tables[table]
+	isNew := !inProd && (hasInserts || hasDeltaCount)
+	isDead := !inProd && hasTombstones && !hasInserts && !hasDeltaCount
+
+	nameStr := Ellipsis(table, nameW)
+	var styledName string
+	switch {
+	case isNew:
+		styledName = NewTableName.Render(nameStr)
+	case isDead:
+		styledName = DeadTableName.Render(nameStr)
+	default:
+		styledName = nameStr
+	}
 
 	indicatorStr := strings.Join(indicators, " ")
 
 	// Build: prefix + space + name + padding + indicators
-	left := prefix + " " + PadRight(name, nameW)
+	// Pad based on raw name width to keep alignment.
+	namePad := nameW - len([]rune(nameStr))
+	if namePad < 0 {
+		namePad = 0
+	}
+	left := prefix + " " + styledName + strings.Repeat(" ", namePad)
 	line := left + " " + indicatorStr
 
 	if selected {

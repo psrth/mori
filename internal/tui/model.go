@@ -29,6 +29,12 @@ type Model struct {
 	tailer       *Tailer
 	totalQueries int
 
+	// Metrics time series for charts.
+	metricsP50 []float64
+	metricsP95 []float64
+	metricsP99 []float64
+	metricsQPS []float64
+
 	// Sub-models.
 	tableList TableListModel
 
@@ -108,6 +114,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// Recompute chart time series from recent entries.
+		recent := lastNSeconds(m.logEntries, 120)
+		m.metricsP50, m.metricsP95, m.metricsP99, m.metricsQPS = computeTimeSeries(recent)
 		return m, scheduleLogTick()
 
 	case tea.KeyMsg:
@@ -224,6 +233,7 @@ func (m Model) View() string {
 	return RenderDashboard(
 		layout, m.snap, &m.tableList, m.logEntries, m.totalQueries,
 		m.inspecting, m.inspectTable, activeQuery, m.searching,
+		m.metricsP50, m.metricsP95, m.metricsP99, m.metricsQPS,
 	)
 }
 

@@ -10,51 +10,72 @@ import (
 
 // DashboardLayout holds computed panel dimensions.
 type DashboardLayout struct {
-	Width        int
-	Height       int
-	LeftW        int // left panel inner width
-	RightW       int // right panel inner width
-	TopInnerH    int // content rows in top section
-	BottomInnerH int // content rows in query section
+	Width  int
+	Height int
+
+	LeftW  int // left panel inner width (chars between │ and │)
+	RightW int // right panel inner width
+
+	ChartContentH int // rows for chart content (graph + legend)
+	TablesH       int // rows for tables section content
+	SessionH      int // rows for session section content (including divider)
+	QueryH        int // rows for query panel content
 }
 
 // ComputeLayout calculates panel dimensions from terminal size.
 func ComputeLayout(width, height int) DashboardLayout {
 	l := DashboardLayout{Width: width, Height: height}
 
-	// Content height: minus top bar (1) and bottom bar (1).
-	contentH := height - 2
+	// Overhead rows:
+	//   top bar (2) + chart header (1) + bottom header (1) + bottom bar (1) = 5
+	overhead := 5
+	contentH := height - overhead
 	if contentH < 10 {
 		contentH = 10
 	}
 
-	// Top section: ~40% of content. Bottom: ~60%.
-	topH := contentH * 2 / 5
-	if topH < 8 {
-		topH = 8
+	// Chart: ~25% of content, min 6 (5 graph + 1 legend).
+	l.ChartContentH = contentH * 25 / 100
+	if l.ChartContentH < 6 {
+		l.ChartContentH = 6
 	}
-	bottomH := contentH - topH
 
-	// Inner heights: subtract 1 header row each (borders are shared).
-	l.TopInnerH = topH - 1
-	l.BottomInnerH = bottomH - 1
+	// Bottom section: everything else.
+	bottomH := contentH - l.ChartContentH
+	if bottomH < 4 {
+		bottomH = 4
+	}
 
-	// Left panel width.
-	l.LeftW = width / 3
-	if l.LeftW > 38 {
-		l.LeftW = 38
+	// Session: fixed 6 rows (1 divider + 5 content), but cap at half of bottom.
+	l.SessionH = 6
+	if l.SessionH > bottomH/2 {
+		l.SessionH = bottomH / 2
+	}
+
+	l.TablesH = bottomH - l.SessionH
+
+	// Query content height = tables + session (queries span the full right side).
+	l.QueryH = bottomH
+
+	// Left panel: ~35% capped [22, 40].
+	l.LeftW = width * 35 / 100
+	if l.LeftW > 40 {
+		l.LeftW = 40
 	}
 	if l.LeftW < 22 {
 		l.LeftW = 22
 	}
 
-	// Right panel: total = 1(│) + leftW + 1(│) + rightW + 1(│) = width.
+	// Right: total = │ + leftW + │ + rightW + │ = width
 	l.RightW = width - l.LeftW - 3
+	if l.RightW < 10 {
+		l.RightW = 10
+	}
 
 	return l
 }
 
-// RenderDashboard composes the single-screen dashboard view.
+// RenderDashboard composes the full-screen dashboard view.
 func RenderDashboard(
 	layout DashboardLayout,
 	snap Snapshot,
@@ -65,62 +86,42 @@ func RenderDashboard(
 	inspectTable string,
 	searchQuery string,
 	searching bool,
+	metricsP50, metricsP95, metricsP99, metricsQPS []float64,
 ) string {
 	if layout.Width < 50 || layout.Height < 12 {
 		msg := "Terminal too small.\nMinimum: 50x12"
 		return lipgloss.Place(layout.Width, layout.Height, lipgloss.Center, lipgloss.Center, msg)
 	}
 
-	pipe := BorderStyle.Render("│")
-
-	// --- Top bar ---
-	topBar := RenderTopBar(layout.Width, snap)
-
-	// --- Build left panel content ---
-	var leftContent []string
-	leftMidRow := -1 // row index for inspect mid-border (-1 = none)
-
-	if inspecting && inspectTable != "" {
-		tablesH := layout.TopInnerH / 2
-		inspectH := layout.TopInnerH - tablesH - 1 // -1 for mid-border row
-
-		tableContent := RenderTableList(layout.LeftW, tablesH, tableList, snap)
-		leftContent = append(leftContent, padLines(strings.Split(tableContent, "\n"), tablesH)...)
-
-		leftMidRow = tablesH
-
-		inspectContent := RenderInspectInline(layout.LeftW, inspectH, inspectTable, snap)
-		leftContent = append(leftContent, padLines(strings.Split(inspectContent, "\n"), inspectH)...)
-	} else {
-		tableContent := RenderTableList(layout.LeftW, layout.TopInnerH, tableList, snap)
-		leftContent = padLines(strings.Split(tableContent, "\n"), layout.TopInnerH)
-	}
-
-	// --- Build right panel content ---
-	var rightContent []string
-	rightMidRow := -1
-
-	sessionH := 5
-	routingH := layout.TopInnerH - sessionH - 1
-	if routingH < 3 {
-		// Not enough room for routing chart — give all to session.
-		sessionH = layout.TopInnerH
-		routingH = 0
-	}
-
-	sessionContent := RenderSummary(layout.RightW, sessionH, snap, totalQueries)
-	rightContent = append(rightContent, padLines(strings.Split(sessionContent, "\n"), sessionH)...)
-
-	if routingH > 0 {
-		rightMidRow = sessionH
-		routingContent := RenderRoutingChart(layout.RightW, routingH, logEntries)
-		rightContent = append(rightContent, padLines(strings.Split(routingContent, "\n"), routingH)...)
-	}
-
-	// --- Compose top section row by row ---
 	var rows []string
 
-	// Panel headers: ├─ Tables (N hot) ──┬─ Session ──┤
+	// ═══════════════════════════════════════════════
+	// 1. Top bar (2 lines)
+	// ═══════════════════════════════════════════════
+	topBar := RenderTopBar(layout.Width, snap)
+	rows = append(rows, topBar)
+
+	// ═══════════════════════════════════════════════
+	// 2. Chart header: ├─ Query Latency ──┬─ Throughput (q/s) ──┤
+	// ═══════════════════════════════════════════════
+	rows = append(rows, buildPanelHeader("Query Latency", "Throughput (q/s)", layout.LeftW, layout.RightW))
+
+	// ═══════════════════════════════════════════════
+	// 3. Chart content rows
+	// ═══════════════════════════════════════════════
+	latencyChart := RenderLatencyChart(metricsP50, metricsP95, metricsP99, layout.LeftW, layout.ChartContentH)
+	throughputChart := RenderThroughputChart(metricsQPS, layout.RightW, layout.ChartContentH)
+
+	leftChartLines := padLines(strings.Split(latencyChart, "\n"), layout.ChartContentH)
+	rightChartLines := padLines(strings.Split(throughputChart, "\n"), layout.ChartContentH)
+
+	for i := 0; i < layout.ChartContentH; i++ {
+		rows = append(rows, buildContentRow(leftChartLines[i], rightChartLines[i], layout.LeftW, layout.RightW))
+	}
+
+	// ═══════════════════════════════════════════════
+	// 4. Bottom section header: ├─ Tables ──┼─ Queries ──┤
+	// ═══════════════════════════════════════════════
 	hotCount := 0
 	for _, t := range tableList.Tables {
 		if isHot(t, snap) {
@@ -131,78 +132,110 @@ func RenderDashboard(
 	if hotCount > 0 {
 		tablesTitle = fmt.Sprintf("Tables (%d hot)", hotCount)
 	}
-	rows = append(rows, buildPanelHeader(tablesTitle, "Session", layout.LeftW, layout.RightW))
 
-	// Content rows — walk through both panels in lockstep.
-	leftIdx, rightIdx := 0, 0
-	for row := 0; row < layout.TopInnerH; row++ {
-		isLeftMid := (row == leftMidRow)
-		isRightMid := (row == rightMidRow)
+	queriesPanelTitle := "Queries"
+	if searching {
+		queriesPanelTitle = "Queries ─ /" + searchQuery + "█"
+	} else if searchQuery != "" {
+		queriesPanelTitle = "Queries ─ /" + searchQuery
+	}
+	rows = append(rows, buildPanelHeader(tablesTitle, queriesPanelTitle, layout.LeftW, layout.RightW))
 
-		if isLeftMid && isRightMid {
-			leftTitle := "inspect: " + Ellipsis(inspectTable, layout.LeftW-12)
-			rows = append(rows, buildDoubleMidBorder(leftTitle, "Routing", layout.LeftW, layout.RightW))
-		} else if isLeftMid {
-			leftTitle := "inspect: " + Ellipsis(inspectTable, layout.LeftW-12)
-			rightCell := ""
-			if rightIdx < len(rightContent) {
-				rightCell = rightContent[rightIdx]
-				rightIdx++
-			}
-			rows = append(rows, buildLeftMidBorder(leftTitle, rightCell, layout.LeftW, layout.RightW))
-		} else if isRightMid {
+	// ═══════════════════════════════════════════════
+	// 5. Bottom content: Tables+Session (left) | Queries (right)
+	// ═══════════════════════════════════════════════
+
+	// -- Left: tables content --
+	var leftLines []string
+	leftMidRow := -1 // row where session divider goes
+	inspectMidRow := -1
+
+	if inspecting && inspectTable != "" {
+		// Split tables area between table list and inspect.
+		tablesDisplayH := layout.TablesH / 2
+		inspectDisplayH := layout.TablesH - tablesDisplayH - 1 // -1 for inspect mid-border
+
+		tableContent := RenderTableList(layout.LeftW, tablesDisplayH, tableList, snap)
+		leftLines = append(leftLines, padLines(strings.Split(tableContent, "\n"), tablesDisplayH)...)
+
+		inspectMidRow = tablesDisplayH
+
+		inspectContent := RenderInspectInline(layout.LeftW, inspectDisplayH, inspectTable, snap)
+		leftLines = append(leftLines, padLines(strings.Split(inspectContent, "\n"), inspectDisplayH)...)
+	} else {
+		tableContent := RenderTableList(layout.LeftW, layout.TablesH, tableList, snap)
+		leftLines = append(leftLines, padLines(strings.Split(tableContent, "\n"), layout.TablesH)...)
+	}
+
+	// Session divider row index (relative to bottom content start).
+	leftMidRow = layout.TablesH
+
+	// -- Left: session content --
+	sessionContentH := layout.SessionH - 1 // -1 for the divider row
+	if sessionContentH < 0 {
+		sessionContentH = 0
+	}
+	sessionContent := RenderSummary(layout.LeftW, sessionContentH, snap, totalQueries)
+	sessionLines := padLines(strings.Split(sessionContent, "\n"), sessionContentH)
+
+	// -- Right: query content --
+	filteredEntries := logEntries
+	if searchQuery != "" {
+		filteredEntries = filterEntries(logEntries, searchQuery)
+	}
+	queryContent := RenderQueryStream(layout.RightW, layout.QueryH, filteredEntries)
+	rightQueryLines := padLines(strings.Split(queryContent, "\n"), layout.QueryH)
+
+	// -- Compose bottom rows in lockstep --
+	totalBottomRows := layout.TablesH + layout.SessionH
+	leftIdx, sessionIdx, rightIdx := 0, 0, 0
+
+	for row := 0; row < totalBottomRows; row++ {
+		isInspectMid := (inspecting && inspectTable != "" && inspectMidRow >= 0 && row == inspectMidRow)
+		isSessionMid := (row == leftMidRow)
+
+		rightCell := ""
+		if rightIdx < len(rightQueryLines) {
+			rightCell = rightQueryLines[rightIdx]
+			rightIdx++
+		}
+
+		if isInspectMid && isSessionMid {
+			// Both dividers on same row (unlikely but handle).
+			title := "inspect: " + Ellipsis(inspectTable, layout.LeftW-12)
+			rows = append(rows, buildLeftMidBorder(title, rightCell, layout.LeftW, layout.RightW))
+		} else if isInspectMid {
+			title := "inspect: " + Ellipsis(inspectTable, layout.LeftW-12)
+			rows = append(rows, buildLeftMidBorder(title, rightCell, layout.LeftW, layout.RightW))
+		} else if isSessionMid {
+			// Session divider: ├─ Session ──┤ on left, continue queries on right.
+			rows = append(rows, buildLeftMidBorder("Session", rightCell, layout.LeftW, layout.RightW))
+		} else if row < leftMidRow {
+			// Tables area.
 			leftCell := ""
-			if leftIdx < len(leftContent) {
-				leftCell = leftContent[leftIdx]
+			if leftIdx < len(leftLines) {
+				leftCell = leftLines[leftIdx]
 				leftIdx++
 			}
-			rows = append(rows, buildRightMidBorder(leftCell, "Routing", layout.LeftW, layout.RightW))
+			rows = append(rows, buildContentRow(leftCell, rightCell, layout.LeftW, layout.RightW))
 		} else {
+			// Session area.
 			leftCell := ""
-			if leftIdx < len(leftContent) {
-				leftCell = leftContent[leftIdx]
-				leftIdx++
-			}
-			rightCell := ""
-			if rightIdx < len(rightContent) {
-				rightCell = rightContent[rightIdx]
-				rightIdx++
+			if sessionIdx < len(sessionLines) {
+				leftCell = sessionLines[sessionIdx]
+				sessionIdx++
 			}
 			rows = append(rows, buildContentRow(leftCell, rightCell, layout.LeftW, layout.RightW))
 		}
 	}
 
-	// --- Queries header: ├─ Queries ──┴──────┤ ---
-	queriesTitle := "Queries"
-	if searching {
-		queriesTitle = "Queries ─ /" + searchQuery + "█"
-	} else if searchQuery != "" {
-		queriesTitle = "Queries ─ /" + searchQuery
-	}
-	rows = append(rows, buildQueriesHeader(queriesTitle, layout.Width, layout.LeftW))
-
-	// --- Query content ---
-	filteredEntries := logEntries
-	if searchQuery != "" {
-		filteredEntries = filterEntries(logEntries, searchQuery)
-	}
-	queryContent := RenderQueryStream(layout.Width-2, layout.BottomInnerH, filteredEntries)
-	qLines := padLines(strings.Split(queryContent, "\n"), layout.BottomInnerH)
-	for _, line := range qLines {
-		lineW := lipgloss.Width(line)
-		pad := layout.Width - 2 - lineW
-		if pad < 0 {
-			pad = 0
-		}
-		rows = append(rows, pipe+line+strings.Repeat(" ", pad)+pipe)
-	}
-
-	// --- Bottom bar ---
+	// ═══════════════════════════════════════════════
+	// 6. Bottom bar
+	// ═══════════════════════════════════════════════
 	bottomBar := RenderBottomBar(layout.Width, searching)
+	rows = append(rows, bottomBar)
 
-	all := append([]string{topBar}, rows...)
-	all = append(all, bottomBar)
-	return strings.Join(all, "\n")
+	return strings.Join(rows, "\n")
 }
 
 // padLines pads or truncates a slice of strings to exactly n lines.
@@ -254,28 +287,7 @@ func buildContentRow(leftContent, rightContent string, leftW, rightW int) string
 		rightContent + strings.Repeat(" ", rightPad) + pipe
 }
 
-// buildRightMidBorder: │ leftContent ├─ Routing ──┤
-func buildRightMidBorder(leftContent, title string, leftW, rightW int) string {
-	pipe := BorderStyle.Render("│")
-
-	leftPad := leftW - lipgloss.Width(leftContent)
-	if leftPad < 0 {
-		leftPad = 0
-	}
-
-	titleRendered := " " + PanelTitle.Render(title) + " "
-	titleVisualW := lipgloss.Width(titleRendered)
-	fill := rightW - 1 - titleVisualW
-	if fill < 0 {
-		fill = 0
-	}
-
-	return pipe + leftContent + strings.Repeat(" ", leftPad) +
-		BorderStyle.Render("├─") + titleRendered +
-		BorderStyle.Render(strings.Repeat("─", fill)+"┤")
-}
-
-// buildLeftMidBorder: ├─ inspect ──┤ rightContent │
+// buildLeftMidBorder: ├─ Title ──┤ rightContent │
 func buildLeftMidBorder(title, rightContent string, leftW, rightW int) string {
 	pipe := BorderStyle.Render("│")
 
@@ -294,49 +306,6 @@ func buildLeftMidBorder(title, rightContent string, leftW, rightW int) string {
 	return BorderStyle.Render("├─") + titleRendered +
 		BorderStyle.Render(strings.Repeat("─", fill)+"┤") +
 		rightContent + strings.Repeat(" ", rightPad) + pipe
-}
-
-// buildDoubleMidBorder: ├─ left ──┼─ right ──┤
-func buildDoubleMidBorder(leftTitle, rightTitle string, leftW, rightW int) string {
-	leftRendered := " " + PanelTitle.Render(leftTitle) + " "
-	leftTitleVisualW := lipgloss.Width(leftRendered)
-	leftFill := leftW - 1 - leftTitleVisualW
-	if leftFill < 0 {
-		leftFill = 0
-	}
-
-	rightRendered := " " + PanelTitle.Render(rightTitle) + " "
-	rightTitleVisualW := lipgloss.Width(rightRendered)
-	rightFill := rightW - 1 - rightTitleVisualW
-	if rightFill < 0 {
-		rightFill = 0
-	}
-
-	return BorderStyle.Render("├─") + leftRendered +
-		BorderStyle.Render(strings.Repeat("─", leftFill)+"┼─") + rightRendered +
-		BorderStyle.Render(strings.Repeat("─", rightFill)+"┤")
-}
-
-// buildQueriesHeader: ├─ Queries ──┴──────┤
-func buildQueriesHeader(title string, totalW, leftW int) string {
-	titleRendered := " " + PanelTitle.Render(title) + " "
-	titleVisualW := lipgloss.Width(titleRendered)
-	rightW := totalW - leftW - 3
-
-	fillBefore := leftW - 1 - titleVisualW
-	if fillBefore >= 0 {
-		return BorderStyle.Render("├─") + titleRendered +
-			BorderStyle.Render(strings.Repeat("─", fillBefore)+"┴"+strings.Repeat("─", rightW)+"┤")
-	}
-
-	// Title extends past divider — skip ┴.
-	innerW := totalW - 2
-	fill := innerW - 1 - titleVisualW
-	if fill < 0 {
-		fill = 0
-	}
-	return BorderStyle.Render("├─") + titleRendered +
-		BorderStyle.Render(strings.Repeat("─", fill)+"┤")
 }
 
 // filterEntries filters log entries by search query.
