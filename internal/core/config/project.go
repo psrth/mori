@@ -132,6 +132,8 @@ func (c *Connection) ToConnString() string {
 		return c.toOracleConnString()
 	case "sqlite":
 		return c.toSQLiteConnString()
+	case "firestore":
+		return c.toFirestoreConnString()
 	default:
 		// postgres, cockroachdb, and any other pg-compatible engine.
 		return c.toPostgresConnString()
@@ -224,6 +226,17 @@ func (c *Connection) toSQLiteConnString() string {
 		return p
 	}
 	return c.Database
+}
+
+func (c *Connection) toFirestoreConnString() string {
+	projectID := c.Extra["project_id"]
+	if projectID == "" {
+		projectID = c.Database
+	}
+	if creds, ok := c.Extra["credentials_file"]; ok && creds != "" {
+		return projectID + "?credentials_file=" + creds
+	}
+	return projectID
 }
 
 // RedactedPassword returns the password masked for display.
