@@ -1,0 +1,96 @@
+---
+title: "Supported Engines"
+description: "Database engines supported by Mori, with connection parameters."
+sidebarTitle: "Engines"
+---
+
+## Engine Matrix
+
+| Engine | Display Name | Category | Default Port | Status |
+|--------|-------------|----------|-------------|--------|
+| `postgres` | PostgreSQL | SQL / pgwire | 5432 | **Stable** |
+| `cockroachdb` | CockroachDB | SQL / pgwire | 26257 | **Stable** |
+| `mysql` | MySQL | SQL / MySQL | 3306 | Supported |
+| `mariadb` | MariaDB | SQL / MySQL | 3306 | Supported |
+| `mssql` | MS SQL Server | SQL / TDS | 1433 | Supported |
+| `oracle` | Oracle | SQL / Net8 | 1521 | Supported |
+| `sqlite` | SQLite | SQL / Embedded | N/A | Supported |
+| `redis` | Redis | NoSQL | 6379 | Supported |
+| `firestore` | Firestore | NoSQL | N/A | Supported |
+| `mongodb` | MongoDB | NoSQL | 27017 | Planned |
+| `elasticsearch` | Elasticsearch | NoSQL | 9200 | Planned |
+| `dynamodb` | DynamoDB | NoSQL | N/A | Planned |
+| `cassandra` | Cassandra / ScyllaDB | Specialized | 9042 | Planned |
+| `clickhouse` | ClickHouse | Specialized | 9000 | Planned |
+| `neo4j` | Neo4j | Specialized | 7687 | Planned |
+
+## Connection Fields
+
+Each engine requires specific connection parameters:
+
+<Tabs>
+  <Tab title="PostgreSQL / CockroachDB">
+    | Field | Description |
+    |-------|------------|
+    | `host` | Database host |
+    | `port` | Database port (default: 5432 / 26257) |
+    | `user` | Username |
+    | `password` | Password |
+    | `database` | Database name |
+    | `ssl_mode` | SSL mode (disable, require, verify-ca, verify-full) |
+  </Tab>
+  <Tab title="MySQL / MariaDB">
+    | Field | Description |
+    |-------|------------|
+    | `host` | Database host |
+    | `port` | Database port (default: 3306) |
+    | `user` | Username |
+    | `password` | Password |
+    | `database` | Database name |
+    | `ssl_mode` | SSL mode |
+  </Tab>
+  <Tab title="MS SQL Server">
+    | Field | Description |
+    |-------|------------|
+    | `host` | Database host |
+    | `port` | Database port (default: 1433) |
+    | `user` | Username |
+    | `password` | Password |
+    | `database` | Database name |
+    | `encrypt` | Encryption setting |
+    | `trust_server_cert` | Trust server certificate |
+  </Tab>
+  <Tab title="Oracle">
+    | Field | Description |
+    |-------|------------|
+    | `host` | Database host |
+    | `port` | Database port (default: 1521) |
+    | `user` | Username |
+    | `password` | Password |
+    | `service_name` | Oracle service name |
+  </Tab>
+  <Tab title="SQLite">
+    | Field | Description |
+    |-------|------------|
+    | `file_path` | Path to the SQLite database file |
+  </Tab>
+  <Tab title="Redis">
+    | Field | Description |
+    |-------|------------|
+    | `host` | Redis host |
+    | `port` | Redis port (default: 6379) |
+    | `password` | Password |
+    | `db_number` | Database number |
+    | `ssl` | Enable SSL |
+  </Tab>
+  <Tab title="Firestore">
+    | Field | Description |
+    |-------|------------|
+    | `project_id` | GCP project ID |
+    | `credentials_file` | Path to service account credentials JSON |
+  </Tab>
+</Tabs>
+
+<Info>
+Connection string formats vary by engine (URI, DSN, key-value). Each engine's `connstr/` package handles parsing automatically.
+</Info>

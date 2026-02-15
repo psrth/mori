@@ -1,0 +1,42 @@
+---
+title: "Transactions"
+description: "How Mori coordinates transactions across Prod and Shadow, and handles primary keys."
+sidebarTitle: "Transactions"
+---
+
+## Transaction Model
+
+| Operation | Behavior |
+|-----------|----------|
+| `BEGIN` | Open read-only transaction on Prod (REPEATABLE READ) + read-write transaction on Shadow |
+| `COMMIT` | Commit Shadow, close Prod, promote staged deltas/tombstones to persistent state |
+| `ROLLBACK` | Rollback Shadow, close Prod, discard staged deltas/tombstones |
+
+## Staged Deltas
+
+<Note>
+Within a transaction, all delta/tombstone additions are **staged** — held in a per-transaction buffer. This prevents phantom deltas from failed transactions: if a transaction rolls back, the Delta Map remains unchanged.
+</Note>
+
+Autocommit mode (implicit single-statement transactions) applies deltas immediately — no staging needed.
+
+The staged model ensures consistency: only committed mutations are visible in subsequent reads outside the transaction.
+
+## Primary Key Model
+
+| PK Type | Handling | Routing |
+|---------|---------|---------|
+| **Serial / bigserial** | Sequence offset guarantees no collision | Range-based fast-path: PK above offset threshold = local |
+| **UUID** | Local generation, statistically unique | Delta Map lookup for all operations |
+| **Composite** | Serialized as tuple in Delta Map | Standard delta lookup |
+| **No PK** | Table treated as read-only with warning | Prod Direct only |
+
+### Sequence Offset
+
+The offset formula ensures Shadow-generated PKs never collide with Prod:
+
+```
+max(prod_max * 10, prod_max + 10,000,000)
+```
+
+This is computed per table during `mori init`. The gap is large enough that Prod's ongoing inserts don't catch up during a development session. Configurable for high-volume tables.

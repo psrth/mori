@@ -1,0 +1,118 @@
+---
+title: "CLI Reference"
+description: "Complete reference for all Mori CLI commands."
+sidebarTitle: "Reference"
+---
+
+## Setup
+
+### `mori init`
+
+Interactive setup. Walks you through engine selection, provider, and credentials.
+
+```bash
+mori init
+```
+
+Non-interactive init with a connection string:
+
+```bash
+mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
+```
+
+## Running
+
+### `mori start`
+
+Start the proxy. On first run, creates the Shadow database.
+
+```bash
+mori start                    # Start with default connection
+mori start my-connection      # Start a specific connection
+mori start --port 5433        # Start on a custom port
+mori start --verbose          # Log all queries and routing decisions
+```
+
+### `mori stop`
+
+Graceful shutdown. Persists all state (Delta Map, Tombstone Set, Schema Registry).
+
+```bash
+mori stop
+```
+
+## State Management
+
+### `mori reset`
+
+Wipe all local state — Shadow data, Delta Map, Tombstone Set, Schema Registry.
+
+```bash
+mori reset            # Wipe local state
+mori reset --hard     # Wipe + re-sync schema from Prod
+```
+
+<Warning>
+`mori reset` is irreversible. All local mutations are permanently deleted.
+</Warning>
+
+### `mori status`
+
+Display current state: delta rows, tombstones, schema diffs, sequence offsets.
+
+```bash
+mori status
+```
+
+### `mori inspect`
+
+Detailed state for a specific table: delta count, tombstone count, schema divergence, PK type.
+
+```bash
+mori inspect users
+```
+
+## Logging
+
+### `mori log`
+
+Stream the proxy activity log.
+
+```bash
+mori log              # Stream live
+mori log --tail 50    # Show last 50 entries
+```
+
+### `mori dash`
+
+Launch the TUI dashboard — real-time query stream, delta/tombstone stats, table breakdown, live charts.
+
+```bash
+mori dash
+```
+
+## Connection Management
+
+### `mori ls`
+
+List all configured connections.
+
+```bash
+mori ls
+```
+
+### `mori rm`
+
+Remove a connection and its associated state.
+
+```bash
+mori rm my-connection
+```
+
+### `mori config`
+
+View or edit configuration.
+
+```bash
+mori config
+```

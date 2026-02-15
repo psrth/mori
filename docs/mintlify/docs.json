@@ -1,0 +1,85 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "Mori",
+  "theme": "maple",
+  "colors": {
+    "primary": "#69347A",
+    "light": "#9B59B6",
+    "dark": "#69347A"
+  },
+  "background": {
+    "color": {
+      "dark": "#13120A"
+    }
+  },
+  "favicon": "/favicon.svg",
+  "logo": {
+    "light": "/logo/light.png",
+    "dark": "/logo/dark.png"
+  },
+  "fonts": {
+    "heading": {
+      "family": "Manrope",
+      "weight": 700
+    },
+    "body": {
+      "family": "Inter",
+      "weight": 400
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": ["introduction", "quickstart"]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/read-path",
+              "concepts/write-path",
+              "concepts/transactions",
+              "concepts/schema-registry"
+            ]
+          },
+          {
+            "group": "Engines & Providers",
+            "pages": ["engines/overview", "engines/providers"]
+          },
+          {
+            "group": "CLI",
+            "pages": ["cli/reference", "cli/configuration"]
+          },
+          {
+            "group": "Integrations",
+            "pages": ["integrations/mcp-server"]
+          },
+          {
+            "group": "Advanced",
+            "pages": ["advanced/write-guard", "advanced/adding-engines"]
+          },
+          {
+            "group": "About",
+            "pages": ["design-decisions", "roadmap"]
+          }
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "primary": {
+      "type": "button",
+      "label": "GitHub",
+      "href": "https://github.com/mori-dev/mori"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/mori-dev/mori"
+    }
+  }
+}

@@ -1,0 +1,63 @@
+---
+title: "Read Path"
+description: "How Mori routes and merges SELECT queries across Prod and Shadow."
+sidebarTitle: "Read Path"
+---
+
+## Prod Direct
+
+When a SELECT touches only tables with no local mutations (no entries in the Delta Map or Tombstone Set), queries pass straight through to Prod. Zero overhead beyond the proxy hop.
+
+## Merged Read (Single Table)
+
+When a SELECT touches a table with delta or tombstone entries, Mori executes a merged read:
+
+<Steps>
+  <Step title="Shadow Query">
+    Execute the original query against Shadow. Returns the local subset of results.
+  </Step>
+  <Step title="Prod Query (over-fetched)">
+    Execute against Prod with adjusted LIMIT: `LIMIT + |deltas| + |tombstones|`. If schema divergence exists, sanitize the query first (remove WHERE predicates on Shadow-only columns).
+  </Step>
+  <Step title="Filter Prod Results">
+    Discard rows where `(table, pk)` exists in the Delta Map (Shadow has the authoritative version) or the Tombstone Set (locally deleted).
+  </Step>
+  <Step title="Adapt Prod Results">
+    Per the Schema Registry: inject NULLs for added columns, strip dropped columns, apply renames and type casts.
+  </Step>
+  <Step title="Merge">
+    Combine Shadow results with filtered/adapted Prod results.
+  </Step>
+  <Step title="Re-apply Ordering and Limits">
+    Sort by original ORDER BY, apply LIMIT/OFFSET to produce the final result set.
+  </Step>
+</Steps>
+
+<Info>
+Over-fetching caps at **3 iterations** to bound latency. If the requested number of rows can't be satisfied after 3 rounds, the result is returned as-is.
+</Info>
+
+## Merged Read (JOINs)
+
+When a SELECT joins tables and at least one has local mutations:
+
+<Steps>
+  <Step title="Execute on Prod">
+    Run the JOIN as-is on Prod. Produces correct results for all non-delta rows.
+  </Step>
+  <Step title="Identify affected rows">
+    For each row in the result, check if any primary key from a delta table is in the Delta Map or Tombstone Set. Partition into clean, delta, and dead rows.
+  </Step>
+  <Step title="Discard tombstoned rows">
+    Remove rows referencing locally-deleted PKs.
+  </Step>
+  <Step title="Patch delta rows">
+    Fetch Shadow versions of delta rows and replace the delta columns in the joined result.
+  </Step>
+  <Step title="Execute on Shadow">
+    Run the JOIN on Shadow to catch locally-inserted rows that should appear in the result.
+  </Step>
+  <Step title="Merge and deduplicate">
+    Combine patched Prod results with Shadow results. Deduplicate by composite key, then re-apply ORDER BY and LIMIT.
+  </Step>
+</Steps>

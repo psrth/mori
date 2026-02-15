@@ -1,0 +1,96 @@
+---
+title: "Adding a New Engine"
+description: "Step-by-step guide to implementing a new database engine for Mori."
+sidebarTitle: "Adding Engines"
+---
+
+## Engine Interface
+
+Every engine implements this contract:
+
+```go
+type Engine interface {
+    ID() registry.EngineID
+    Init(ctx context.Context, opts InitOptions) (*InitResult, error)
+    ParseConnStr(connStr string) (*ConnInfo, error)
+    LoadTableMeta(moriDir string) (map[string]TableMeta, error)
+    NewClassifier(tables map[string]TableMeta) core.Classifier
+    NewProxy(deps ProxyDeps, tables map[string]TableMeta) Proxy
+}
+
+type Proxy interface {
+    ListenAndServe(ctx context.Context) error
+    Shutdown(ctx context.Context) error
+    Addr() string
+}
+```
+
+| Method | Purpose | Called When |
+|--------|---------|-----------|
+| `ID()` | Return `registry.EngineID` constant | Registration + lookup |
+| `Init()` | First-time setup: spin up Shadow, dump Prod schema, return config | `mori start` (first run) |
+| `ParseConnStr()` | Parse connection string into `ConnInfo` | Every `mori start` |
+| `LoadTableMeta()` | Read persisted table metadata from `.mori/` | Every `mori start` |
+| `NewClassifier()` | Return a `core.Classifier` for this engine's query dialect | Every `mori start` |
+| `NewProxy()` | Create a `Proxy` speaking this engine's wire protocol | Every `mori start` |
+
+## Step-by-Step Guide
+
+<Steps>
+  <Step title="Create the folder">
+    Create `internal/engine/<name>/` with subpackages:
+
+    ```
+    internal/engine/<name>/
+      engine.go        # Main adapter (implements engine.Engine)
+      init.go          # Shadow setup (Docker container, schema dump)
+      connstr/         # Connection string parsing
+      classify/        # Query classifier -> core.Classification
+      proxy/           # Wire protocol proxy -> engine.Proxy
+      schema/          # Schema introspection + persistence
+      shadow/          # Shadow container management
+    ```
+  </Step>
+  <Step title="Implement the adapter">
+    In `engine.go`, implement the `Engine` interface and self-register in `init()`:
+
+    ```go
+    func init() {
+        engine.Register(&myEngine{})
+    }
+    ```
+  </Step>
+  <Step title="Add blank import">
+    In `cmd/mori/start.go`, add the blank import so the engine registers at startup:
+
+    ```go
+    import _ "github.com/mori-dev/mori/internal/engine/<name>"
+    ```
+  </Step>
+  <Step title="Mark as supported">
+    In `internal/registry/engine.go`, set `Supported: true` for your engine.
+  </Step>
+</Steps>
+
+## Classifier Interface
+
+Each engine's classifier parses its own query language into a shared `Classification`:
+
+```go
+type Classifier interface {
+    Classify(query string) (*Classification, error)
+    ClassifyWithParams(query string, params []interface{}) (*Classification, error)
+}
+```
+
+A `Classification` contains:
+- `OpType` — `OpRead`, `OpWrite`, `OpDDL`, `OpTransaction`, `OpMeta`
+- `SubType` — engine-specific operation subtype
+- `Tables []string` — affected tables
+- Flags: `HasAggregate`, `IsJoin`, `IsComplexRead`, `HasSetOp`
+
+The shared Router uses these fields to decide strategy. Each engine's classifier only needs to parse its own query language into this structure.
+
+<Note>
+Each engine is completely isolated — no engine imports another engine's packages. Shared code lives in `internal/core/` (router, delta, merge) and `internal/registry/` (engine/provider catalogs).
+</Note>

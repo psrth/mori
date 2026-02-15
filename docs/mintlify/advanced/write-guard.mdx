@@ -1,0 +1,39 @@
+---
+title: "Write Guard"
+description: "The 4-layer defense system that ensures production is never written to."
+sidebarTitle: "Write Guard"
+---
+
+## Overview
+
+Mori's core invariant is that production is read-only. The write guard is a defense-in-depth system — four independent layers that each independently prevent writes from reaching Prod.
+
+<Warning>
+Production is read-only. There is no code path that writes to Prod. The write guard ensures this invariant holds even if bugs exist in the router or any single layer.
+</Warning>
+
+## The Four Layers
+
+<Steps>
+  <Step title="Strict Mode">
+    Refuse to serve any requests if the Shadow database is unavailable. Without Shadow, writes have nowhere to go — so Mori shuts down rather than risk routing to Prod.
+  </Step>
+  <Step title="L1: Routing Assertion">
+    After the Router selects a strategy, verify that write and DDL operations **never** receive the `StrategyProdDirect` strategy. If they do, the request is blocked before execution.
+  </Step>
+  <Step title="L2: Connection Wrapper">
+    Inspect outbound bytes on the Prod connection. If the payload contains write SQL (INSERT, UPDATE, DELETE, DDL), the connection wrapper blocks it. This catches bugs where the Router incorrectly assigns a strategy.
+  </Step>
+  <Step title="L3: Dispatch Gate">
+    Final check at the point of execution. If a write or DDL operation reaches `targetProd` in the dispatch layer, it is blocked and returns an error. This is the last line of defense.
+  </Step>
+</Steps>
+
+## NoSQL Engines
+
+For NoSQL engines, the write guard is adapted to the protocol. For example:
+
+- **Redis**: Inspect commands for mutating operations (`SET`, `DEL`, `HSET`, `LPUSH`, etc.) on the Prod connection
+- **Firestore**: Intercept write RPCs (`Create`, `Update`, `Delete`) before they reach the Prod client
+
+The principle is the same: multiple independent layers, each capable of blocking writes to production on its own.
