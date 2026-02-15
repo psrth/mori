@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import { FadeIn } from "./fade-in";
 
 export function CliDemo() {
@@ -10,14 +11,29 @@ export function CliDemo() {
           <div className="bg-card-gray border border-white/10 rounded-xl p-6 overflow-x-auto">
             <div className="flex items-center gap-2 font-[family-name:var(--font-dm-mono)] text-sm tracking-[-0.02em]">
               <span className="text-card-white/50">$</span>
-              <span className="text-card-white">mori start</span>
-              <span className="text-card-white/50">--provider</span>
-              <span className="bg-brand-purple/20 text-brand-purple-light border border-brand-purple/30 rounded-full px-3 py-0.5 text-xs">
-                Cloud SQL
+              <span className="text-card-white font-medium">mori</span>
+              <span className="text-card-white">start</span>
+              <span className="text-card-white/50 ml-2">--provider</span>
+              <span className="inline-flex items-center gap-1.5">
+                <Image
+                  src="/images/cloud-sql-logo.svg"
+                  alt="Cloud SQL"
+                  width={20}
+                  height={20}
+                  className="inline-block"
+                />
+                <span className="text-card-white">Cloud SQL</span>
               </span>
-              <span className="text-card-white/50">--db</span>
-              <span className="bg-brand-purple/20 text-brand-purple-light border border-brand-purple/30 rounded-full px-3 py-0.5 text-xs">
-                PostgreSQL
+              <span className="text-card-white/50 ml-2">--db</span>
+              <span className="inline-flex items-center gap-1.5">
+                <Image
+                  src="/images/postgresql-logo.svg"
+                  alt="PostgreSQL"
+                  width={20}
+                  height={20}
+                  className="inline-block"
+                />
+                <span className="text-card-white">SQL</span>
               </span>
               <span className="text-brand-purple-light animate-blink">|</span>
             </div>
