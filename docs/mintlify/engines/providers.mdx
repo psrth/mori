@@ -1,0 +1,91 @@
+---
+title: "Auth Providers"
+description: "Database hosting providers supported by Mori."
+sidebarTitle: "Providers"
+---
+
+Mori supports 14 database hosting providers. During `mori init`, select your provider to auto-configure SSL, connection parameters, and authentication.
+
+## Provider Matrix
+
+| Provider | Compatible Engines | SSL Default |
+|----------|-------------------|-------------|
+| **Direct / Self-Hosted** | All | Engine default |
+| **GCP Cloud SQL** | Postgres, MySQL, MSSQL | require |
+| **AWS RDS / Aurora** | Postgres, MySQL, MariaDB, MSSQL, Oracle | require |
+| **Neon** | Postgres | require |
+| **Supabase** | Postgres | require |
+| **Azure Database** | Postgres, MySQL, MariaDB, MSSQL | require |
+| **PlanetScale** | MySQL | require |
+| **Vercel Postgres** | Postgres | require |
+| **MongoDB Atlas** | MongoDB | true |
+| **DigitalOcean** | Postgres, MySQL, Redis, MongoDB | require |
+| **Railway** | Postgres, MySQL, Redis, MongoDB | require |
+| **Upstash** | Redis | true |
+| **Cloudflare D1 / KV** | SQLite, Redis | -- |
+| **Firebase** | Firestore | -- |
+
+## By Tier
+
+### Primary
+
+The most common production setups. Full SSL, battle-tested.
+
+<CardGroup cols={3}>
+  <Card title="Direct / Self-Hosted">
+    All engines. Use when connecting to your own infrastructure or any provider not listed below.
+  </Card>
+  <Card title="GCP Cloud SQL">
+    Postgres, MySQL, MSSQL. Automatic SSL configuration.
+  </Card>
+  <Card title="AWS RDS / Aurora">
+    Postgres, MySQL, MariaDB, MSSQL, Oracle. Covers standard RDS and Aurora instances.
+  </Card>
+  <Card title="Neon">
+    Postgres. Serverless Postgres with automatic SSL.
+  </Card>
+  <Card title="Supabase">
+    Postgres. Auto-configured for Supabase connection pooling.
+  </Card>
+</CardGroup>
+
+### Platforms
+
+Managed database platforms with provider-specific connection handling.
+
+<CardGroup cols={3}>
+  <Card title="Azure Database">
+    Postgres, MySQL, MariaDB, MSSQL.
+  </Card>
+  <Card title="PlanetScale">
+    MySQL. Serverless MySQL platform.
+  </Card>
+  <Card title="Vercel Postgres">
+    Postgres. Integrated with Vercel deployments.
+  </Card>
+  <Card title="MongoDB Atlas">
+    MongoDB. Cloud-hosted MongoDB clusters.
+  </Card>
+  <Card title="DigitalOcean">
+    Postgres, MySQL, Redis, MongoDB. Managed database service.
+  </Card>
+</CardGroup>
+
+### Serverless
+
+Serverless and edge-focused providers.
+
+<CardGroup cols={3}>
+  <Card title="Railway">
+    Postgres, MySQL, Redis, MongoDB. One-click deployments.
+  </Card>
+  <Card title="Upstash">
+    Redis. Serverless Redis with per-request pricing.
+  </Card>
+  <Card title="Cloudflare D1 / KV">
+    SQLite, Redis. Edge-deployed data stores.
+  </Card>
+  <Card title="Firebase">
+    Firestore. Google's NoSQL document database.
+  </Card>
+</CardGroup>

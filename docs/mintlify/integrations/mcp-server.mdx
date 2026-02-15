@@ -1,0 +1,49 @@
+---
+title: "MCP Server"
+description: "Model Context Protocol server for AI agent integration."
+sidebarTitle: "MCP Server"
+---
+
+## Overview
+
+Mori includes an MCP (Model Context Protocol) server that enables AI coding agents to interact with databases through Mori's safe proxy layer.
+
+The MCP server exposes a `db_query` tool over HTTP. AI agents connect to this endpoint, issue database queries, and receive results as JSON — all routed through Mori's copy-on-write proxy.
+
+## How It Works
+
+1. The MCP server starts alongside the Mori proxy
+2. AI agents connect to the MCP HTTP endpoint
+3. The server forwards queries to Mori as a standard database client
+4. Mori routes reads to Prod, captures writes in Shadow
+5. Results are returned as JSON to the agent
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Safe Production Queries">
+    AI agents can query real production data without any risk of modification. All reads go through Mori's read-only Prod connection.
+  </Card>
+  <Card title="Risk-Free Mutations">
+    Agents can INSERT, UPDATE, and DELETE freely. All writes are captured in Shadow — production is never touched.
+  </Card>
+  <Card title="Test-Verify Loops">
+    Agents can make changes, verify results, and reset state programmatically. Enables automated QA workflows.
+  </Card>
+  <Card title="Schema Exploration">
+    Agents can inspect table structures, run diagnostic queries, and understand the database schema safely.
+  </Card>
+</CardGroup>
+
+## Configuration
+
+The MCP server port is configurable. The endpoint is available at `/mcp` on the configured port.
+
+```bash
+# Start Mori with MCP server
+mori start
+```
+
+<Info>
+The MCP server connects to Mori's proxy as a standard PostgreSQL client. From the MCP server's perspective, Mori is just a database — it doesn't need to know about the Prod/Shadow split.
+</Info>

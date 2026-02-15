@@ -1,0 +1,61 @@
+---
+title: "Quick Start"
+description: "Get Mori running in under 5 minutes."
+sidebarTitle: "Quick Start"
+---
+
+## Prerequisites
+
+- **Go 1.21+**
+- **Docker** (for Shadow containers — all engines except SQLite)
+
+## Setup
+
+<Steps>
+  <Step title="Build">
+    ```bash
+    go build -o mori ./cmd/mori
+    ```
+  </Step>
+  <Step title="Initialize">
+    Connect to your production database. The interactive setup walks you through engine, provider, and credentials.
+    ```bash
+    ./mori init
+    ```
+    <Tip>
+    For non-interactive setup, use a connection string directly:
+    ```bash
+    ./mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
+    ```
+    </Tip>
+  </Step>
+  <Step title="Start the proxy">
+    ```bash
+    ./mori start
+    ```
+    On first run, Mori creates the Shadow database (a schema-only clone of Prod) and computes sequence offsets.
+  </Step>
+  <Step title="Point your app at Mori">
+    Swap your application's connection string to point at the Mori proxy. Same port as your engine's default — your app won't know the difference.
+  </Step>
+  <Step title="Reset when done">
+    Wipe all local state and start fresh:
+    ```bash
+    ./mori reset
+    ```
+  </Step>
+</Steps>
+
+## Lifecycle
+
+```
+mori init         Connect to Prod, dump schema, spin up Shadow, offset sequences
+     |
+mori start        Start proxy, load state, accept connections
+     |
+  [app runs]      CRUD operations routed transparently
+     |
+mori stop         Persist state, shut down proxy
+     |
+mori reset        Wipe Shadow data + metadata, clean slate
+```

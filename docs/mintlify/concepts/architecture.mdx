@@ -1,0 +1,93 @@
+---
+title: "Architecture"
+description: "How Mori's proxy intercepts, classifies, routes, and merges database operations."
+sidebarTitle: "Architecture"
+---
+
+## Overview
+
+Mori sits between your application and two databases: the production database (read-only) and the Shadow database (read-write). Every query is intercepted, classified, routed, and — when needed — results from both databases are merged transparently.
+
+```
++--------------+
+| Application  |
++------+-------+
+       | DB wire protocol (PG v3, MySQL, TDS, RESP, gRPC, etc.)
+       v
++----------------------------------------------------------+
+|                       MORI PROXY                          |
+|                                                           |
+|  +-------------+  +-------------+  +------------------+  |
+|  |  Protocol   |  | Classifier  |  |      Router      |  |
+|  |  Handler    |--|             |--|                  |  |
+|  |             |  | op_type     |  | Prod Direct      |  |
+|  | accept      |  | tables      |  | Merged Read      |  |
+|  | parse       |  | pks         |  | Shadow Write     |  |
+|  | serialize   |  | join?       |  | Hydrate+Write    |  |
+|  +-------------+  +-------------+  | Shadow Delete    |  |
+|                                     | Shadow DDL       |  |
+|  +-------------+  +-------------+  | Transaction Ctrl |  |
+|  |   Delta     |  |  Schema     |  +------------------+  |
+|  |  Manager    |  | Registry    |                         |
+|  |             |  |             |  +------------------+  |
+|  | delta_map   |  | added_cols  |  |   Merge Engine   |  |
+|  | tombstones  |  | dropped     |  |                  |  |
+|  | staging     |  | renamed     |  | single_table     |  |
+|  +-------------+  | type_casts  |  | join_patch       |  |
+|                    +-------------+  | over_fetch       |  |
+|  +-------------+                    | adapt + filter   |  |
+|  | Transaction |                    +------------------+  |
+|  |  Manager    |                                          |
+|  |             |  +-------------+  +------------------+  |
+|  | per-conn    |  |  Engine     |  |   Write Engine   |  |
+|  | staging     |  |  Manager    |  |                  |  |
+|  | commit      |  |             |  | insert           |  |
+|  | rollback    |  | prod_pool   |  | update+hydrate   |  |
+|  +-------------+  | shadow_pool |  | delete+tombstone |  |
+|                    +-------------+  | ddl+registry     |  |
+|                                     +------------------+  |
++---------------+-----------------------------+-------------+
+                | read-only                   | read-write
+                v                             v
+         +-------------+             +-------------+
+         |    Prod      |             |   Shadow    |
+         |  Database    |             |  Database   |
+         |  (upstream)  |             |  (local)    |
+         +-------------+             +-------------+
+```
+
+## Components
+
+**Protocol Handler** — Speaks the target database's native wire protocol. Accepts connections, performs handshake/authentication, parses incoming messages, serializes outgoing results. Indistinguishable from a real database server to the application.
+
+**Classifier** — Parses each query to determine operation type (`READ`, `WRITE`, `DDL`, `TRANSACTION`), affected tables, extractable primary keys, and whether it's a JOIN. Lightweight syntactic analysis — fast, sits in the hot path.
+
+**Router** — Takes classifier output + delta/tombstone state and selects an execution strategy. The core decision point.
+
+**Delta Manager** — Maintains the Delta Map and Tombstone Set. Supports transaction staging: additions are staged within a transaction, promoted on COMMIT, discarded on ROLLBACK.
+
+**Schema Registry** — Tracks per-table schema divergence. Used to adapt Prod rows during reads (inject NULLs for new columns, strip dropped columns, rename, cast types) and during hydration.
+
+**Transaction Manager** — Per-connection transaction state. Coordinates transactions across Prod (read-only) and Shadow (read-write). Enforces staged delta semantics.
+
+**Engine Manager** — Connection pools to Prod and Shadow. Each app connection gets one dedicated Prod connection (read-only) and one dedicated Shadow connection (read-write).
+
+**Merge Engine** — Combines Prod and Shadow results during reads. Handles single-table merges, JOIN patching, over-fetching for LIMIT queries, row filtering, and schema adaptation.
+
+**Write Engine** — INSERT (Shadow-only), UPDATE (hydrate + Shadow), DELETE (Shadow + tombstone). Coordinates with Delta Manager on every mutation.
+
+## Routing Table
+
+| Operation | Condition | Strategy |
+|-----------|-----------|----------|
+| `SELECT` (single table) | No deltas/tombstones for table | **Prod Direct** — forward to Prod |
+| `SELECT` (single table) | Table has deltas or tombstones | **Merged Read** — query both, filter, adapt, merge |
+| `SELECT` (JOIN) | No table has deltas/tombstones | **Prod Direct** — forward to Prod |
+| `SELECT` (JOIN) | Any table has deltas/tombstones | **Join Patch** — execute on Prod, patch from Shadow |
+| `INSERT` | -- | **Shadow Write** — execute on Shadow only |
+| `UPDATE` | -- | **Hydrate + Shadow Write** — hydrate if needed, update Shadow |
+| `DELETE` | -- | **Shadow Delete** — delete from Shadow, add tombstone |
+| `DDL` | -- | **Shadow DDL** — execute on Shadow, update Schema Registry |
+| `BEGIN` | -- | Open transactions on both Prod and Shadow |
+| `COMMIT` | -- | Commit Shadow, close Prod, promote staged deltas |
+| `ROLLBACK` | -- | Rollback Shadow, close Prod, discard staged deltas |

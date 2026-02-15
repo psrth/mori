@@ -1,0 +1,71 @@
+---
+title: "Write Path"
+description: "How Mori handles INSERT, UPDATE, DELETE, and DDL operations."
+sidebarTitle: "Write Path"
+---
+
+All writes go to the Shadow database. Production is never modified.
+
+## INSERT
+
+1. Execute on Shadow only.
+2. Shadow's offset sequence assigns a PK in the local range (e.g., `10,000,001`). The offset guarantees no collision with Prod PKs.
+3. Return result (including generated PK) to the application.
+
+For UUIDs, Shadow generates locally — statistically guaranteed unique, no collision risk.
+
+## UPDATE
+
+### Point Update
+
+When the WHERE clause contains a primary key (e.g., `WHERE id = 42`):
+
+<Steps>
+  <Step title="Check Shadow">
+    Does the row exist in Shadow?
+    - **Yes**: proceed to step 2.
+    - **No**: **Hydrate** — fetch the row from Prod, adapt for schema differences, insert into Shadow.
+  </Step>
+  <Step title="Apply UPDATE">
+    Execute the UPDATE on Shadow.
+  </Step>
+  <Step title="Track in Delta Map">
+    Add `(table, pk)` to the Delta Map.
+  </Step>
+  <Step title="Return result">
+    Return the update result to the application.
+  </Step>
+</Steps>
+
+### Bulk Update
+
+When the WHERE clause has no primary key:
+
+1. Identify affected rows via SELECT on both Prod and Shadow.
+2. Hydrate missing Prod rows into Shadow.
+3. Apply UPDATE on Shadow.
+4. Add all affected PKs to the Delta Map.
+
+## DELETE
+
+1. If the row exists in Shadow, delete it.
+2. Add `(table, pk)` to the Tombstone Set (uniform path — works whether the row was in Shadow or Prod-only).
+3. Return result.
+
+## DDL
+
+<Warning>
+DDL runs on Shadow only. Production schema is never modified.
+</Warning>
+
+DDL operations are executed on the Shadow database, and the Schema Registry tracks what changed:
+
+| DDL | Registry Records | Read Adaptation | Hydration Adaptation |
+|-----|-----------------|----------------|---------------------|
+| `ADD COLUMN` | Column name, type, default | Prod rows get NULL/default injected | Hydrated rows get NULL/default |
+| `DROP COLUMN` | Dropped column name | Dropped column stripped from Prod | Dropped column excluded |
+| `RENAME COLUMN` | `old_name -> new_name` | Column renamed in result | Column renamed on insert |
+| `ALTER TYPE` | `old_type -> new_type` | Value cast in result | Value cast on insert |
+| `CREATE TABLE` | Shadow-only table | N/A | N/A |
+| `DROP TABLE` | Marked as dropped | "table not found" | N/A |
+| `CREATE INDEX` | Shadow only, silent | N/A | N/A |

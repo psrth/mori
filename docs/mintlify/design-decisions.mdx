@@ -1,0 +1,40 @@
+---
+title: "Design Decisions"
+description: "Architectural trade-offs, rationale, and known limitations."
+sidebarTitle: "Design Decisions"
+---
+
+## Trade-offs and Rationale
+
+### FK Constraints Stripped from Shadow
+
+Shadow starts empty. INSERTs referencing Prod rows via foreign key would fail because the referenced row doesn't exist in Shadow. Hydrating referenced rows transitively is a rabbit hole. The app's code already ensures referential integrity — Mori trusts it.
+
+### Production Data Drift Accepted
+
+Prod reads are live, not pinned to a snapshot. Pinning holds resources on Prod that interfere with vacuuming and replication. For a dev tool with short sessions, live reads are pragmatic. Shadow overrides are consistent; Prod reads are best-effort recent.
+
+### 1:1:1 Connection Model
+
+Each app connection to Mori gets one dedicated Prod connection and one dedicated Shadow connection. Simple, no multiplexing complexity. Per-connection transaction isolation comes for free.
+
+### Sequence Offset
+
+`max(prod_max * 10, prod_max + 10,000,000)` per table. Large enough that Prod's ongoing inserts don't catch up during a session. Configurable for high-volume tables.
+
+### Two-Phase Classification for Parameterized Queries
+
+Classify at template parse time (tables, operation type); resolve PK values at parameter bind time. Necessary because wire protocols separate SQL templates from parameter values.
+
+## Known Limitations
+
+| Limitation | Impact | Mitigation |
+|-----------|--------|-----------|
+| Multi-column ORDER BY | Only single-column sort re-applied after merge | Multi-column ORDER BY returns in backend order |
+| Mutating CTEs only see Shadow data | CTE reads from clean tables return empty | v1.1: split into write + read |
+| Stored procedures with side effects | `SELECT my_function()` routes as READ to Prod | v2: function introspection or config allowlist |
+| Tables without PKs | Read-only, writes produce warning | Rare in practice |
+| Bulk ops on large tables | Hydrating thousands of rows is slow | Acceptable for dev tool |
+| JOIN PK patching | Requires PK in SELECT list | Patching skipped when PK not selected |
+| Aggregate queries | COUNT/SUM on delta tables not merged | Returns separate rows from Prod/Shadow |
+| Parameterized LIMIT | `LIMIT $1` not rewritten for over-fetching | Uncommon in practice |
