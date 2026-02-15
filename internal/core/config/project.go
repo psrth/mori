@@ -134,6 +134,8 @@ func (c *Connection) ToConnString() string {
 		return c.toSQLiteConnString()
 	case "firestore":
 		return c.toFirestoreConnString()
+	case "redis":
+		return c.toRedisConnString()
 	default:
 		// postgres, cockroachdb, and any other pg-compatible engine.
 		return c.toPostgresConnString()
@@ -226,6 +228,33 @@ func (c *Connection) toSQLiteConnString() string {
 		return p
 	}
 	return c.Database
+}
+
+func (c *Connection) toRedisConnString() string {
+	// If the caller stored a full connection string in Extra, use it directly.
+	if cs, ok := c.Extra["connection_string"]; ok && cs != "" {
+		return cs
+	}
+	host := c.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port := c.Port
+	if port == 0 {
+		port = 6379
+	}
+	db := "0"
+	if d, ok := c.Extra["db"]; ok && d != "" {
+		db = d
+	}
+	scheme := "redis"
+	if c.SSLMode == "require" || c.SSLMode == "enabled" {
+		scheme = "rediss"
+	}
+	if c.Password != "" {
+		return fmt.Sprintf("%s://:%s@%s:%d/%s", scheme, url.PathEscape(c.Password), host, port, db)
+	}
+	return fmt.Sprintf("%s://%s:%d/%s", scheme, host, port, db)
 }
 
 func (c *Connection) toFirestoreConnString() string {
