@@ -1,8 +1,9 @@
 package registry
 
 // FieldsWithProviderDefaults returns the connection fields for an engine
-// with provider-specific defaults applied (e.g. SSL mode overrides).
-// Provider extra fields are appended at the end.
+// with provider-specific defaults applied (e.g. SSL mode, host placeholder,
+// port, database, and user overrides). Provider extra fields are appended
+// at the end.
 func FieldsWithProviderDefaults(engineID EngineID, providerID ProviderID) []ConnectionField {
 	base := FieldsForEngine(engineID)
 	if base == nil {
@@ -14,11 +15,30 @@ func FieldsWithProviderDefaults(engineID EngineID, providerID ProviderID) []Conn
 		return base
 	}
 
-	// Apply SSL default override from provider.
-	if provider.SSLDefault != "" {
-		for i := range base {
-			if base[i].Key == "ssl_mode" || base[i].Key == "ssl" {
+	for i := range base {
+		switch base[i].Key {
+		case "ssl_mode", "ssl":
+			if provider.SSLDefault != "" {
 				base[i].Default = provider.SSLDefault
+			}
+		case "host":
+			if provider.HostPlaceholder != "" {
+				base[i].Placeholder = provider.HostPlaceholder
+			}
+		case "port":
+			if provider.PortDefault != "" {
+				base[i].Default = provider.PortDefault
+				base[i].Placeholder = provider.PortDefault
+			}
+		case "database":
+			if provider.DatabaseDefault != "" {
+				base[i].Default = provider.DatabaseDefault
+				base[i].Placeholder = provider.DatabaseDefault
+			}
+		case "user":
+			if provider.UserDefault != "" {
+				base[i].Default = provider.UserDefault
+				base[i].Placeholder = provider.UserDefault
 			}
 		}
 	}

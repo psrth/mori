@@ -15,13 +15,7 @@ type vercelPostgresProvider struct{}
 func (p *vercelPostgresProvider) ID() registry.ProviderID { return registry.VercelPG }
 
 func (p *vercelPostgresProvider) Fields(engine registry.EngineID) []registry.ConnectionField {
-	urlField := registry.ConnectionField{
-		Key:         "connection_url",
-		Label:       "Connection URL (optional, paste full URL or leave empty)",
-		Placeholder: "postgres://user:pass@host:5432/db?sslmode=require",
-	}
-	defaults := registry.FieldsWithProviderDefaults(engine, registry.VercelPG)
-	return append([]registry.ConnectionField{urlField}, defaults...)
+	return nil // use registry defaults; wizard's "paste connection string" handles URL paste
 }
 
 func (p *vercelPostgresProvider) ConnString(_ context.Context, conn *config.Connection) (string, error) {
