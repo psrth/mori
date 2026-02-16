@@ -415,7 +415,7 @@ func (p *Proxy) classifyAndRoute(inline, cmd string, connID int64) routeDecision
 // whether to read from prod or shadow.
 func (p *Proxy) executeMergedRead(
 	cmdVal *RESPValue,
-	cl *core.Classification,
+	_ *core.Classification,
 	prodConn net.Conn, prodReader *bufio.Reader,
 	shadowConn net.Conn, shadowReader *bufio.Reader,
 	connID int64,
@@ -471,7 +471,7 @@ func (p *Proxy) executeMergedMGET(
 	keys []string,
 	prodConn net.Conn, prodReader *bufio.Reader,
 	shadowConn net.Conn, shadowReader *bufio.Reader,
-	connID int64,
+	_ int64,
 ) []byte {
 	results := make([]RESPValue, len(keys))
 
@@ -585,25 +585,22 @@ func (p *Proxy) hydrateKeys(
 
 // trackWriteEffects updates delta/tombstone state after a write operation.
 func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.RoutingStrategy, connID int64) {
-	// Extract the actual key from the command.
+	// Extract affected keys from the command.
 	args := strings.Fields(cl.RawSQL)
-	var key string
-	if len(args) >= 2 {
-		key = args[1]
-	}
+	keys := extractWriteKeys(args)
 
 	switch strategy {
 	case core.StrategyShadowWrite:
 		for _, table := range cl.Tables {
 			p.deltaMap.MarkInserted(table)
 		}
-		if key != "" {
+		for _, key := range keys {
 			prefix := classify.KeyPrefix(key)
 			p.deltaMap.Add(prefix, key)
 		}
 
 	case core.StrategyHydrateAndWrite:
-		if key != "" {
+		for _, key := range keys {
 			prefix := classify.KeyPrefix(key)
 			p.deltaMap.Add(prefix, key)
 		}
@@ -614,7 +611,7 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 		}
 
 	case core.StrategyShadowDelete:
-		if key != "" {
+		for _, key := range keys {
 			prefix := classify.KeyPrefix(key)
 			p.tombstones.Add(prefix, key)
 			p.deltaMap.Remove(prefix, key)
@@ -628,6 +625,24 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 	case core.StrategyShadowDDL:
 		// DDL (FLUSHDB, etc.) — nothing specific to track.
 	}
+}
+
+// extractWriteKeys returns the keys affected by a write command.
+// For MSET/MSETNX, keys are at odd positions (cmd key val key val ...).
+// For other commands, the key is the second arg.
+func extractWriteKeys(args []string) []string {
+	if len(args) < 2 {
+		return nil
+	}
+	cmd := strings.ToUpper(args[0])
+	if cmd == "MSET" || cmd == "MSETNX" {
+		var keys []string
+		for i := 1; i < len(args); i += 2 {
+			keys = append(keys, args[i])
+		}
+		return keys
+	}
+	return []string{args[1]}
 }
 
 func isMultiKeyRead(cmd string) bool {
