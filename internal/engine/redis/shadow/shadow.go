@@ -16,6 +16,42 @@ const (
 	DefaultHostPort = 9001
 )
 
+// ImageForVersion returns the Docker image tag matching a Redis version string.
+// For example, "7.2.4" -> "redis:7.2", "6.2.14" -> "redis:6.2".
+// Falls back to DefaultImage if the version cannot be parsed.
+func ImageForVersion(version string) string {
+	if version == "" || version == "unknown" {
+		return DefaultImage
+	}
+	// Parse major.minor from "major.minor.patch" or "major.minor".
+	parts := splitVersion(version)
+	if len(parts) >= 2 {
+		return "redis:" + parts[0] + "." + parts[1]
+	}
+	if len(parts) == 1 {
+		return "redis:" + parts[0]
+	}
+	return DefaultImage
+}
+
+// splitVersion splits a version string on '.' characters.
+func splitVersion(v string) []string {
+	var parts []string
+	current := ""
+	for _, ch := range v {
+		if ch == '.' {
+			parts = append(parts, current)
+			current = ""
+		} else {
+			current += string(ch)
+		}
+	}
+	if current != "" {
+		parts = append(parts, current)
+	}
+	return parts
+}
+
 // ContainerConfig holds the configuration for creating a Shadow Redis container.
 type ContainerConfig struct {
 	Image    string

@@ -193,3 +193,56 @@ func TestRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestParseScanResponse(t *testing.T) {
+	t.Run("valid response", func(t *testing.T) {
+		resp := &RESPValue{
+			Type: '*',
+			Array: []RESPValue{
+				{Type: '$', Str: "42"},
+				{Type: '*', Array: []RESPValue{
+					{Type: '$', Str: "user:1"},
+					{Type: '$', Str: "user:2"},
+					{Type: '$', Str: "session:abc"},
+				}},
+			},
+		}
+		cursor, keys := parseScanResponse(resp)
+		if cursor != "42" {
+			t.Errorf("cursor = %q, want %q", cursor, "42")
+		}
+		if len(keys) != 3 {
+			t.Fatalf("keys len = %d, want 3", len(keys))
+		}
+		if keys[0] != "user:1" || keys[1] != "user:2" || keys[2] != "session:abc" {
+			t.Errorf("keys = %v", keys)
+		}
+	})
+
+	t.Run("cursor zero with empty keys", func(t *testing.T) {
+		resp := &RESPValue{
+			Type: '*',
+			Array: []RESPValue{
+				{Type: '$', Str: "0"},
+				{Type: '*', Array: []RESPValue{}},
+			},
+		}
+		cursor, keys := parseScanResponse(resp)
+		if cursor != "0" {
+			t.Errorf("cursor = %q, want %q", cursor, "0")
+		}
+		if len(keys) != 0 {
+			t.Errorf("keys len = %d, want 0", len(keys))
+		}
+	})
+
+	t.Run("nil response", func(t *testing.T) {
+		cursor, keys := parseScanResponse(nil)
+		if cursor != "0" {
+			t.Errorf("cursor = %q, want %q", cursor, "0")
+		}
+		if keys != nil {
+			t.Errorf("keys = %v, want nil", keys)
+		}
+	})
+}

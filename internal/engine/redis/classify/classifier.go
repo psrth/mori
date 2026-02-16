@@ -203,12 +203,19 @@ var commandMap = map[string]opInfo{
 	"CLUSTER":   {core.OpOther, core.SubOther, 0, false},
 	"DEBUG":     {core.OpOther, core.SubOther, 0, false},
 	"WAIT":      {core.OpOther, core.SubOther, 0, false},
-	"SUBSCRIBE": {core.OpOther, core.SubOther, 0, false},
-	"PSUBSCRIBE": {core.OpOther, core.SubOther, 0, false},
-	"UNSUBSCRIBE": {core.OpOther, core.SubOther, 0, false},
+	"SUBSCRIBE":    {core.OpOther, core.SubOther, 0, true},  // routed to both prod+shadow
+	"PSUBSCRIBE":   {core.OpOther, core.SubOther, 0, true},  // routed to both prod+shadow
+	"UNSUBSCRIBE":  {core.OpOther, core.SubOther, 0, false},
 	"PUNSUBSCRIBE": {core.OpOther, core.SubOther, 0, false},
-	"PUBLISH":   {core.OpWrite, core.SubInsert, 0, false},
-	"PUBSUB":    {core.OpOther, core.SubOther, 0, false},
+	"PUBLISH":      {core.OpWrite, core.SubInsert, 0, false}, // shadow-only (write guard)
+	"PUBSUB":       {core.OpOther, core.SubOther, 0, false},
+
+	// --- Lua scripting ---
+	"EVAL":      {core.OpWrite, core.SubInsert, 0, true},
+	"EVALSHA":   {core.OpWrite, core.SubInsert, 0, true},
+	"EVALRO":    {core.OpRead, core.SubSelect, 0, true},
+	"EVALSHA_RO": {core.OpRead, core.SubSelect, 0, true},
+	"SCRIPT":    {core.OpOther, core.SubOther, 0, false},
 	"SLOWLOG":   {core.OpOther, core.SubOther, 0, false},
 	"MEMORY":    {core.OpOther, core.SubOther, 0, false},
 	"LATENCY":   {core.OpOther, core.SubOther, 0, false},
@@ -303,6 +310,14 @@ func (c *RedisClassifier) Classify(query string) (*core.Classification, error) {
 		cl.Tables = c.extractKeyPrefixes(keys)
 	}
 
+	// For EVAL/EVALSHA, extract KEYS from numkeys argument.
+	if cmd == "EVAL" || cmd == "EVALSHA" {
+		evalKeys := ExtractEvalKeys(args[1:])
+		if len(evalKeys) > 0 {
+			cl.Tables = c.extractKeyPrefixes(evalKeys)
+		}
+	}
+
 	return cl, nil
 }
 
@@ -378,4 +393,43 @@ func IsWriteCommand(cmd string) bool {
 		return false
 	}
 	return info.opType == core.OpWrite || info.opType == core.OpDDL
+}
+
+// IsPubSubSubscribe returns true if the command is SUBSCRIBE or PSUBSCRIBE.
+func IsPubSubSubscribe(cmd string) bool {
+	u := strings.ToUpper(cmd)
+	return u == "SUBSCRIBE" || u == "PSUBSCRIBE"
+}
+
+// IsPubSubUnsubscribe returns true if the command is UNSUBSCRIBE or PUNSUBSCRIBE.
+func IsPubSubUnsubscribe(cmd string) bool {
+	u := strings.ToUpper(cmd)
+	return u == "UNSUBSCRIBE" || u == "PUNSUBSCRIBE"
+}
+
+// IsEvalCommand returns true if the command is EVAL or EVALSHA.
+func IsEvalCommand(cmd string) bool {
+	u := strings.ToUpper(cmd)
+	return u == "EVAL" || u == "EVALSHA"
+}
+
+// ExtractEvalKeys extracts the KEYS arguments from an EVAL/EVALSHA command.
+// EVAL script numkeys key [key ...] arg [arg ...]
+// Returns the key names based on numkeys.
+func ExtractEvalKeys(args []string) []string {
+	// args[0] = script/sha, args[1] = numkeys, args[2..] = keys then argv
+	if len(args) < 2 {
+		return nil
+	}
+	numkeys := 0
+	for _, ch := range args[1] {
+		if ch < '0' || ch > '9' {
+			return nil
+		}
+		numkeys = numkeys*10 + int(ch-'0')
+	}
+	if numkeys <= 0 || len(args) < 2+numkeys {
+		return nil
+	}
+	return args[2 : 2+numkeys]
 }

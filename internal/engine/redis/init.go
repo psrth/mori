@@ -52,7 +52,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		return nil, fmt.Errorf("failed to create .mori directory: %w", err)
 	}
 
-	// 5. Start shadow Redis container.
+	// 5. Start shadow Redis container, matching production version.
 	fmt.Println("Creating Shadow Redis container...")
 	mgr, err := shadow.NewManager()
 	if err != nil {
@@ -60,13 +60,19 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 	defer mgr.Close()
 
-	fmt.Printf("  Pulling %s...\n", shadow.DefaultImage)
-	if err := mgr.Pull(ctx, shadow.DefaultImage); err != nil {
-		return nil, fmt.Errorf("failed to pull Redis image: %w", err)
+	shadowImage := shadow.ImageForVersion(version)
+	fmt.Printf("  Pulling %s (matching prod %s)...\n", shadowImage, version)
+	if err := mgr.Pull(ctx, shadowImage); err != nil {
+		// Fall back to default image if version-matched image is unavailable.
+		fmt.Printf("  Warning: %s not available, falling back to %s\n", shadowImage, shadow.DefaultImage)
+		shadowImage = shadow.DefaultImage
+		if err := mgr.Pull(ctx, shadowImage); err != nil {
+			return nil, fmt.Errorf("failed to pull Redis image: %w", err)
+		}
 	}
 
 	containerInfo, err := mgr.Create(ctx, shadow.ContainerConfig{
-		Image:    shadow.DefaultImage,
+		Image:    shadowImage,
 		HostPort: shadow.DefaultHostPort,
 	})
 	if err != nil {
