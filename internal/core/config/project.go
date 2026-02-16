@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -140,6 +141,8 @@ func (c *Connection) ToConnString() string {
 		return c.toMySQLConnString()
 	case "sqlite":
 		return c.toSQLiteConnString()
+	case "duckdb":
+		return c.toDuckDBConnString()
 	case "firestore":
 		return c.toFirestoreConnString()
 	case "redis":
@@ -216,6 +219,14 @@ func (c *Connection) toSQLiteConnString() string {
 	return c.Database
 }
 
+func (c *Connection) toDuckDBConnString() string {
+	// DuckDB connection string is just the file path.
+	if p, ok := c.Extra["path"]; ok {
+		return p
+	}
+	return c.Database
+}
+
 func (c *Connection) toRedisConnString() string {
 	// If the caller stored a full connection string in Extra, use it directly.
 	if cs, ok := c.Extra["connection_string"]; ok && cs != "" {
@@ -248,8 +259,15 @@ func (c *Connection) toFirestoreConnString() string {
 	if projectID == "" {
 		projectID = c.Database
 	}
+	var params []string
 	if creds, ok := c.Extra["credentials_file"]; ok && creds != "" {
-		return projectID + "?credentials_file=" + creds
+		params = append(params, "credentials_file="+creds)
+	}
+	if eh, ok := c.Extra["emulator_host"]; ok && eh != "" {
+		params = append(params, "emulator_host="+eh)
+	}
+	if len(params) > 0 {
+		return projectID + "?" + strings.Join(params, "&")
 	}
 	return projectID
 }

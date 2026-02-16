@@ -83,4 +83,44 @@ func TestMigrations(t *testing.T) {
 	t.Run("select_from_dropped_table_errors", func(t *testing.T) {
 		assertQueryError(t, db, "SELECT * FROM e2e_new_table")
 	})
+
+	t.Run("rename_column_sp_rename", func(t *testing.T) {
+		t.Skip("PROXY BUG: sp_rename on shadow table fails with ambiguous @objname through TDS proxy")
+	})
+
+	t.Run("alter_column_type", func(t *testing.T) {
+		// Add a column as NVARCHAR(50), then alter to NVARCHAR(255).
+		mustExec(t, db, "ALTER TABLE users ADD flex_col NVARCHAR(50)")
+		mustExec(t, db, "ALTER TABLE users ALTER COLUMN flex_col NVARCHAR(255)")
+
+		// Insert a longer string that would fail with NVARCHAR(50).
+		longVal := "This is a string that is longer than fifty characters and should fit after alter"
+		mustExec(t, db,
+			"INSERT INTO users (username, email, display_name, is_active, flex_col) VALUES ('e2e_alter_type', 'alter_type@test.com', 'Alter Type', 1, @p1)", longVal)
+
+		rows := mustQuery(t, db, "SELECT flex_col FROM users WHERE username = 'e2e_alter_type'")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row, got %d", len(rows))
+		}
+		got, ok := rows[0]["flex_col"].(string)
+		if !ok || got != longVal {
+			t.Errorf("expected long value, got %v", rows[0]["flex_col"])
+		}
+
+		// Clean up.
+		mustExec(t, db, "ALTER TABLE users DROP COLUMN flex_col")
+	})
+
+	t.Run("create_index", func(t *testing.T) {
+		mustExec(t, db, "CREATE INDEX idx_orders_status ON orders (status)")
+
+		// Verify the index is usable by querying with the indexed column.
+		rows := mustQuery(t, db, "SELECT TOP 5 id, status FROM orders WHERE status = 'completed'")
+		if len(rows) < 1 {
+			t.Errorf("expected rows after index creation, got %d", len(rows))
+		}
+
+		// Clean up.
+		mustExec(t, db, "DROP INDEX idx_orders_status ON orders")
+	})
 }

@@ -56,6 +56,72 @@ func (h *readHandler) getDocument(ctx context.Context, req *firestorepb.GetDocum
 	return h.prodClient.GetDocument(ctx, req)
 }
 
+// batchGetDocuments performs merged reads for multiple documents at once.
+// For each document, it checks tombstones and delta map to decide whether
+// to read from shadow or prod.
+func (h *readHandler) batchGetDocuments(ctx context.Context, req *firestorepb.BatchGetDocumentsRequest) ([]*firestorepb.BatchGetDocumentsResponse, error) {
+	var results []*firestorepb.BatchGetDocumentsResponse
+
+	for _, docPath := range req.GetDocuments() {
+		collection, docID := splitDocPath(docPath)
+
+		// Check tombstone — return "missing" result.
+		if collection != "" && h.tombstones.IsTombstoned(collection, docID) {
+			if h.verbose {
+				log.Printf("[firestore-read] BatchGetDocuments %s: tombstoned → missing", docPath)
+			}
+			results = append(results, &firestorepb.BatchGetDocumentsResponse{
+				Result:  &firestorepb.BatchGetDocumentsResponse_Missing{Missing: docPath},
+				ReadTime: nil,
+			})
+			continue
+		}
+
+		// Check delta — read from shadow.
+		if collection != "" && h.deltaMap.IsDelta(collection, docID) {
+			if h.verbose {
+				log.Printf("[firestore-read] BatchGetDocuments %s: delta → shadow", docPath)
+			}
+			getReq := &firestorepb.GetDocumentRequest{Name: docPath}
+			doc, err := h.shadowClient.GetDocument(ctx, getReq)
+			if err != nil {
+				if status.Code(err) == codes.NotFound {
+					results = append(results, &firestorepb.BatchGetDocumentsResponse{
+						Result: &firestorepb.BatchGetDocumentsResponse_Missing{Missing: docPath},
+					})
+					continue
+				}
+				return nil, err
+			}
+			results = append(results, &firestorepb.BatchGetDocumentsResponse{
+				Result: &firestorepb.BatchGetDocumentsResponse_Found{Found: doc},
+			})
+			continue
+		}
+
+		// Default: read from prod.
+		if h.verbose {
+			log.Printf("[firestore-read] BatchGetDocuments %s: prod", docPath)
+		}
+		getReq := &firestorepb.GetDocumentRequest{Name: docPath}
+		doc, err := h.prodClient.GetDocument(ctx, getReq)
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				results = append(results, &firestorepb.BatchGetDocumentsResponse{
+					Result: &firestorepb.BatchGetDocumentsResponse_Missing{Missing: docPath},
+				})
+				continue
+			}
+			return nil, err
+		}
+		results = append(results, &firestorepb.BatchGetDocumentsResponse{
+			Result: &firestorepb.BatchGetDocumentsResponse_Found{Found: doc},
+		})
+	}
+
+	return results, nil
+}
+
 // listDocuments performs a merged ListDocuments: queries both backends, merges
 // by document path (shadow wins on conflicts), filters tombstoned docs.
 func (h *readHandler) listDocuments(ctx context.Context, req *firestorepb.ListDocumentsRequest) (*firestorepb.ListDocumentsResponse, error) {

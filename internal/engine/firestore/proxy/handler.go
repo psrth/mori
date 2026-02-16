@@ -100,17 +100,19 @@ func (p *Proxy) resolveTargetSDK(cl *core.Classification, strategy core.RoutingS
 		// Merged reads via SDK.
 		if strategy == core.StrategyMergedRead || strategy == core.StrategyJoinPatch {
 			switch methodName {
-			case "GetDocument", "ListDocuments", "RunQuery":
+			case "GetDocument", "BatchGetDocuments", "ListDocuments", "RunQuery":
 				return targetMerged
 			}
 		}
 
-		// Reads that should go to prod but need tombstone filtering.
+		// Reads that should go to prod but need delta/tombstone handling.
+		// Firestore classifications don't include table names, so the router
+		// defaults to ProdDirect. We upgrade to merged read when any deltas
+		// or tombstones exist, so shadow writes are visible in subsequent reads.
 		if cl.OpType == core.OpRead && strategy == core.StrategyProdDirect {
 			switch methodName {
-			case "GetDocument", "ListDocuments", "RunQuery":
-				// If there are any tombstones, use SDK to filter them.
-				if p.tombstones.CountForTable("") > 0 || len(p.tombstones.Tables()) > 0 {
+			case "GetDocument", "BatchGetDocuments", "ListDocuments", "RunQuery":
+				if p.deltaMap.HasAnyDelta() || p.tombstones.CountForTable("") > 0 || len(p.tombstones.Tables()) > 0 {
 					return targetMerged
 				}
 			}
@@ -210,6 +212,29 @@ func (p *Proxy) handleSDKRead(serverStream grpc.ServerStream, method string, con
 			return status.Errorf(codes.Internal, "failed to marshal ListDocuments response: %v", err)
 		}
 		return serverStream.SendMsg(&frame{payload: respBytes})
+
+	case "BatchGetDocuments":
+		req := &firestorepb.BatchGetDocumentsRequest{}
+		if err := proto.Unmarshal(f.payload, req); err != nil {
+			log.Printf("[conn %d] failed to unmarshal BatchGetDocumentsRequest: %v — falling back to raw", connID, err)
+			return p.forwardToProd(serverStream, method, connID)
+		}
+
+		results, err := rh.batchGetDocuments(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		for _, r := range results {
+			respBytes, err := proto.Marshal(r)
+			if err != nil {
+				return status.Errorf(codes.Internal, "failed to marshal BatchGetDocuments response: %v", err)
+			}
+			if err := serverStream.SendMsg(&frame{payload: respBytes}); err != nil {
+				return err
+			}
+		}
+		return nil
 
 	case "RunQuery":
 		req := &firestorepb.RunQueryRequest{}
