@@ -334,14 +334,27 @@ func (eh *ExtHandler) inTxn() bool {
 
 // --- Strategy handlers ---
 
-// handleExtInsert forwards batch to Shadow and tracks the insert in deltaMap.
+// handleExtInsert forwards batch to Shadow, captures the insert count, and tracks it.
 func (eh *ExtHandler) handleExtInsert(clientConn net.Conn, batchRaw []byte, cl *core.Classification) error {
-	if err := forwardAndRelay(batchRaw, eh.shadowConn, clientConn); err != nil {
+	tag, err := forwardRelayAndCaptureTag(batchRaw, eh.shadowConn, clientConn)
+	if err != nil {
 		return err
 	}
 	if eh.deltaMap != nil {
+		count := parseInsertCount(tag)
 		for _, table := range cl.Tables {
-			eh.deltaMap.MarkInserted(table)
+			if eh.inTxn() {
+				eh.deltaMap.StageInsertCount(table, count)
+			} else {
+				eh.deltaMap.AddInsertCount(table, count)
+			}
+		}
+		if !eh.inTxn() {
+			if err := delta.WriteDeltaMap(eh.moriDir, eh.deltaMap); err != nil {
+				if eh.verbose {
+					log.Printf("[conn %d] ext: failed to persist delta map: %v", eh.connID, err)
+				}
+			}
 		}
 	}
 	return nil

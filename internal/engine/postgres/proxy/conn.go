@@ -117,9 +117,11 @@ func relayStartup(clientConn, prodConn net.Conn) error {
 		}
 
 		// If Prod sent an auth request, the client may need to respond.
+		// AuthenticationOk (0) and SASLFinal (12) are server-only messages
+		// that do not require a client response.
 		if msg.Type == 'R' && len(msg.Payload) >= 4 {
 			authType := binary.BigEndian.Uint32(msg.Payload[:4])
-			if authType != 0 { // 0 = AuthenticationOk
+			if authType != 0 && authType != 12 {
 				clientMsg, err := readMsg(clientConn)
 				if err != nil {
 					return fmt.Errorf("reading client auth response: %w", err)
@@ -543,6 +545,34 @@ func forwardAndRelay(raw []byte, backend, client net.Conn) error {
 
 		if msg.Type == 'Z' {
 			return nil
+		}
+	}
+}
+
+// forwardRelayAndCaptureTag sends a message to the backend, relays the full
+// response to the client, and returns the CommandComplete tag string.
+func forwardRelayAndCaptureTag(raw []byte, backend, client net.Conn) (string, error) {
+	if _, err := backend.Write(raw); err != nil {
+		return "", fmt.Errorf("sending to backend: %w", err)
+	}
+
+	var tag string
+	for {
+		msg, err := readMsg(backend)
+		if err != nil {
+			return tag, fmt.Errorf("reading backend response: %w", err)
+		}
+
+		if msg.Type == 'C' {
+			tag = parseCommandTag(msg.Payload)
+		}
+
+		if _, err := client.Write(msg.Raw); err != nil {
+			return tag, fmt.Errorf("relaying to client: %w", err)
+		}
+
+		if msg.Type == 'Z' {
+			return tag, nil
 		}
 	}
 }

@@ -116,6 +116,16 @@ func parseCommandTag(payload []byte) string {
 	return string(payload)
 }
 
+// parseInsertCount extracts the row count from an INSERT command tag.
+// Format: "INSERT 0 N" → N. Returns 0 if the tag is not an INSERT or unparseable.
+func parseInsertCount(tag string) int {
+	var oid, count int
+	if _, err := fmt.Sscanf(tag, "INSERT %d %d", &oid, &count); err == nil {
+		return count
+	}
+	return 0
+}
+
 // QueryResult holds the parsed result of executing a query on a backend.
 type QueryResult struct {
 	Columns    []ColumnInfo // column metadata from RowDescription

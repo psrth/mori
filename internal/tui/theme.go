@@ -69,10 +69,10 @@ var (
 	DimText = lipgloss.NewStyle().
 		Foreground(ColorMuted)
 
-	DeltaStyle = lipgloss.NewStyle().
+	EditStyle = lipgloss.NewStyle().
 			Foreground(ColorWarning)
 
-	TombstoneStyle = lipgloss.NewStyle().
+	DeleteStyle = lipgloss.NewStyle().
 			Foreground(ColorStopped)
 
 	SchemaStyle = lipgloss.NewStyle().

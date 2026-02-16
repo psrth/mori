@@ -7,11 +7,13 @@ import (
 )
 
 // connWithSSL returns a copy of conn with SSLMode enforced to "require"
-// when it is empty or explicitly set to "disable". The Extra map is
-// deep-copied so mutations on the returned value cannot affect the original.
+// when it is empty or explicitly set to "disable". When a tunnel is
+// configured the tunnel already handles TLS, so SSL enforcement is skipped.
+// The Extra map is deep-copied so mutations on the returned value cannot
+// affect the original.
 func connWithSSL(conn *config.Connection) *config.Connection {
 	c := *conn
-	if c.SSLMode == "" || c.SSLMode == "disable" {
+	if conn.Tunnel == nil && (c.SSLMode == "" || c.SSLMode == "disable") {
 		c.SSLMode = "require"
 	}
 	if conn.Extra != nil {
