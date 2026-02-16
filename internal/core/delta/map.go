@@ -8,17 +8,19 @@ type Map struct {
 	s *pkSet
 
 	// insertedTables tracks tables that have had rows inserted into Shadow.
-	// Inserts don't need per-PK tracking — the Router just needs to know
-	// "this table has Shadow-only rows" to trigger merged reads.
+	// The int value is the cumulative insert count (0 means "has inserts but count unknown").
 	insertMu       sync.RWMutex
-	insertedTables map[string]bool
+	insertedTables map[string]int
+
+	// stagedInserts holds insert counts added during a transaction, promoted on Commit.
+	stagedInserts map[string]int
 }
 
 // NewMap creates an empty delta map.
 func NewMap() *Map {
 	return &Map{
 		s:              newPKSet(),
-		insertedTables: make(map[string]bool),
+		insertedTables: make(map[string]int),
 	}
 }
 
@@ -48,39 +50,85 @@ func (m *Map) CountForTable(table string) int { return m.s.countForTable(table) 
 // Tables returns all table names that have delta entries, sorted.
 func (m *Map) Tables() []string { return m.s.tables() }
 
-// MarkInserted records that a table has had rows inserted into Shadow.
+// AddInsertCount atomically adds count to the insert total for a table.
+func (m *Map) AddInsertCount(table string, count int) {
+	m.insertMu.Lock()
+	defer m.insertMu.Unlock()
+	m.insertedTables[table] += count
+}
+
+// MarkInserted records that a table has had rows inserted into Shadow (count unknown).
+// Used by non-Postgres engines that don't track per-statement row counts.
 func (m *Map) MarkInserted(table string) {
 	m.insertMu.Lock()
 	defer m.insertMu.Unlock()
-	m.insertedTables[table] = true
+	if _, ok := m.insertedTables[table]; !ok {
+		m.insertedTables[table] = 0
+	}
 }
 
 // HasInserts reports whether a table has had rows inserted into Shadow.
 func (m *Map) HasInserts(table string) bool {
 	m.insertMu.RLock()
 	defer m.insertMu.RUnlock()
+	_, ok := m.insertedTables[table]
+	return ok
+}
+
+// InsertCountForTable returns the cumulative insert count for a table.
+// Returns 0 if unknown or no inserts.
+func (m *Map) InsertCountForTable(table string) int {
+	m.insertMu.RLock()
+	defer m.insertMu.RUnlock()
 	return m.insertedTables[table]
 }
 
-// InsertedTablesList returns all tables with inserts, for persistence.
-func (m *Map) InsertedTablesList() []string {
+// InsertedTablesList returns all tables with inserts and their counts.
+func (m *Map) InsertedTablesList() map[string]int {
 	m.insertMu.RLock()
 	defer m.insertMu.RUnlock()
-	var out []string
-	for t := range m.insertedTables {
-		out = append(out, t)
+	out := make(map[string]int, len(m.insertedTables))
+	for t, c := range m.insertedTables {
+		out[t] = c
 	}
 	return out
 }
 
-// LoadInsertedTables populates the inserted tables set from a persisted list.
-func (m *Map) LoadInsertedTables(tables []string) {
+// LoadInsertedTables populates the inserted tables set from a persisted map.
+func (m *Map) LoadInsertedTables(tables map[string]int) {
 	m.insertMu.Lock()
 	defer m.insertMu.Unlock()
-	m.insertedTables = make(map[string]bool, len(tables))
-	for _, t := range tables {
-		m.insertedTables[t] = true
+	m.insertedTables = make(map[string]int, len(tables))
+	for t, c := range tables {
+		m.insertedTables[t] = c
 	}
+}
+
+// StageInsertCount stages an insert count addition for transaction support.
+func (m *Map) StageInsertCount(table string, count int) {
+	m.insertMu.Lock()
+	defer m.insertMu.Unlock()
+	if m.stagedInserts == nil {
+		m.stagedInserts = make(map[string]int)
+	}
+	m.stagedInserts[table] += count
+}
+
+// CommitInsertCounts promotes staged insert counts into committed state.
+func (m *Map) CommitInsertCounts() {
+	m.insertMu.Lock()
+	defer m.insertMu.Unlock()
+	for t, c := range m.stagedInserts {
+		m.insertedTables[t] += c
+	}
+	m.stagedInserts = nil
+}
+
+// RollbackInsertCounts discards staged insert counts.
+func (m *Map) RollbackInsertCounts() {
+	m.insertMu.Lock()
+	defer m.insertMu.Unlock()
+	m.stagedInserts = nil
 }
 
 // HasAnyDelta reports whether any delta entries or inserts exist at all.
@@ -103,7 +151,7 @@ func (m *Map) AnyTableDelta(tables []string) bool {
 	m.insertMu.RLock()
 	defer m.insertMu.RUnlock()
 	for _, t := range tables {
-		if m.insertedTables[t] {
+		if _, ok := m.insertedTables[t]; ok {
 			return true
 		}
 	}

@@ -80,7 +80,7 @@ func TestDeltaMapFileFormat(t *testing.T) {
 
 	m := NewMap()
 	m.Add("users", "42")
-	m.MarkInserted("orders")
+	m.AddInsertCount("orders", 5)
 
 	if err := WriteDeltaMap(dir, m); err != nil {
 		t.Fatalf("WriteDeltaMap() error: %v", err)
@@ -91,7 +91,7 @@ func TestDeltaMapFileFormat(t *testing.T) {
 		t.Fatalf("ReadFile() error: %v", err)
 	}
 
-	// Should be valid indented JSON with deltas and inserted_tables.
+	// Should be valid indented JSON with deltas and inserted_tables as map[string]int.
 	var raw deltaFile
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("file is not valid JSON: %v", err)
@@ -99,8 +99,68 @@ func TestDeltaMapFileFormat(t *testing.T) {
 	if len(raw.Deltas["users"]) != 1 || raw.Deltas["users"][0] != "42" {
 		t.Errorf("deltas = %v, want {users: [42]}", raw.Deltas)
 	}
-	if len(raw.InsertedTables) != 1 || raw.InsertedTables[0] != "orders" {
-		t.Errorf("inserted_tables = %v, want [orders]", raw.InsertedTables)
+	if raw.InsertedTables["orders"] != 5 {
+		t.Errorf("inserted_tables = %v, want {orders: 5}", raw.InsertedTables)
+	}
+}
+
+func TestDeltaMapLegacyFormat(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write old format: inserted_tables as []string.
+	legacy := `{"deltas":{"users":["1"]},"inserted_tables":["orders","products"]}`
+	if err := os.WriteFile(filepath.Join(dir, DeltaFile), []byte(legacy), 0644); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	got, err := ReadDeltaMap(dir)
+	if err != nil {
+		t.Fatalf("ReadDeltaMap() error: %v", err)
+	}
+
+	if !got.IsDelta("users", "1") {
+		t.Error("read map missing users entry")
+	}
+	if !got.HasInserts("orders") {
+		t.Error("read map missing orders inserts")
+	}
+	if !got.HasInserts("products") {
+		t.Error("read map missing products inserts")
+	}
+	// Legacy format should have count 0 (unknown).
+	if got.InsertCountForTable("orders") != 0 {
+		t.Errorf("InsertCountForTable(orders) = %d, want 0 (unknown)", got.InsertCountForTable("orders"))
+	}
+}
+
+func TestDeltaMapInsertCounts(t *testing.T) {
+	dir := t.TempDir()
+
+	m := NewMap()
+	m.AddInsertCount("users", 3)
+	m.AddInsertCount("users", 2)
+	m.MarkInserted("orders") // unknown count
+
+	if err := WriteDeltaMap(dir, m); err != nil {
+		t.Fatalf("WriteDeltaMap() error: %v", err)
+	}
+
+	got, err := ReadDeltaMap(dir)
+	if err != nil {
+		t.Fatalf("ReadDeltaMap() error: %v", err)
+	}
+
+	if got.InsertCountForTable("users") != 5 {
+		t.Errorf("InsertCountForTable(users) = %d, want 5", got.InsertCountForTable("users"))
+	}
+	if got.InsertCountForTable("orders") != 0 {
+		t.Errorf("InsertCountForTable(orders) = %d, want 0", got.InsertCountForTable("orders"))
+	}
+	if !got.HasInserts("users") {
+		t.Error("HasInserts(users) = false, want true")
+	}
+	if !got.HasInserts("orders") {
+		t.Error("HasInserts(orders) = false, want true")
 	}
 }
 

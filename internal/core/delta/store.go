@@ -17,6 +17,12 @@ const (
 // deltaFile is the on-disk format for the delta map, including inserted tables.
 type deltaFile struct {
 	Deltas         map[string][]string `json:"deltas"`
+	InsertedTables map[string]int      `json:"inserted_tables,omitempty"`
+}
+
+// deltaFileLegacy is the old on-disk format where InsertedTables was []string.
+type deltaFileLegacy struct {
+	Deltas         map[string][]string `json:"deltas"`
 	InsertedTables []string            `json:"inserted_tables,omitempty"`
 }
 
@@ -42,15 +48,31 @@ func ReadDeltaMap(moriDir string) (*Map, error) {
 
 	m := NewMap()
 
-	// Try new format first (with inserted_tables).
+	// Try new format first (with inserted_tables as map[string]int).
 	var df deltaFile
 	if err := json.Unmarshal(data, &df); err == nil && df.Deltas != nil {
 		m.Load(df.Deltas)
-		m.LoadInsertedTables(df.InsertedTables)
+		if df.InsertedTables != nil {
+			m.LoadInsertedTables(df.InsertedTables)
+		}
 		return m, nil
 	}
 
-	// Fall back to legacy format (plain map[string][]string).
+	// Try legacy format (inserted_tables as []string).
+	var legacy deltaFileLegacy
+	if err := json.Unmarshal(data, &legacy); err == nil && legacy.Deltas != nil {
+		m.Load(legacy.Deltas)
+		if len(legacy.InsertedTables) > 0 {
+			converted := make(map[string]int, len(legacy.InsertedTables))
+			for _, t := range legacy.InsertedTables {
+				converted[t] = 0 // count unknown from legacy format
+			}
+			m.LoadInsertedTables(converted)
+		}
+		return m, nil
+	}
+
+	// Fall back to bare format (plain map[string][]string, no inserted_tables).
 	var raw map[string][]string
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("failed to parse delta map: %w", err)
