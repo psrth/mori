@@ -90,7 +90,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		}
 		defer shadowClient.Close()
 
-		if err := schema.SeedShadow(ctx, prodClient, shadowClient, collections, 100); err != nil {
+		if err := schema.SeedShadow(ctx, prodClient, shadowClient, collections, schema.DefaultSeedLimit); err != nil {
 			mgr.StopAndRemove(ctx, containerInfo.ContainerID)
 			return nil, fmt.Errorf("failed to seed shadow: %w", err)
 		}
