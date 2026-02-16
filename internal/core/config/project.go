@@ -37,6 +37,16 @@ type Connection struct {
 	// Extra holds engine- or provider-specific fields that don't have
 	// dedicated struct fields (e.g. service_name, region, project_ref).
 	Extra map[string]string `yaml:"extra,omitempty"`
+
+	// Tunnel holds optional tunnel configuration for private-network databases.
+	Tunnel *TunnelConfig `yaml:"tunnel,omitempty"`
+}
+
+// TunnelConfig is the tunnel section of a connection in mori.yaml.
+type TunnelConfig struct {
+	Type      string            `yaml:"type"`
+	LocalPort int               `yaml:"local_port,omitempty"`
+	Params    map[string]string `yaml:"params,omitempty"`
 }
 
 // ProjectConfigPath returns the absolute path to mori.yaml
