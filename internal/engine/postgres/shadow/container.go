@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -74,10 +75,15 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 		password = "mori"
 	}
 
-	// Determine host port (default 9001).
+	// Determine host port (dynamic allocation if not specified).
 	hostPort := cfg.HostPort
 	if hostPort == 0 {
-		hostPort = 9001
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("failed to find free port: %w", err)
+		}
+		hostPort = listener.Addr().(*net.TCPAddr).Port
+		listener.Close()
 	}
 	portMapping := fmt.Sprintf("127.0.0.1:%d:5432", hostPort)
 

@@ -17,6 +17,8 @@ import (
 type InitOptions struct {
 	ProdConnStr string
 	ProjectRoot string
+	Image       string // Docker image override (default: "mysql:8.0")
+	EngineName  string // Engine name for config (default: "mysql")
 }
 
 // InitResult holds the result of a successful initialization.
@@ -54,8 +56,11 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 	fmt.Printf("  MySQL %s detected\n", versionStr)
 
-	// 4. Docker image — always use mysql:8.0 for Shadow.
-	imageName := "mysql:8.0"
+	// 4. Docker image — default to mysql:8.0, allow override for MariaDB.
+	imageName := opts.Image
+	if imageName == "" {
+		imageName = "mysql:8.0"
+	}
 
 	// 5. Set up Docker container.
 	fmt.Printf("Pulling Docker image %s...\n", imageName)
@@ -123,6 +128,22 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 	defer shadowDB.Close()
 
+	// Wait for the Shadow database to accept TCP connections from the host.
+	// mysqladmin ping (used by WaitReady) may succeed before the TCP listener
+	// is fully ready for external connections.
+	{
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+			if err := shadowDB.PingContext(pingCtx); err == nil {
+				pingCancel()
+				break
+			}
+			pingCancel()
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
 	if err := schema.ApplySchema(ctx, shadowDB, schemaSQL); err != nil {
 		initErr = err
 		return nil, fmt.Errorf("failed to apply schema to Shadow: %w", err)
@@ -141,7 +162,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		ShadowPort:      containerInfo.HostPort,
 		ShadowContainer: containerInfo.ContainerName,
 		ShadowImage:     imageName,
-		Engine:          "mysql",
+		Engine:          engineName(opts.EngineName),
 		EngineVersion:   versionStr,
 		ProxyPort:       9002,
 		InitializedAt:   time.Now(),
@@ -166,4 +187,12 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 			Tables:    tables,
 		},
 	}, nil
+}
+
+// engineName returns the engine name to use in config, defaulting to "mysql".
+func engineName(override string) string {
+	if override != "" {
+		return override
+	}
+	return "mysql"
 }

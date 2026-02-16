@@ -1,0 +1,74 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: #13120A;
+  --color-foreground: #FFFFFF;
+  --color-brand-purple: #69347A;
+  --color-brand-purple-light: #9B59B6;
+  --color-header-white: #FFFFFF;
+  --color-card-white: #D9D9D9;
+  --color-card-gray: #191816;
+
+  --font-heading: var(--font-manrope);
+  --font-body: var(--font-inter);
+  --font-mono: var(--font-dm-mono);
+
+  --color-card: #191816;
+  --color-card-foreground: #D9D9D9;
+  --color-primary: #69347A;
+  --color-primary-foreground: #FFFFFF;
+  --color-secondary: #191816;
+  --color-secondary-foreground: #D9D9D9;
+  --color-muted: #191816;
+  --color-muted-foreground: #D9D9D9;
+  --color-border: rgba(255, 255, 255, 0.1);
+  --color-ring: #69347A;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+}
+
+:root {
+  --radius: 0.625rem;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-inter), sans-serif;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-manrope), sans-serif;
+  }
+}
+
+/* Blinking cursor animation */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.animate-blink {
+  animation: blink 1s step-end infinite;
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}
+
+/* Selection color */
+::selection {
+  background-color: rgba(105, 52, 122, 0.4);
+  color: #FFFFFF;
+}

@@ -67,7 +67,6 @@ const (
 	comQuit       byte = 0x01
 	comInitDB     byte = 0x02
 	comQuery      byte = 0x03
-	comFieldList  byte = 0x04
 	comPing       byte = 0x0e
 	comStmtPrepare byte = 0x16
 	comStmtExecute byte = 0x17
@@ -94,16 +93,6 @@ func isEOFPacket(payload []byte) bool {
 // isERRPacket checks if a packet is an Error response.
 func isERRPacket(payload []byte) bool {
 	return len(payload) > 0 && payload[0] == iERR
-}
-
-// isResultSetHeader checks if a packet begins a result set (column count).
-func isResultSetHeader(payload []byte) bool {
-	if len(payload) == 0 {
-		return false
-	}
-	// Column count is a length-encoded integer. Values 1-250 are single byte.
-	// 0x00 = OK, 0xff = ERR, 0xfe = EOF.
-	return payload[0] > 0 && payload[0] < 0xfb
 }
 
 // buildOKPacket constructs a MySQL OK packet.

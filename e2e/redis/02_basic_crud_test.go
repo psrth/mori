@@ -140,16 +140,18 @@ func TestExists(t *testing.T) {
 func TestMget(t *testing.T) {
 	t.Run("mget_prod_keys", func(t *testing.T) {
 		conn, r := connectProxy(t)
-		resp := redisCmd(t, conn, r, "MGET", "user:1", "user:2", "user:3")
+		// Use user:3, session:abc, session:def which are not modified by earlier tests
+		// (user:1 is overwritten in TestBasicSet, user:2 is deleted in TestBasicDelete).
+		resp := redisCmd(t, conn, r, "MGET", "user:3", "session:abc", "session:def")
 		assertArrayLen(t, resp, 3)
-		if resp.Array[0].Str != "Alice" {
-			t.Errorf("MGET[0] = %q, want 'Alice'", resp.Array[0].Str)
+		if resp.Array[0].Str != "Charlie" {
+			t.Errorf("MGET[0] = %q, want 'Charlie'", resp.Array[0].Str)
 		}
-		if resp.Array[1].Str != "Bob" {
-			t.Errorf("MGET[1] = %q, want 'Bob'", resp.Array[1].Str)
+		if resp.Array[1].Str != "user:1" {
+			t.Errorf("MGET[1] = %q, want 'user:1'", resp.Array[1].Str)
 		}
-		if resp.Array[2].Str != "Charlie" {
-			t.Errorf("MGET[2] = %q, want 'Charlie'", resp.Array[2].Str)
+		if resp.Array[2].Str != "user:2" {
+			t.Errorf("MGET[2] = %q, want 'user:2'", resp.Array[2].Str)
 		}
 	})
 

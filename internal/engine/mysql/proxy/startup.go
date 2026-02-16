@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"time"
 )
@@ -73,15 +72,32 @@ func relayHandshake(clientConn, prodConn net.Conn) error {
 			}
 			return nil
 		default:
-			// Auth switch request (0xFE with plugin name) or auth more data (0x01).
-			if authResult.Payload[0] == 0x01 || authResult.Payload[0] == 0xfe {
-				// Read client's auth continuation.
+			if authResult.Payload[0] == 0x01 {
+				// Auth more data (caching_sha2_password).
+				// 0x01 0x03 = fast auth success → server will send OK next, don't read from client.
+				// 0x01 0x04 = full auth required → client will send encrypted password.
+				if len(authResult.Payload) > 1 && authResult.Payload[1] == 0x03 {
+					// Fast auth success: continue to read the final OK from server.
+					continue
+				}
+				// Full auth or other: relay client's auth response.
 				clientAuth, err := readMySQLPacket(clientConn)
 				if err != nil {
 					return fmt.Errorf("reading client auth continuation: %w", err)
 				}
 				if _, err := prodConn.Write(clientAuth.Raw); err != nil {
 					return fmt.Errorf("forwarding auth continuation to prod: %w", err)
+				}
+				continue
+			}
+			if authResult.Payload[0] == 0xfe {
+				// Auth switch request (0xFE with plugin name).
+				clientAuth, err := readMySQLPacket(clientConn)
+				if err != nil {
+					return fmt.Errorf("reading client auth switch response: %w", err)
+				}
+				if _, err := prodConn.Write(clientAuth.Raw); err != nil {
+					return fmt.Errorf("forwarding auth switch response to prod: %w", err)
 				}
 				continue
 			}
@@ -268,9 +284,3 @@ func parseHandshake(payload []byte) (authData []byte, plugin string) {
 	return authData, plugin
 }
 
-// readRawBytes reads exactly n bytes from the reader.
-func readRawBytes(r io.Reader, n int) ([]byte, error) {
-	buf := make([]byte, n)
-	_, err := io.ReadFull(r, buf)
-	return buf, err
-}

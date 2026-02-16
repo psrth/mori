@@ -16,15 +16,20 @@ type DumpResult struct {
 	Tables    map[string]TableMeta
 }
 
-// DumpSchema runs mysqldump --no-data against the Prod database.
-// It runs mysqldump inside a Docker container to ensure tool availability.
+// DumpSchema runs mysqldump/mariadb-dump --no-data against the Prod database.
+// It runs the dump tool inside a Docker container to ensure tool availability.
 func DumpSchema(ctx context.Context, dsn *connstr.DSN, image string) (string, error) {
+	// MariaDB 11+ ships mariadb-dump instead of mysqldump.
+	dumpCmd := "mysqldump"
+	if strings.Contains(image, "mariadb") {
+		dumpCmd = "mariadb-dump"
+	}
 	args := []string{
 		"run", "--rm",
 		"-e", dsn.MysqldumpEnv(),
 		"--add-host", "host.docker.internal:host-gateway",
 		image,
-		"mysqldump",
+		dumpCmd,
 	}
 	args = append(args, dsn.MysqldumpDockerArgs()...)
 

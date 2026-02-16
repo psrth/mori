@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os/exec"
 	"strings"
 	"time"
@@ -75,7 +76,12 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 
 	hostPort := cfg.HostPort
 	if hostPort == 0 {
-		hostPort = DefaultHostPort
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("failed to find free port: %w", err)
+		}
+		hostPort = listener.Addr().(*net.TCPAddr).Port
+		listener.Close()
 	}
 
 	portMapping := fmt.Sprintf("127.0.0.1:%d:6379", hostPort)

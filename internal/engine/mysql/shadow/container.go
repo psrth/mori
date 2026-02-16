@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -75,18 +76,28 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 
 	hostPort := cfg.HostPort
 	if hostPort == 0 {
-		hostPort = 9001
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("failed to find free port: %w", err)
+		}
+		hostPort = listener.Addr().(*net.TCPAddr).Port
+		listener.Close()
 	}
 	portMapping := fmt.Sprintf("127.0.0.1:%d:3306", hostPort)
 
-	cmd := exec.CommandContext(ctx, "docker", "run", "-d",
+	args := []string{"run", "-d",
 		"--name", name,
-		"-e", "MYSQL_ROOT_PASSWORD="+password,
-		"-e", "MYSQL_DATABASE="+cfg.DBName,
+		"-e", "MYSQL_ROOT_PASSWORD=" + password,
+		"-e", "MYSQL_DATABASE=" + cfg.DBName,
 		"-p", portMapping,
 		cfg.Image,
-		"--default-authentication-plugin=mysql_native_password",
-	)
+	}
+	// MariaDB does not support --default-authentication-plugin; only add
+	// this flag for MySQL images.
+	if !strings.Contains(cfg.Image, "mariadb") {
+		args = append(args, "--default-authentication-plugin=mysql_native_password")
+	}
+	cmd := exec.CommandContext(ctx, "docker", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create container: %s", strings.TrimSpace(string(out)))
@@ -160,9 +171,15 @@ func (m *Manager) WaitReady(ctx context.Context, containerID, password string) e
 }
 
 func (m *Manager) isMySQLReady(ctx context.Context, containerID, password string) bool {
-	cmd := exec.CommandContext(ctx, "docker", "exec", containerID,
-		"mysqladmin", "ping", "-h", "localhost", "-uroot", "-p"+password, "--silent")
-	return cmd.Run() == nil
+	// Try mysqladmin first (MySQL), then mariadb-admin (MariaDB 11+).
+	for _, admin := range []string{"mysqladmin", "mariadb-admin"} {
+		cmd := exec.CommandContext(ctx, "docker", "exec", containerID,
+			admin, "ping", "-h", "localhost", "-uroot", "-p"+password, "--silent")
+		if cmd.Run() == nil {
+			return true
+		}
+	}
+	return false
 }
 
 // Stop stops a running Shadow container.

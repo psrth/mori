@@ -85,6 +85,53 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	}
 	defer closeAll()
 
+	// Create a WriteHandler for delta-tracking writes.
+	var wh *WriteHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		wh = &WriteHandler{
+			prodConn:   prodConn,
+			shadowConn: shadowConn,
+			deltaMap:   p.deltaMap,
+			tombstones: p.tombstones,
+			tables:     p.tables,
+			moriDir:    p.moriDir,
+			connID:     connID,
+			verbose:    p.verbose,
+			logger:     p.logger,
+		}
+	}
+
+	// Create a ReadHandler for merged reads.
+	var rh *ReadHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		rh = &ReadHandler{
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+		}
+	}
+
+	// Create a DDLHandler for schema-tracking DDL execution.
+	var ddh *DDLHandler
+	if p.schemaRegistry != nil {
+		ddh = &DDLHandler{
+			shadowConn:     shadowConn,
+			schemaRegistry: p.schemaRegistry,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+		}
+	}
+
 	for {
 		pkt, err := readMySQLPacket(clientConn)
 		if err != nil {
@@ -145,6 +192,47 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		if cmd == comQuery {
 			sql := extractQuerySQL(pkt.Payload)
 			decision := p.classifyAndRoute(sql, connID)
+
+			// Dispatch write strategies to WriteHandler when available.
+			if wh != nil && decision.classification != nil {
+				switch decision.strategy {
+				case core.StrategyShadowWrite,
+					core.StrategyHydrateAndWrite,
+					core.StrategyShadowDelete:
+					if err := wh.HandleWrite(clientConn, pkt.Raw, decision.classification, decision.strategy); err != nil {
+						if p.verbose {
+							log.Printf("[conn %d] write handler error: %v", connID, err)
+						}
+						return
+					}
+					continue
+				}
+			}
+
+			// Dispatch merged read strategies to ReadHandler when available.
+			if rh != nil && decision.classification != nil {
+				switch decision.strategy {
+				case core.StrategyMergedRead, core.StrategyJoinPatch:
+					if err := rh.HandleRead(clientConn, pkt.Raw, decision.classification, decision.strategy); err != nil {
+						if p.verbose {
+							log.Printf("[conn %d] read handler error: %v", connID, err)
+						}
+						return
+					}
+					continue
+				}
+			}
+
+			// Dispatch DDL to DDLHandler when available.
+			if ddh != nil && decision.classification != nil && decision.strategy == core.StrategyShadowDDL {
+				if err := ddh.HandleDDL(clientConn, pkt.Raw, decision.classification); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] DDL handler error: %v", connID, err)
+					}
+					return
+				}
+				continue
+			}
 
 			switch decision.target {
 			case targetProd:
@@ -255,9 +343,8 @@ func (p *Proxy) classifyAndRoute(sql string, connID int64) routeDecision {
 		return routeDecision{target: targetBoth, classification: classification, strategy: strategy}
 
 	case core.StrategyMergedRead, core.StrategyJoinPatch:
-		// For v1, fall back to prod for merged reads.
 		return routeDecision{
-			target:         targetProd,
+			target:         targetProd, // fallback if ReadHandler is nil
 			classification: classification,
 			strategy:       strategy,
 		}
