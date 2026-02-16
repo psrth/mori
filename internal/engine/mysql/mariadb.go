@@ -32,6 +32,7 @@ func (e *mariadbEngine) Init(ctx context.Context, opts engine.InitOptions) (*eng
 	result, err := Init(ctx, InitOptions{
 		ProdConnStr: opts.ProdConnStr,
 		ProjectRoot: opts.ProjectRoot,
+		ConnName:    opts.ConnName,
 		EngineName:  "mariadb",
 	})
 	if err != nil {

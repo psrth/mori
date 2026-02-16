@@ -406,8 +406,8 @@ func TestAzure_ConnString_WithPassword(t *testing.T) {
 func TestUpstash_Fields(t *testing.T) {
 	p := auth.Lookup(registry.Upstash)
 	fields := p.Fields(registry.Redis)
-	if len(fields) != 5 {
-		t.Errorf("Upstash.Fields() returned %d fields, want 5", len(fields))
+	if fields != nil {
+		t.Errorf("Upstash.Fields() returned non-nil, expected nil (uses registry defaults)")
 	}
 }
 
@@ -422,22 +422,16 @@ func TestFirebase_Fields(t *testing.T) {
 func TestVercelPostgres_Fields(t *testing.T) {
 	p := auth.Lookup(registry.VercelPG)
 	fields := p.Fields(registry.Postgres)
-	if len(fields) == 0 {
-		t.Fatal("Vercel Postgres.Fields() returned no fields")
-	}
-	if fields[0].Key != "connection_url" {
-		t.Errorf("first field should be connection_url, got %s", fields[0].Key)
+	if fields != nil {
+		t.Errorf("Vercel Postgres.Fields() returned non-nil, expected nil (uses registry defaults)")
 	}
 }
 
 func TestRailway_Fields(t *testing.T) {
 	p := auth.Lookup(registry.Railway)
 	fields := p.Fields(registry.Postgres)
-	if len(fields) == 0 {
-		t.Fatal("Railway.Fields() returned no fields")
-	}
-	if fields[0].Key != "connection_url" {
-		t.Errorf("first field should be connection_url, got %s", fields[0].Key)
+	if fields != nil {
+		t.Errorf("Railway.Fields() returned non-nil, expected nil (uses registry defaults)")
 	}
 }
 
@@ -447,7 +441,7 @@ func TestNilFieldsProviders(t *testing.T) {
 		registry.Direct, registry.GCPCloudSQL, registry.AWSRDS,
 		registry.Neon, registry.Supabase, registry.Azure,
 		registry.PlanetScale, registry.MongoAtlas, registry.DigitalOcean,
-		registry.Cloudflare,
+		registry.Cloudflare, registry.Upstash, registry.VercelPG, registry.Railway,
 	}
 	for _, id := range nilFieldProviders {
 		p := auth.Lookup(id)

@@ -7,17 +7,20 @@ import (
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 
 var statusCmd = &cobra.Command{
-	Use:   "status",
+	Use:   "status [connection-name]",
 	Short: "Display current Mori state",
-	Long: `Show the current state of the Mori project: engine info, connection
+	Long: `Show the current state of a Mori connection: engine info, connection
 details, delta row counts, tombstone counts, schema diffs, and sequence
 offsets.
 
-If Mori is not initialized, prints a message indicating so.`,
+If no connection name is given and only one is initialized, it is selected
+automatically.`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runStatus,
 }
 
@@ -27,42 +30,48 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to determine project root: %w", err)
 	}
 
-	if !config.IsInitialized(projectRoot) {
+	initialized := config.InitializedConnections(projectRoot)
+	if len(initialized) == 0 {
 		if config.HasProjectConfig(projectRoot) {
-			fmt.Println("Mori has connections configured but no active session.")
-			fmt.Println("Run 'mori start' to begin proxying.")
+			fmt.Println("Mori has connections configured but none initialized.")
+			ui.Info("Run 'mori start' to begin proxying.")
 		} else {
 			fmt.Println("Mori is not initialized.")
-			fmt.Println("Run 'mori init' to get started.")
+			ui.Info("Run 'mori init' to get started.")
 		}
 		return nil
 	}
 
-	cfg, err := config.ReadConfig(projectRoot)
+	connName, err := resolveInitializedConnection(projectRoot, args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.ReadConnConfig(projectRoot, connName)
 	if err != nil {
 		return fmt.Errorf("failed to read config: %w", err)
 	}
 
+	connDir := config.ConnDir(projectRoot, connName)
+
 	// Connection info.
-	if cfg.ActiveConnection != "" {
-		fmt.Printf("Connection:   %s\n", cfg.ActiveConnection)
-	}
-	fmt.Printf("Engine:       %s %s\n", cfg.Engine, cfg.EngineVersion)
-	fmt.Printf("Prod:         %s (read-only)\n", cfg.RedactedProdConnection())
-	fmt.Printf("Shadow:       localhost:%d\n", cfg.ShadowPort)
+	fmt.Printf("Connection: %s\n", ui.Cyan(connName))
+	fmt.Printf("Engine:     %s %s\n", cfg.Engine, cfg.EngineVersion)
+	fmt.Printf("Prod:       %s\n", cfg.RedactedProdConnection())
+	fmt.Printf("Shadow:     localhost:%d\n", cfg.ShadowPort)
 
 	// Proxy running state.
-	pidPath := config.PidFilePath(projectRoot)
+	pidPath := config.ConnPidFilePath(projectRoot, connName)
 	if pid, running := isProxyRunning(pidPath); running {
-		fmt.Printf("Proxy:        localhost:%d (running, PID %d)\n", cfg.ProxyPort, pid)
+		fmt.Printf("Proxy:      localhost:%d · %s (PID %d)\n",
+			cfg.ProxyPort, ui.Green(ui.IconActive+" running"), pid)
 	} else {
-		fmt.Printf("Proxy:        localhost:%d (stopped)\n", cfg.ProxyPort)
+		fmt.Printf("Proxy:      localhost:%d · %s\n",
+			cfg.ProxyPort, ui.Dim(ui.IconInactive+" stopped"))
 	}
 
-	moriDir := config.MoriDirPath(projectRoot)
-
 	// Delta Rows.
-	if dm, err := delta.ReadDeltaMap(moriDir); err == nil {
+	if dm, err := delta.ReadDeltaMap(connDir); err == nil {
 		tables := dm.Tables()
 		insertedTables := dm.InsertedTablesList()
 		if len(tables) > 0 || len(insertedTables) > 0 {
@@ -75,51 +84,51 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			}
 			for _, t := range insertedTables {
 				if !shown[t] {
-					fmt.Printf("  %-20s (inserts)\n", t)
+					fmt.Printf("  %-20s %s\n", t, ui.Dim("(inserts)"))
 				}
 			}
 		} else {
-			fmt.Println("\nDelta Rows:   (none)")
+			fmt.Printf("Delta Rows: %s\n", ui.Dim("(none)"))
 		}
 	} else {
-		fmt.Println("\nDelta Rows:   (none)")
+		fmt.Printf("Delta Rows: %s\n", ui.Dim("(none)"))
 	}
 
 	// Tombstones.
-	if ts, err := delta.ReadTombstoneSet(moriDir); err == nil {
+	if ts, err := delta.ReadTombstoneSet(connDir); err == nil {
 		tables := ts.Tables()
 		if len(tables) > 0 {
-			fmt.Println("\nTombstones:")
+			fmt.Println("Tombstones:")
 			for _, t := range tables {
 				count := ts.CountForTable(t)
 				fmt.Printf("  %-20s %d %s\n", t, count, pluralize(count, "row", "rows"))
 			}
 		} else {
-			fmt.Println("\nTombstones:   (none)")
+			fmt.Printf("Tombstones: %s\n", ui.Dim("(none)"))
 		}
 	} else {
-		fmt.Println("\nTombstones:   (none)")
+		fmt.Printf("Tombstones: %s\n", ui.Dim("(none)"))
 	}
 
 	// Schema Diffs.
-	if sr, err := coreSchema.ReadRegistry(moriDir); err == nil {
+	if sr, err := coreSchema.ReadRegistry(connDir); err == nil {
 		tables := sr.Tables()
 		if len(tables) > 0 {
-			fmt.Println("\nSchema Diffs:")
+			fmt.Println("Schema Diffs:")
 			for _, t := range tables {
 				diff := sr.GetDiff(t)
 				fmt.Printf("  %-20s %s\n", t, formatSchemaDiff(diff))
 			}
 		} else {
-			fmt.Println("\nSchema Diffs: (none)")
+			fmt.Printf("Schema Diffs: %s\n", ui.Dim("(none)"))
 		}
 	} else {
-		fmt.Println("\nSchema Diffs: (none)")
+		fmt.Printf("Schema Diffs: %s\n", ui.Dim("(none)"))
 	}
 
 	// Sequence Offsets.
-	if seqs, err := schema.ReadSequences(moriDir); err == nil && len(seqs) > 0 {
-		fmt.Println("\nSequence Offsets:")
+	if seqs, err := schema.ReadSequences(connDir); err == nil && len(seqs) > 0 {
+		fmt.Println("Sequence Offsets:")
 		for tableName, offset := range seqs {
 			label := tableName + "." + offset.Column
 			fmt.Printf("  %-20s start=%s (prod max: %s)\n",
@@ -128,7 +137,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				formatNumber(offset.ProdMax))
 		}
 	} else {
-		fmt.Println("\nSequence Offsets: (none)")
+		fmt.Printf("Sequence Offsets: %s\n", ui.Dim("(none)"))
 	}
 
 	return nil

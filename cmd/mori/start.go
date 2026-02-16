@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 	morimcp "github.com/mori-dev/mori/internal/mcp"
 	"github.com/mori-dev/mori/internal/registry"
 	"github.com/mori-dev/mori/internal/tunnel"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 
 	// Register engine implementations via side-effect imports.
@@ -43,6 +43,8 @@ var startCmd = &cobra.Command{
 If no connection name is given and only one connection exists, it is selected
 automatically. If multiple connections exist, an interactive picker is shown.
 
+Multiple connections can run simultaneously on different ports.
+
 On first start for a connection, the Shadow database container is created
 and the production schema is dumped. Subsequent starts reuse the existing
 Shadow.`,
@@ -51,14 +53,14 @@ Shadow.`,
 }
 
 func init() {
-	startCmd.Flags().IntP("port", "p", 9002, "Port for the proxy to listen on")
+	startCmd.Flags().IntP("port", "p", 0, "Port for the proxy to listen on (default: auto-assign from 9002)")
 	startCmd.Flags().Bool("verbose", false, "Log all intercepted queries and routing decisions")
 	startCmd.Flags().Bool("mcp", false, "Enable MCP server for AI tool integration")
 	startCmd.Flags().Int("mcp-port", 9000, "Port for the MCP server")
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
-	port, _ := cmd.Flags().GetInt("port")
+	portFlag, _ := cmd.Flags().GetInt("port")
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	mcpEnabled, _ := cmd.Flags().GetBool("mcp")
 	mcpPort, _ := cmd.Flags().GetInt("mcp-port")
@@ -91,26 +93,25 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("connection %q not found in mori.yaml", connName)
 	}
 
+	ui.StepDone(fmt.Sprintf("Loaded connection %s", ui.Cyan(connName)))
+
 	// 4. Look up the engine implementation.
 	eng, err := engine.Lookup(registry.EngineID(conn.Engine))
 	if err != nil {
 		return fmt.Errorf("engine %q is not yet supported — only PostgreSQL and CockroachDB connections can be started", conn.Engine)
 	}
 
-	// 5. Check for existing active connection.
-	var cfg *config.Config
-	if config.IsInitialized(projectRoot) {
-		cfg, err = config.ReadConfig(projectRoot)
-		if err != nil {
-			return fmt.Errorf("failed to read runtime config: %w", err)
-		}
-		if cfg.ActiveConnection != "" && cfg.ActiveConnection != connName {
-			return fmt.Errorf("connection %q is currently active — run 'mori stop' first, then 'mori start %s'",
-				cfg.ActiveConnection, connName)
-		}
+	// 5. Migrate legacy state if needed (old .mori/config.json → .mori/<connName>/).
+	config.MigrateToConnDir(projectRoot, connName)
+
+	// 6. Check if this connection is already running.
+	connDir := config.ConnDir(projectRoot, connName)
+	pidPath := config.ConnPidFilePath(projectRoot, connName)
+	if pid, running := isProxyRunning(pidPath); running {
+		return fmt.Errorf("connection %q is already running (PID %d) — run 'mori stop %s' first", connName, pid, connName)
 	}
 
-	// 5.5 Start tunnel if configured.
+	// 7. Start tunnel if configured.
 	var tunnelMgr *tunnel.Manager
 	if conn.Tunnel != nil {
 		tunnelMgr, err = tunnel.NewManager(conn.Tunnel)
@@ -119,14 +120,16 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if tunnelMgr != nil {
-		fmt.Printf("  Starting %s...\n", tunnelMgr.DisplayName())
-		if err := tunnelMgr.Start(cmd.Context()); err != nil {
-			return fmt.Errorf("failed to start tunnel: %w", err)
+		tunnelErr := ui.Spinner(fmt.Sprintf("Starting %s...", tunnelMgr.DisplayName()), func() error {
+			return tunnelMgr.Start(cmd.Context())
+		})
+		if tunnelErr != nil {
+			return fmt.Errorf("failed to start tunnel: %w", tunnelErr)
 		}
-		fmt.Printf("  Tunnel ready on %s\n", tunnelMgr.LocalAddr())
+		ui.StepDone(fmt.Sprintf("Tunnel ready on %s", tunnelMgr.LocalAddr()))
 
 		// Write tunnel PID file for stop command.
-		tunnelPidPath := config.TunnelPidFilePath(projectRoot)
+		tunnelPidPath := config.ConnTunnelPidFilePath(projectRoot, connName)
 		if err := os.WriteFile(tunnelPidPath, []byte(strconv.Itoa(tunnelMgr.PID())), 0644); err != nil {
 			log.Printf("Warning: could not write tunnel PID file: %v", err)
 		}
@@ -136,9 +139,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 		conn.Port = tunnelMgr.LocalPort()
 	}
 
-	// 6. If no runtime config exists, run the engine init (first start).
-	if cfg == nil {
-		fmt.Printf("First start for %q — setting up Shadow database...\n\n", connName)
+	// 8. If no runtime config exists for this connection, run the engine init (first start).
+	var cfg *config.Config
+	if config.IsConnInitialized(projectRoot, connName) {
+		cfg, err = config.ReadConnConfig(projectRoot, connName)
+		if err != nil {
+			return fmt.Errorf("failed to read runtime config: %w", err)
+		}
+	} else {
 		authProvider := auth.Lookup(registry.ProviderID(conn.Provider))
 		connStr, err := authProvider.ConnString(cmd.Context(), conn)
 		if err != nil {
@@ -148,58 +156,85 @@ func runStart(cmd *cobra.Command, args []string) error {
 		if conn.Extra != nil {
 			imageOverride = conn.Extra["image"]
 		}
-		result, err := eng.Init(cmd.Context(), engine.InitOptions{
+
+		result, initErr := eng.Init(cmd.Context(), engine.InitOptions{
 			ProdConnStr:   connStr,
 			ProjectRoot:   projectRoot,
+			ConnName:      connName,
 			ImageOverride: imageOverride,
 		})
-		if err != nil {
-			return err
+		if initErr != nil {
+			return initErr
 		}
 		cfg = result.Config
-		cfg.ActiveConnection = connName
-		if err := config.WriteConfig(projectRoot, cfg); err != nil {
-			return fmt.Errorf("failed to update config with active connection: %w", err)
-		}
 
-		fmt.Println()
-		fmt.Printf("Shadow ready — %s %s\n", cfg.Engine, cfg.EngineVersion)
-		fmt.Printf("  Shadow: localhost:%d (container: %s)\n", result.ContainerPort, result.ContainerName)
-		fmt.Printf("  Tables: %d\n", result.TableCount)
-		if len(cfg.Extensions) > 0 {
-			fmt.Printf("  Extensions: %s\n", strings.Join(cfg.Extensions, ", "))
-		}
-		fmt.Println()
+		tableLabel := fmt.Sprintf("%d %s", result.TableCount, pluralize(result.TableCount, "table", "tables"))
+		ui.StepDone(fmt.Sprintf("Shadow ready — %s %s · %s", cfg.Engine, cfg.EngineVersion, tableLabel))
 	}
 
-	// 7. Parse prod address from config.
+	// 9. Determine proxy port: explicit flag > existing config > auto-assign.
+	port := portFlag
+	if port == 0 && cfg.ProxyPort > 0 {
+		// Reuse previously assigned port, but verify it's not taken by another connection.
+		otherUsing := false
+		for _, name := range config.InitializedConnections(projectRoot) {
+			if name == connName {
+				continue
+			}
+			otherPid := config.ConnPidFilePath(projectRoot, name)
+			if _, running := isProxyRunning(otherPid); running {
+				if otherCfg, err := config.ReadConnConfig(projectRoot, name); err == nil {
+					if otherCfg.ProxyPort == cfg.ProxyPort {
+						otherUsing = true
+						break
+					}
+				}
+			}
+		}
+		if !otherUsing {
+			port = cfg.ProxyPort
+		}
+	}
+	if port == 0 {
+		port = config.NextAvailablePort(projectRoot, 9002)
+	}
+
+	// Update port in config.
+	cfg.ProxyPort = port
+	cfg.ActiveConnection = connName
+	if err := config.WriteConnConfig(projectRoot, connName, cfg); err != nil {
+		return fmt.Errorf("failed to update config: %w", err)
+	}
+
+	// 10. Parse prod address from config.
 	connInfo, err := eng.ParseConnStr(cfg.ProdConnection)
 	if err != nil {
 		return fmt.Errorf("invalid prod connection in config: %w", err)
 	}
 	prodAddr := connInfo.Addr
 
-	// 8. Check for an existing proxy (stale PID file).
-	pidPath := config.PidFilePath(projectRoot)
+	// 11. Check for a stale PID file.
 	if data, err := os.ReadFile(pidPath); err == nil {
 		if pid, err := strconv.Atoi(string(data)); err == nil {
 			if process, err := os.FindProcess(pid); err == nil {
 				if err := process.Signal(syscall.Signal(0)); err == nil {
-					return fmt.Errorf("mori proxy already running (PID %d) — run 'mori stop' first", pid)
+					return fmt.Errorf("mori proxy already running (PID %d) — run 'mori stop %s' first", pid, connName)
 				}
 			}
 		}
 		os.Remove(pidPath)
 	}
 
-	// 9. Write PID file.
+	// 12. Write PID file.
+	if err := config.InitConnDir(projectRoot, connName); err != nil {
+		return fmt.Errorf("failed to create state directory: %w", err)
+	}
 	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
 		return fmt.Errorf("failed to write PID file: %w", err)
 	}
 
-	// 10. Load table metadata for classifier.
-	moriDir := config.MoriDirPath(projectRoot)
-	tables, err := eng.LoadTableMeta(moriDir)
+	// 13. Load table metadata for classifier.
+	tables, err := eng.LoadTableMeta(connDir)
 	if err != nil {
 		if verbose {
 			log.Printf("Warning: could not load table metadata: %v (classifier will run without PK info)", err)
@@ -207,47 +242,48 @@ func runStart(cmd *cobra.Command, args []string) error {
 		tables = make(map[string]engine.TableMeta)
 	}
 
-	// 11. Create classifier.
+	// 14. Create classifier.
 	classifier := eng.NewClassifier(tables)
 
-	// 12. Load delta state.
+	// 15. Load delta state.
 	deltaMap := delta.NewMap()
-	if dm, err := delta.ReadDeltaMap(moriDir); err == nil {
+	if dm, err := delta.ReadDeltaMap(connDir); err == nil {
 		deltaMap = dm
 	} else if verbose {
 		log.Printf("No existing delta map found (starting clean): %v", err)
 	}
 
 	tombstones := delta.NewTombstoneSet()
-	if ts, err := delta.ReadTombstoneSet(moriDir); err == nil {
+	if ts, err := delta.ReadTombstoneSet(connDir); err == nil {
 		tombstones = ts
 	} else if verbose {
 		log.Printf("No existing tombstones found (starting clean): %v", err)
 	}
 
-	// 13. Load schema registry.
+	// 16. Load schema registry.
 	schemaReg := coreSchema.NewRegistry()
-	if sr, err := coreSchema.ReadRegistry(moriDir); err == nil {
+	if sr, err := coreSchema.ReadRegistry(connDir); err == nil {
 		schemaReg = sr
 	} else if verbose {
 		log.Printf("No existing schema registry found (starting clean): %v", err)
 	}
 
-	// 14. Create router.
+	// 17. Create router.
 	router := core.NewRouter(deltaMap, tombstones, schemaReg)
 
-	// 15. Compute Shadow address.
+	// 18. Compute Shadow address.
 	shadowAddr := fmt.Sprintf("127.0.0.1:%d", cfg.ShadowPort)
 
-	// 16. Create structured logger.
+	// 19. Create structured logger.
 	var logger *logging.Logger
-	if l, err := logging.New(config.LogFilePath(projectRoot)); err != nil {
+	logPath := config.ConnLogFilePath(projectRoot, connName)
+	if l, err := logging.New(logPath); err != nil {
 		log.Printf("Warning: could not create log file: %v (structured logging disabled)", err)
 	} else {
 		logger = l
 	}
 
-	// 17. Create proxy.
+	// 20. Create proxy.
 	p := eng.NewProxy(engine.ProxyDeps{
 		ProdAddr:   prodAddr,
 		ShadowAddr: shadowAddr,
@@ -259,11 +295,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		DeltaMap:   deltaMap,
 		Tombstones: tombstones,
 		SchemaReg:  schemaReg,
-		MoriDir:    moriDir,
+		MoriDir:    connDir,
 		Logger:     logger,
 	}, tables)
 
-	// 18. Set up signal handling.
+	// 21. Set up signal handling.
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
 
@@ -275,7 +311,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		errCh <- p.ListenAndServe(ctx)
 	}()
 
-	// 19. Optionally start MCP server.
+	// 22. Optionally start MCP server.
 	var mcpSrv *morimcp.Server
 	if mcpEnabled {
 		mcpSrv = morimcp.New(mcpPort, morimcp.EngineConfig{
@@ -298,26 +334,27 @@ func runStart(cmd *cobra.Command, args []string) error {
 			select {
 			case err := <-tunnelMgr.Done():
 				if err != nil && ctx.Err() == nil {
-					fmt.Printf("\n  WARNING: Tunnel died unexpectedly: %v\n", err)
-					fmt.Println("  Database connections may fail. Restart with 'mori stop && mori start'.")
+					fmt.Println()
+					ui.StepWarn(fmt.Sprintf("Tunnel died unexpectedly: %v", err))
+					ui.Info("Database connections may fail. Restart with 'mori stop && mori start'.")
 				}
 			case <-ctx.Done():
 			}
 		}()
 	}
 
-	fmt.Printf("Mori proxy started on 127.0.0.1:%d → %s [%s]\n", port, prodAddr, connName)
-	fmt.Printf("  Prod:   %s\n", cfg.RedactedProdConnection())
-	fmt.Printf("  Shadow: %s\n", shadowAddr)
+	ui.StepDone(fmt.Sprintf("Proxy listening on 127.0.0.1:%d %s %s", port, ui.IconArrow, prodAddr))
+	ui.Info(fmt.Sprintf("Prod:   %s", cfg.RedactedProdConnection()))
+	ui.Info(fmt.Sprintf("Shadow: %s", shadowAddr))
 	if mcpEnabled {
-		fmt.Printf("  MCP:    http://127.0.0.1:%d/mcp\n", mcpPort)
+		ui.Info(fmt.Sprintf("MCP:    http://127.0.0.1:%d/mcp", mcpPort))
 	}
 	if verbose {
-		fmt.Println("  Verbose logging enabled.")
+		ui.Info("Verbose logging enabled.")
 	}
-	fmt.Println("Press Ctrl+C to stop.")
+	ui.Info("Press Ctrl+C to stop.")
 
-	// 20. Wait for signal or error.
+	// 23. Wait for signal or error.
 	select {
 	case sig := <-sigCh:
 		fmt.Printf("\nReceived %s, shutting down...\n", sig)
@@ -327,7 +364,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// 21. Graceful shutdown with 10-second timeout.
+	// 24. Graceful shutdown with 10-second timeout.
 	cancel()
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -341,18 +378,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("Shutdown timeout: %v", err)
 	}
 
-	// 22. Stop tunnel if active.
+	// 25. Stop tunnel if active.
 	if tunnelMgr != nil {
-		fmt.Printf("Stopping tunnel (PID %d)...\n", tunnelMgr.PID())
 		if err := tunnelMgr.Stop(); err != nil {
 			log.Printf("Warning: failed to stop tunnel: %v", err)
 		}
-		os.Remove(config.TunnelPidFilePath(projectRoot))
+		os.Remove(config.ConnTunnelPidFilePath(projectRoot, connName))
 	}
 
-	// 23. Remove PID file.
+	// 26. Remove PID file.
 	os.Remove(pidPath)
-	fmt.Printf("Mori proxy stopped [%s].\n", connName)
+	ui.StepDone(fmt.Sprintf("Proxy stopped %s.", ui.Cyan(connName)))
 
 	return nil
 }

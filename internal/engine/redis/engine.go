@@ -31,6 +31,7 @@ func (e *redisEngine) Init(ctx context.Context, opts engine.InitOptions) (*engin
 	result, err := Init(ctx, InitOptions{
 		ProdConnStr: opts.ProdConnStr,
 		ProjectRoot: opts.ProjectRoot,
+		ConnName:    opts.ConnName,
 	})
 	if err != nil {
 		return nil, err

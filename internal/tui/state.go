@@ -22,12 +22,12 @@ type Snapshot struct {
 	ProxyRunning bool
 }
 
-// ReadSnapshot reads all state files from disk.
+// ReadSnapshot reads all state files from disk for a specific connection.
 // Never returns an error — returns whatever it can read successfully.
-func ReadSnapshot(projectRoot, moriDir string) Snapshot {
+func ReadSnapshot(projectRoot, connName, moriDir string) Snapshot {
 	var snap Snapshot
 
-	snap.Config, _ = config.ReadConfig(projectRoot)
+	snap.Config, _ = config.ReadConnConfig(projectRoot, connName)
 
 	if config.HasProjectConfig(projectRoot) {
 		snap.ProjConfig, _ = config.ReadProjectConfig(projectRoot)
@@ -39,7 +39,7 @@ func ReadSnapshot(projectRoot, moriDir string) Snapshot {
 	snap.Sequences, _ = pgschema.ReadSequences(moriDir)
 	snap.Tables, _ = pgschema.ReadTables(moriDir)
 
-	pidPath := config.PidFilePath(projectRoot)
+	pidPath := config.ConnPidFilePath(projectRoot, connName)
 	snap.ProxyPID, snap.ProxyRunning = ui.IsProxyRunning(pidPath)
 
 	return snap

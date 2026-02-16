@@ -11,11 +11,12 @@ import (
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 
 var resetCmd = &cobra.Command{
-	Use:   "reset",
+	Use:   "reset [connection-name]",
 	Short: "Reset all local state",
 	Long: `Wipe all local mutations and restore a clean-slate view of production.
 
@@ -25,6 +26,7 @@ data as if starting fresh.
 
 Use --hard to also re-sync the schema from production (useful when the
 production schema has changed since initialization).`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runReset,
 }
 
@@ -36,26 +38,28 @@ func runReset(cmd *cobra.Command, args []string) error {
 	hard, _ := cmd.Flags().GetBool("hard")
 	ctx := cmd.Context()
 
-	// 1. Find project root, verify initialized.
+	// 1. Find project root, resolve connection.
 	projectRoot, err := config.FindProjectRoot()
 	if err != nil {
 		return fmt.Errorf("failed to determine project root: %w", err)
 	}
-	if !config.IsInitialized(projectRoot) {
-		return fmt.Errorf("mori is not initialized — run 'mori init --from <conn_string>' first")
+
+	connName, err := resolveInitializedConnection(projectRoot, args)
+	if err != nil {
+		return err
 	}
 
 	// 2. Refuse if proxy is running.
-	pidPath := config.PidFilePath(projectRoot)
+	pidPath := config.ConnPidFilePath(projectRoot, connName)
 	if pid, running := isProxyRunning(pidPath); running {
-		return fmt.Errorf("mori proxy is running (PID %d) — stop it first with 'mori stop'", pid)
+		return fmt.Errorf("mori proxy is running (PID %d) — stop it first with 'mori stop %s'", pid, connName)
 	}
 
-	cfg, err := config.ReadConfig(projectRoot)
+	cfg, err := config.ReadConnConfig(projectRoot, connName)
 	if err != nil {
 		return fmt.Errorf("failed to read config: %w", err)
 	}
-	moriDir := config.MoriDirPath(projectRoot)
+	connDir := config.ConnDir(projectRoot, connName)
 
 	// 3. Parse prod DSN for dbname.
 	dsn, err := connstr.Parse(cfg.ProdConnection)
@@ -64,92 +68,133 @@ func runReset(cmd *cobra.Command, args []string) error {
 	}
 
 	// 4. Connect to Shadow and truncate tables.
-	fmt.Println("Connecting to Shadow database...")
 	shadowConnStr := connstr.ShadowDSN(cfg.ShadowPort, dsn.DBName)
-	shadowConn, err := pgx.Connect(ctx, shadowConnStr)
-	if err != nil {
-		return fmt.Errorf("cannot connect to Shadow (is the container running?): %w", err)
+
+	var shadowConn *pgx.Conn
+	connErr := ui.Spinner("Connecting to Shadow database...", func() error {
+		var e error
+		shadowConn, e = pgx.Connect(ctx, shadowConnStr)
+		return e
+	})
+	if connErr != nil {
+		return fmt.Errorf("cannot connect to Shadow (is the container running?): %w", connErr)
 	}
 	defer shadowConn.Close(ctx)
+	ui.StepDone("Connected")
 
-	tables, err := schema.ReadTables(moriDir)
+	tables, err := schema.ReadTables(connDir)
 	if err != nil {
-		fmt.Println("  Warning: could not read table metadata, skipping truncation.")
+		ui.StepWarn("Could not read table metadata, skipping truncation.")
 		tables = nil
 	}
 
 	if hard {
 		// --hard: drop all tables, re-dump schema from prod.
-		fmt.Println("Hard reset: dropping Shadow tables...")
-		if tables != nil {
-			for tableName := range tables {
-				shadowConn.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", quoteIdent(tableName)))
+		_ = ui.Spinner("Dropping Shadow tables...", func() error {
+			if tables != nil {
+				for tableName := range tables {
+					shadowConn.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", quoteIdent(tableName)))
+				}
 			}
-		}
+			return nil
+		})
 		shadowConn.Close(ctx)
 
-		fmt.Println("Re-syncing schema from production...")
-		prodConn, err := pgx.Connect(ctx, dsn.ConnString())
-		if err != nil {
-			return fmt.Errorf("cannot connect to production: %w", err)
-		}
-		defer prodConn.Close(ctx)
+		var dumpResult *schema.DumpResult
+		syncErr := ui.Spinner("Re-syncing schema from production...", func() error {
+			prodConn, err := pgx.Connect(ctx, dsn.ConnString())
+			if err != nil {
+				return fmt.Errorf("cannot connect to production: %w", err)
+			}
+			defer prodConn.Close(ctx)
 
-		dumpResult, err := schema.FullDump(ctx, prodConn, dsn, cfg.ShadowImage)
-		if err != nil {
-			return fmt.Errorf("schema dump failed: %w", err)
-		}
+			var e error
+			dumpResult, e = schema.FullDump(ctx, prodConn, dsn, cfg.ShadowImage)
+			if e != nil {
+				return fmt.Errorf("schema dump failed: %w", e)
+			}
 
-		extOpts := &schema.ExtInstallOptions{
-			ContainerID: cfg.ShadowContainer,
-		}
-		if v, parseErr := schema.ParseVersion(cfg.EngineVersion); parseErr == nil {
-			extOpts.PGMajor = v.Major
-		}
-		if err := schema.ApplyToShadow(ctx, shadowConnStr, dumpResult, extOpts); err != nil {
-			return fmt.Errorf("failed to apply schema to Shadow: %w", err)
+			extOpts := &schema.ExtInstallOptions{
+				ContainerID: cfg.ShadowContainer,
+			}
+			if v, parseErr := schema.ParseVersion(cfg.EngineVersion); parseErr == nil {
+				extOpts.PGMajor = v.Major
+			}
+			if e := schema.ApplyToShadow(ctx, shadowConnStr, dumpResult, extOpts); e != nil {
+				return fmt.Errorf("failed to apply schema to Shadow: %w", e)
+			}
+
+			return nil
+		})
+		if syncErr != nil {
+			return syncErr
 		}
 
 		// Persist updated metadata.
-		if err := schema.WriteSequences(moriDir, dumpResult.Sequences); err != nil {
+		if err := schema.WriteSequences(connDir, dumpResult.Sequences); err != nil {
 			return fmt.Errorf("failed to write sequences: %w", err)
 		}
-		if err := schema.WriteTables(moriDir, dumpResult.Tables); err != nil {
+		if err := schema.WriteTables(connDir, dumpResult.Tables); err != nil {
 			return fmt.Errorf("failed to write tables: %w", err)
 		}
 
-		fmt.Printf("  Re-synced %d tables, %d sequence offsets\n",
-			len(dumpResult.Tables), len(dumpResult.Sequences))
+		ui.StepDone(fmt.Sprintf("Re-synced %d tables, %d sequence offsets",
+			len(dumpResult.Tables), len(dumpResult.Sequences)))
 	} else {
 		// Soft reset: truncate tables and reset sequences.
 		if tables != nil {
-			fmt.Println("Truncating Shadow tables...")
-			for tableName := range tables {
-				_, err := shadowConn.Exec(ctx,
-					fmt.Sprintf("TRUNCATE TABLE %s CASCADE", quoteIdent(tableName)))
-				if err != nil {
-					fmt.Printf("  Warning: could not truncate %s: %v\n", tableName, err)
+			tableCount := len(tables)
+			_ = ui.Spinner("Truncating Shadow tables...", func() error {
+				for tableName := range tables {
+					_, err := shadowConn.Exec(ctx,
+						fmt.Sprintf("TRUNCATE TABLE %s CASCADE", quoteIdent(tableName)))
+					if err != nil {
+						fmt.Printf("  Warning: could not truncate %s: %v\n", tableName, err)
+					}
 				}
-			}
+				return nil
+			})
+			ui.StepDone(fmt.Sprintf("Truncated %d %s", tableCount, pluralize(tableCount, "table", "tables")))
 		}
 
 		// Reset sequence offsets.
-		if seqs, err := schema.ReadSequences(moriDir); err == nil {
+		if seqs, err := schema.ReadSequences(connDir); err == nil {
 			if err := schema.ApplySequenceOffsets(ctx, shadowConnStr, seqs); err != nil {
-				fmt.Printf("  Warning: could not reset sequence offsets: %v\n", err)
+				ui.StepWarn(fmt.Sprintf("Could not reset sequence offsets: %v", err))
 			}
 		}
 	}
 
 	// 5. Clear state files.
-	fmt.Println("Clearing local state...")
-	os.Remove(filepath.Join(moriDir, delta.DeltaFile))
-	os.Remove(filepath.Join(moriDir, delta.TombstoneFile))
-	os.Remove(filepath.Join(moriDir, coreSchema.RegistryFile))
+	_ = ui.Spinner("Clearing local state...", func() error {
+		os.Remove(filepath.Join(connDir, delta.DeltaFile))
+		os.Remove(filepath.Join(connDir, delta.TombstoneFile))
+		os.Remove(filepath.Join(connDir, coreSchema.RegistryFile))
+		os.Remove(config.ConnLogFilePath(projectRoot, connName))
+		return nil
+	})
 
-	// 6. Clear log file.
-	os.Remove(config.LogFilePath(projectRoot))
-
-	fmt.Println("\nReset complete. Run 'mori start' to begin a fresh session.")
+	ui.StepDone("Reset complete — run 'mori start' to begin fresh.")
 	return nil
+}
+
+// resolveInitializedConnection figures out which initialized connection to use.
+func resolveInitializedConnection(projectRoot string, args []string) (string, error) {
+	if len(args) == 1 {
+		name := args[0]
+		if !config.IsConnInitialized(projectRoot, name) {
+			return "", fmt.Errorf("connection %q is not initialized — run 'mori start %s' first", name, name)
+		}
+		return name, nil
+	}
+
+	initialized := config.InitializedConnections(projectRoot)
+	if len(initialized) == 0 {
+		return "", fmt.Errorf("no initialized connections — run 'mori start' first")
+	}
+	if len(initialized) == 1 {
+		return initialized[0], nil
+	}
+
+	return "", fmt.Errorf("multiple initialized connections (%v) — specify which one", initialized)
 }

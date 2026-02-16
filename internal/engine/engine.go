@@ -33,6 +33,7 @@ type ConnInfo struct {
 type InitOptions struct {
 	ProdConnStr   string
 	ProjectRoot   string
+	ConnName      string // Connection name for per-connection state directory
 	ImageOverride string // Optional: Docker image override (e.g. custom image with extensions)
 }
 

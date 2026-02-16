@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -59,7 +60,7 @@ func runRm(cmd *cobra.Command, args []string) error {
 		var confirm string
 		fmt.Scanln(&confirm)
 		if confirm != "y" && confirm != "Y" {
-			fmt.Println("Cancelled.")
+			ui.Info("Cancelled.")
 			return nil
 		}
 	}
@@ -69,6 +70,6 @@ func runRm(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to write mori.yaml: %w", err)
 	}
 
-	fmt.Printf("Connection %q removed from mori.yaml.\n", name)
+	ui.StepDone(fmt.Sprintf("Connection %s removed from mori.yaml.", ui.Cyan(name)))
 	return nil
 }
