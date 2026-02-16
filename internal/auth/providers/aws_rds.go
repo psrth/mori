@@ -12,6 +12,14 @@ import (
 	"github.com/mori-dev/mori/internal/registry"
 )
 
+// cliErrorDetail extracts stderr from an exec.ExitError for better diagnostics.
+func cliErrorDetail(err error) string {
+	if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+		return strings.TrimSpace(string(exitErr.Stderr))
+	}
+	return err.Error()
+}
+
 func init() { auth.Register(&awsRDSProvider{}) }
 
 type awsRDSProvider struct{}
@@ -40,7 +48,11 @@ func (p *awsRDSProvider) ConnString(ctx context.Context, conn *config.Connection
 
 	port := conn.Port
 	if port == 0 {
-		port = 5432
+		if eng, ok := registry.EngineByID(registry.EngineID(conn.Engine)); ok && eng.DefaultPort != 0 {
+			port = eng.DefaultPort
+		} else {
+			return "", fmt.Errorf("aws-rds: port is required (no default for engine %q)", conn.Engine)
+		}
 	}
 
 	username := conn.User
@@ -57,9 +69,9 @@ func (p *awsRDSProvider) ConnString(ctx context.Context, conn *config.Connection
 	).Output()
 	if err != nil {
 		return "", fmt.Errorf(
-			"aws-rds: could not generate IAM auth token: %w\n"+
+			"aws-rds: could not generate IAM auth token: %s\n"+
 				"Make sure the AWS CLI is installed and configured (aws configure)",
-			err,
+			cliErrorDetail(err),
 		)
 	}
 

@@ -26,13 +26,20 @@ func (p *gcpCloudSQLProvider) ConnString(ctx context.Context, conn *config.Conne
 		return c.ToConnString(), nil
 	}
 
+	if c.Host == "" {
+		return "", fmt.Errorf("gcp-cloud-sql: host is required")
+	}
+	if c.User == "" {
+		return "", fmt.Errorf("gcp-cloud-sql: user is required")
+	}
+
 	// No password supplied — obtain an access token from gcloud.
 	out, err := exec.CommandContext(ctx, "gcloud", "auth", "print-access-token").Output()
 	if err != nil {
 		return "", fmt.Errorf(
-			"gcp-cloud-sql: could not obtain access token via gcloud: %w\n"+
+			"gcp-cloud-sql: could not obtain access token via gcloud: %s\n"+
 				"Make sure the Google Cloud SDK is installed and you are authenticated (gcloud auth login)",
-			err,
+			cliErrorDetail(err),
 		)
 	}
 

@@ -34,8 +34,8 @@ func (a *awsSSMTunnel) Fields() []tunnel.Field {
 			Placeholder: "i-0abcd1234efgh5678"},
 		{Key: "remote_host", Label: "Remote DB host (from target)", Required: true,
 			Placeholder: "mydb.cluster-xxx.us-east-1.rds.amazonaws.com"},
-		{Key: "remote_port", Label: "Remote DB port", Required: true, Default: "5432",
-			Placeholder: "5432"},
+		{Key: "remote_port", Label: "Remote DB port", Required: true,
+			Placeholder: "5432 (Postgres), 3306 (MySQL), 1433 (MSSQL)"},
 		{Key: "region", Label: "AWS region", Placeholder: "us-east-1"},
 	}
 }
@@ -58,6 +58,12 @@ func (a *awsSSMTunnel) buildArgs(cfg *config.TunnelConfig) []string {
 }
 
 func (a *awsSSMTunnel) Start(ctx context.Context, cfg *config.TunnelConfig) (*tunnel.Process, error) {
+	for _, key := range []string{"target_instance", "remote_host", "remote_port"} {
+		if cfg.Params[key] == "" {
+			return nil, fmt.Errorf("aws-ssm: required parameter %q is missing", key)
+		}
+	}
+
 	args := a.buildArgs(cfg)
 	cmd := exec.CommandContext(ctx, "aws", args...)
 

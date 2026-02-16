@@ -45,6 +45,10 @@ func (c *cloudSQLProxyTunnel) buildArgs(cfg *config.TunnelConfig) []string {
 }
 
 func (c *cloudSQLProxyTunnel) Start(ctx context.Context, cfg *config.TunnelConfig) (*tunnel.Process, error) {
+	if cfg.Params["instance"] == "" {
+		return nil, fmt.Errorf("cloud-sql-proxy: required parameter \"instance\" is missing")
+	}
+
 	args := c.buildArgs(cfg)
 	cmd := exec.CommandContext(ctx, "cloud-sql-proxy", args...)
 
