@@ -62,7 +62,7 @@ var providers = []Provider{
 	{
 		ID: AWSRDS, DisplayName: "AWS RDS / Aurora",
 		Tier: ProviderTierT1, Category: "PRIMARY",
-		CompatibleEngines: []EngineID{Postgres, MySQL, MariaDB, MSSQL, Oracle},
+		CompatibleEngines: []EngineID{Postgres, MySQL, MariaDB, MSSQL},
 		SSLDefault:        "require",
 		ExtraFields: []ConnectionField{
 			{Key: "aws_region", Label: "AWS Region", Placeholder: "us-east-1"},

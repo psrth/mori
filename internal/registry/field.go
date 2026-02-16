@@ -121,13 +121,6 @@ var engineFields = map[EngineID][]ConnectionField{
 		{Key: "encrypt", Label: "Encrypt", Default: "true", Placeholder: "true | false"},
 		{Key: "trust_server_cert", Label: "Trust Server Certificate", Default: "false", Placeholder: "true | false"},
 	},
-	Oracle: {
-		fieldHost,
-		withDefault(fieldPort, "1521"),
-		fieldUser,
-		fieldPassword,
-		{Key: "service_name", Label: "Service Name", Required: true, Placeholder: "ORCL", Validate: validateNonEmpty("service name")},
-	},
 	SQLite: {
 		{Key: "file_path", Label: "File Path", Required: true, Placeholder: "./data.db", Validate: validateNonEmpty("file path")},
 	},

@@ -9,8 +9,8 @@ const (
 	MySQL         EngineID = "mysql"
 	MariaDB       EngineID = "mariadb"
 	MSSQL         EngineID = "mssql"
-	Oracle        EngineID = "oracle"
 	SQLite        EngineID = "sqlite"
+	DuckDB        EngineID = "duckdb"
 	Redis         EngineID = "redis"
 	MongoDB       EngineID = "mongodb"
 	Elasticsearch EngineID = "elasticsearch"
@@ -50,8 +50,8 @@ var engines = []Engine{
 
 	// T2 — SQL / new wire protocols
 	{MSSQL, "MS SQL Server", EngineTierT2, "SQL/TDS", 1433, true},
-	{Oracle, "Oracle", EngineTierT2, "SQL/NET8", 1521, true},
 	{SQLite, "SQLite", EngineTierT2, "SQL/EMBEDDED", 0, true},
+	{DuckDB, "DuckDB", EngineTierT2, "SQL/EMBEDDED", 0, true},
 
 	// T3 — NoSQL
 	{Redis, "Redis", EngineTierT3, "NOSQL", 6379, true},
