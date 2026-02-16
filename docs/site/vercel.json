@@ -1,8 +1,12 @@
 {
   "rewrites": [
     {
-      "source": "/docs/:path*",
-      "destination": "https://mori-mintlify.vercel.app/docs/:path*"
+      "source": "/docs",
+      "destination": "https://mori.mintlify.dev/docs"
+    },
+    {
+      "source": "/docs/:match*",
+      "destination": "https://mori.mintlify.dev/docs/:match*"
     }
   ]
 }

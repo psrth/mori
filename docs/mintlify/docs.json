@@ -1,6 +1,7 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "name": "Mori",
+  "basePath": "/docs",
   "theme": "maple",
   "colors": {
     "primary": "#69347A",
