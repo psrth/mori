@@ -1,10 +1,15 @@
 package proxy
 
 import (
+	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"time"
 )
+
+// clientSSL is the MySQL CLIENT_SSL capability flag.
+const clientSSL uint32 = 0x0800
 
 // relayHandshake relays the MySQL handshake between client and production server.
 // MySQL handshake flow:
@@ -12,27 +17,44 @@ import (
 // 2. Client -> Server: Handshake Response Packet
 // 3. Server -> Client: OK/ERR/AuthSwitch
 // 4. If AuthSwitch: Client -> Server: auth data, Server -> Client: OK/ERR
-func relayHandshake(clientConn, prodConn net.Conn) error {
+//
+// SSL handling: the proxy listens on localhost only, so it strips CLIENT_SSL
+// from the server handshake before forwarding to the client. If the server
+// supports SSL, the proxy independently negotiates TLS with prod.
+func relayHandshake(clientConn, prodConn net.Conn) (net.Conn, error) {
 	// 1. Read initial handshake from Prod.
 	handshake, err := readMySQLPacket(prodConn)
 	if err != nil {
-		return fmt.Errorf("reading prod handshake: %w", err)
+		return prodConn, fmt.Errorf("reading prod handshake: %w", err)
 	}
 
-	// Forward to client.
-	if _, err := clientConn.Write(handshake.Raw); err != nil {
-		return fmt.Errorf("forwarding handshake to client: %w", err)
+	// Check if Prod supports SSL and strip the flag before forwarding to client.
+	prodSupportsSSL := stripSSLCapability(handshake.Payload)
+
+	// Rebuild raw packet with modified payload.
+	clientHandshake := buildMySQLPacket(handshake.Sequence, handshake.Payload)
+	if _, err := clientConn.Write(clientHandshake); err != nil {
+		return prodConn, fmt.Errorf("forwarding handshake to client: %w", err)
 	}
 
-	// 2. Read handshake response from client.
+	// If Prod supports SSL, negotiate TLS before the client sends its response.
+	if prodSupportsSSL {
+		charset := handshakeCharset(handshake.Payload)
+		prodConn, err = negotiateMySQLSSL(prodConn, charset)
+		if err != nil {
+			return prodConn, fmt.Errorf("prod SSL negotiation: %w", err)
+		}
+	}
+
+	// 2. Read handshake response from client (plain TCP — client didn't see SSL).
 	response, err := readMySQLPacket(clientConn)
 	if err != nil {
-		return fmt.Errorf("reading client handshake response: %w", err)
+		return prodConn, fmt.Errorf("reading client handshake response: %w", err)
 	}
 
-	// Forward to Prod.
+	// Forward to Prod (possibly over TLS).
 	if _, err := prodConn.Write(response.Raw); err != nil {
-		return fmt.Errorf("forwarding handshake response to prod: %w", err)
+		return prodConn, fmt.Errorf("forwarding handshake response to prod: %w", err)
 	}
 
 	// 3. Read auth result from Prod.
@@ -40,37 +62,37 @@ func relayHandshake(clientConn, prodConn net.Conn) error {
 	for {
 		authResult, err := readMySQLPacket(prodConn)
 		if err != nil {
-			return fmt.Errorf("reading prod auth result: %w", err)
+			return prodConn, fmt.Errorf("reading prod auth result: %w", err)
 		}
 
 		// Forward to client.
 		if _, err := clientConn.Write(authResult.Raw); err != nil {
-			return fmt.Errorf("forwarding auth result to client: %w", err)
+			return prodConn, fmt.Errorf("forwarding auth result to client: %w", err)
 		}
 
 		if len(authResult.Payload) == 0 {
-			return fmt.Errorf("empty auth result from prod")
+			return prodConn, fmt.Errorf("empty auth result from prod")
 		}
 
 		switch authResult.Payload[0] {
 		case iOK:
-			return nil
+			return prodConn, nil
 		case iERR:
-			return fmt.Errorf("prod auth error: %s", string(authResult.Payload[9:]))
+			return prodConn, fmt.Errorf("prod auth error: %s", string(authResult.Payload[9:]))
 		case iEOF:
 			// AuthSwitch or old-auth. Relay client response.
 			if len(authResult.Payload) == 1 {
 				// Old-auth: client sends password.
 				clientAuth, err := readMySQLPacket(clientConn)
 				if err != nil {
-					return fmt.Errorf("reading client old-auth: %w", err)
+					return prodConn, fmt.Errorf("reading client old-auth: %w", err)
 				}
 				if _, err := prodConn.Write(clientAuth.Raw); err != nil {
-					return fmt.Errorf("forwarding old-auth to prod: %w", err)
+					return prodConn, fmt.Errorf("forwarding old-auth to prod: %w", err)
 				}
 				continue
 			}
-			return nil
+			return prodConn, nil
 		default:
 			if authResult.Payload[0] == 0x01 {
 				// Auth more data (caching_sha2_password).
@@ -83,10 +105,10 @@ func relayHandshake(clientConn, prodConn net.Conn) error {
 				// Full auth or other: relay client's auth response.
 				clientAuth, err := readMySQLPacket(clientConn)
 				if err != nil {
-					return fmt.Errorf("reading client auth continuation: %w", err)
+					return prodConn, fmt.Errorf("reading client auth continuation: %w", err)
 				}
 				if _, err := prodConn.Write(clientAuth.Raw); err != nil {
-					return fmt.Errorf("forwarding auth continuation to prod: %w", err)
+					return prodConn, fmt.Errorf("forwarding auth continuation to prod: %w", err)
 				}
 				continue
 			}
@@ -94,16 +116,95 @@ func relayHandshake(clientConn, prodConn net.Conn) error {
 				// Auth switch request (0xFE with plugin name).
 				clientAuth, err := readMySQLPacket(clientConn)
 				if err != nil {
-					return fmt.Errorf("reading client auth switch response: %w", err)
+					return prodConn, fmt.Errorf("reading client auth switch response: %w", err)
 				}
 				if _, err := prodConn.Write(clientAuth.Raw); err != nil {
-					return fmt.Errorf("forwarding auth switch response to prod: %w", err)
+					return prodConn, fmt.Errorf("forwarding auth switch response to prod: %w", err)
 				}
 				continue
 			}
-			return nil
+			return prodConn, nil
 		}
 	}
+}
+
+// stripSSLCapability clears the CLIENT_SSL (0x0800) flag from a MySQL
+// Initial Handshake Packet payload. Returns true if the flag was originally set.
+func stripSSLCapability(payload []byte) bool {
+	if len(payload) < 2 {
+		return false
+	}
+
+	// Walk to the lower capability flags:
+	// 1 byte protocol version + variable server version + 4 bytes conn ID +
+	// 8 bytes auth data part 1 + 1 byte filler = offset to caps lower.
+	pos := 1
+	for pos < len(payload) && payload[pos] != 0 {
+		pos++
+	}
+	pos++ // Skip null terminator.
+	pos += 4 // Connection ID.
+	pos += 8 // Auth data part 1.
+	pos++    // Filler.
+
+	if pos+2 > len(payload) {
+		return false
+	}
+
+	// Lower capability flags (2 bytes LE).
+	caps := binary.LittleEndian.Uint16(payload[pos : pos+2])
+	hadSSL := caps&uint16(clientSSL) != 0
+	if hadSSL {
+		caps &^= uint16(clientSSL)
+		binary.LittleEndian.PutUint16(payload[pos:pos+2], caps)
+	}
+	return hadSSL
+}
+
+// handshakeCharset extracts the character set byte from a MySQL
+// Initial Handshake Packet payload. Returns 0x21 (utf8) as default.
+func handshakeCharset(payload []byte) byte {
+	pos := 1
+	for pos < len(payload) && payload[pos] != 0 {
+		pos++
+	}
+	pos++ // Skip null.
+	pos += 4 // Connection ID.
+	pos += 8 // Auth data part 1.
+	pos++    // Filler.
+	pos += 2 // Capability flags lower.
+
+	if pos >= len(payload) {
+		return 0x21 // utf8 default
+	}
+	return payload[pos]
+}
+
+// negotiateMySQLSSL sends a MySQL SSL Request to the server and upgrades
+// the connection to TLS. The SSL Request is a truncated Handshake Response
+// containing only capability flags, max packet size, charset, and reserved bytes.
+func negotiateMySQLSSL(prodConn net.Conn, charset byte) (net.Conn, error) {
+	// Build SSL Request payload (32 bytes):
+	// caps(4 LE) + max_packet(4 LE) + charset(1) + reserved(23 zeros)
+	var payload [32]byte
+	// Capability flags: CLIENT_SSL | CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION
+	caps := clientSSL | 0x00000200 | 0x00008000
+	binary.LittleEndian.PutUint32(payload[0:4], caps)
+	binary.LittleEndian.PutUint32(payload[4:8], 16*1024*1024) // max packet
+	payload[8] = charset
+
+	if err := writeMySQLPacket(prodConn, 1, payload[:]); err != nil {
+		return prodConn, fmt.Errorf("sending SSL request to prod: %w", err)
+	}
+
+	tlsConn := tls.Client(prodConn, &tls.Config{
+		InsecureSkipVerify: true,
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		return prodConn, fmt.Errorf("TLS handshake with prod: %w", err)
+	}
+
+	return tlsConn, nil
 }
 
 // connectShadow establishes a TCP connection to the Shadow MySQL database

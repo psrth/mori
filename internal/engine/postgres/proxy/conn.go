@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -39,7 +40,7 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	}
 
 	// Perform the startup handshake and connect to Shadow.
-	shadowConn, err := p.performStartup(clientConn, prodConn, connID)
+	prodConn, shadowConn, err := p.performStartup(clientConn, prodConn, connID)
 	if err != nil || shadowConn == nil {
 		log.Printf("[conn %d] WRITE GUARD: shadow handshake failed, refusing connection: %v", connID, err)
 		errResp := buildGuardErrorResponse("mori: shadow database unavailable, refusing connection to protect production")
@@ -56,64 +57,80 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 // performStartup handles the PG startup handshake phase.
 // It relays the client's startup sequence to Prod (transparent to client),
 // and independently initiates a Shadow connection.
-func (p *Proxy) performStartup(clientConn, prodConn net.Conn, connID int64) (net.Conn, error) {
-	if err := relayStartup(clientConn, prodConn); err != nil {
-		return nil, fmt.Errorf("prod startup: %w", err)
+// Returns the (possibly TLS-upgraded) prodConn and the shadow connection.
+func (p *Proxy) performStartup(clientConn, prodConn net.Conn, connID int64) (net.Conn, net.Conn, error) {
+	prodConn, err := relayStartup(clientConn, prodConn)
+	if err != nil {
+		return prodConn, nil, fmt.Errorf("prod startup: %w", err)
 	}
 
 	shadowConn, err := p.connectShadow(connID)
 	if err != nil {
-		return nil, fmt.Errorf("shadow startup: %w", err)
+		return prodConn, nil, fmt.Errorf("shadow startup: %w", err)
 	}
-	return shadowConn, nil
+	return prodConn, shadowConn, nil
 }
 
 // relayStartup relays the PG startup handshake between client and Prod.
 // Handles SSLRequest, StartupMessage, auth exchanges, and waits for ReadyForQuery.
-func relayStartup(clientConn, prodConn net.Conn) error {
+//
+// SSL handling: the proxy listens on localhost only, so it declines SSL from
+// the client ('N') and independently negotiates TLS with Prod when the server
+// supports it. This avoids requiring the proxy to present its own TLS certificate.
+func relayStartup(clientConn, prodConn net.Conn) (net.Conn, error) {
 	// Read initial message from client (no type byte).
 	startupRaw, err := readStartupMsg(clientConn)
 	if err != nil {
-		return fmt.Errorf("reading startup: %w", err)
+		return prodConn, fmt.Errorf("reading startup: %w", err)
 	}
 
-	// Handle SSLRequest.
+	// Handle SSLRequest: decline on the client side (localhost is safe),
+	// then negotiate TLS with prod independently.
 	if isSSLRequest(startupRaw) {
-		if _, err := prodConn.Write(startupRaw); err != nil {
-			return fmt.Errorf("forwarding SSLRequest: %w", err)
+		// Tell client we don't support SSL on the local connection.
+		if _, err := clientConn.Write([]byte{'N'}); err != nil {
+			return prodConn, fmt.Errorf("declining SSL to client: %w", err)
 		}
-		var sslResp [1]byte
-		if _, err := io.ReadFull(prodConn, sslResp[:]); err != nil {
-			return fmt.Errorf("reading SSL response: %w", err)
-		}
-		if _, err := clientConn.Write(sslResp[:]); err != nil {
-			return fmt.Errorf("relaying SSL response: %w", err)
-		}
-		// After SSLRequest, client sends the real StartupMessage.
+		// Client will now send the real StartupMessage in plaintext.
 		startupRaw, err = readStartupMsg(clientConn)
 		if err != nil {
-			return fmt.Errorf("reading startup after SSL: %w", err)
+			return prodConn, fmt.Errorf("reading startup after SSL decline: %w", err)
 		}
 	}
 
-	// Forward StartupMessage to Prod.
+	// Negotiate TLS with Prod independently of the client.
+	prodConn, err = negotiateProdSSL(prodConn)
+	if err != nil {
+		return prodConn, fmt.Errorf("prod SSL negotiation: %w", err)
+	}
+
+	// Forward StartupMessage to Prod (possibly over TLS).
 	if _, err := prodConn.Write(startupRaw); err != nil {
-		return fmt.Errorf("forwarding startup: %w", err)
+		return prodConn, fmt.Errorf("forwarding startup: %w", err)
 	}
 
 	// Relay messages from Prod to client until ReadyForQuery ('Z').
 	for {
 		msg, err := readMsg(prodConn)
 		if err != nil {
-			return fmt.Errorf("reading prod startup response: %w", err)
+			return prodConn, fmt.Errorf("reading prod startup response: %w", err)
+		}
+
+		// If Prod sent an AuthenticationSASL (type 10), strip channel-binding
+		// mechanisms (-PLUS) since the client is on plain TCP.
+		if msg.Type == 'R' && len(msg.Payload) >= 4 {
+			authType := binary.BigEndian.Uint32(msg.Payload[:4])
+			if authType == 10 {
+				msg = stripSASLPlusMechanisms(msg)
+			}
 		}
 
 		if _, err := clientConn.Write(msg.Raw); err != nil {
-			return fmt.Errorf("relaying to client: %w", err)
+			return prodConn, fmt.Errorf("relaying to client: %w", err)
 		}
 
 		if msg.Type == 'Z' {
-			return nil
+			return prodConn, nil
 		}
 
 		// If Prod sent an auth request, the client may need to respond.
@@ -124,14 +141,41 @@ func relayStartup(clientConn, prodConn net.Conn) error {
 			if authType != 0 && authType != 12 {
 				clientMsg, err := readMsg(clientConn)
 				if err != nil {
-					return fmt.Errorf("reading client auth response: %w", err)
+					return prodConn, fmt.Errorf("reading client auth response: %w", err)
 				}
 				if _, err := prodConn.Write(clientMsg.Raw); err != nil {
-					return fmt.Errorf("forwarding client auth: %w", err)
+					return prodConn, fmt.Errorf("forwarding client auth: %w", err)
 				}
 			}
 		}
 	}
+}
+
+// negotiateProdSSL sends an SSLRequest to Prod and upgrades the connection
+// to TLS if the server supports it. Returns the original connection unchanged
+// if Prod declines SSL.
+func negotiateProdSSL(prodConn net.Conn) (net.Conn, error) {
+	if _, err := prodConn.Write(buildSSLRequest()); err != nil {
+		return prodConn, fmt.Errorf("sending SSLRequest to prod: %w", err)
+	}
+
+	var resp [1]byte
+	if _, err := io.ReadFull(prodConn, resp[:]); err != nil {
+		return prodConn, fmt.Errorf("reading prod SSL response: %w", err)
+	}
+
+	if resp[0] == 'S' {
+		tlsConn := tls.Client(prodConn, &tls.Config{
+			InsecureSkipVerify: true,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			return prodConn, fmt.Errorf("TLS handshake with prod: %w", err)
+		}
+		return tlsConn, nil
+	}
+
+	// Prod declined SSL — continue with plain TCP.
+	return prodConn, nil
 }
 
 // connectShadow establishes a TCP connection to the Shadow database and

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // pgMsg represents a single PostgreSQL wire protocol message.
@@ -95,4 +96,72 @@ func isSSLRequest(raw []byte) bool {
 	}
 	code := binary.BigEndian.Uint32(raw[4:8])
 	return code == 80877103
+}
+
+// buildSSLRequest constructs an SSLRequest message.
+// Format: length(4, value=8) + code(4, value=80877103).
+func buildSSLRequest() []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint32(buf[0:4], 8)
+	binary.BigEndian.PutUint32(buf[4:8], 80877103)
+	return buf
+}
+
+// stripSASLPlusMechanisms removes SASL mechanisms that require TLS channel
+// binding (those ending in "-PLUS") from an AuthenticationSASL message.
+// This allows a non-SSL client to authenticate via plain SCRAM-SHA-256 while
+// the proxy maintains its own TLS connection to the server.
+//
+// AuthenticationSASL payload format: auth_type(4, value=10) + mechanism\0 ... \0
+func stripSASLPlusMechanisms(msg *pgMsg) *pgMsg {
+	if len(msg.Payload) < 4 {
+		return msg
+	}
+
+	// Parse mechanism names from the payload (after the 4-byte auth type).
+	var kept []string
+	rest := msg.Payload[4:]
+	for len(rest) > 0 {
+		idx := 0
+		for idx < len(rest) && rest[idx] != 0 {
+			idx++
+		}
+		if idx == 0 {
+			break // Terminating null.
+		}
+		mech := string(rest[:idx])
+		if !strings.HasSuffix(mech, "-PLUS") {
+			kept = append(kept, mech)
+		}
+		rest = rest[idx+1:] // Skip past null terminator.
+	}
+
+	if len(kept) == 0 {
+		return msg // Don't strip if it would leave no mechanisms.
+	}
+
+	// Rebuild payload: auth_type(4) + mechanism\0 ... \0
+	var payload []byte
+	payload = append(payload, msg.Payload[:4]...) // Auth type = 10.
+	for _, m := range kept {
+		payload = append(payload, []byte(m)...)
+		payload = append(payload, 0)
+	}
+	payload = append(payload, 0) // Terminating null.
+
+	return buildPGMsgFromPayload('R', payload)
+}
+
+// buildPGMsgFromPayload constructs a pgMsg from a type byte and payload.
+func buildPGMsgFromPayload(msgType byte, payload []byte) *pgMsg {
+	msgLen := 4 + len(payload)
+	raw := make([]byte, 1+4+len(payload))
+	raw[0] = msgType
+	binary.BigEndian.PutUint32(raw[1:5], uint32(msgLen))
+	copy(raw[5:], payload)
+	return &pgMsg{
+		Type:    msgType,
+		Payload: payload,
+		Raw:     raw,
+	}
 }
