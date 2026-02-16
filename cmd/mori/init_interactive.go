@@ -79,8 +79,9 @@ func stepName(existingCfg *config.ProjectConfig, connName *string) error {
 		huh.NewGroup(
 			huh.NewInput().
 				Title("Connection name").
-				Description("A short identifier for this connection (lowercase, hyphens ok)").
-				Placeholder("my-prod-db").
+				Inline(true).
+				Prompt("> ").
+				Placeholder("my-prod-db (lowercase, hyphens ok)").
 				Value(connName).
 				Validate(func(s string) error {
 					if !nameRe.MatchString(s) {
@@ -184,7 +185,8 @@ func stepPasteConnString(engineID string, values *map[string]string) error {
 		huh.NewGroup(
 			huh.NewInput().
 				Title("Connection string").
-				Description("Paste your full database URL").
+				Inline(true).
+				Prompt("> ").
 				Placeholder(connStringPlaceholder(registry.EngineID(engineID))).
 				Value(&connStr).
 				Validate(func(s string) error {
@@ -503,25 +505,28 @@ func buildProviderOptions(engineID registry.EngineID) []huh.Option[string] {
 	return options
 }
 
-// buildFieldInputs creates a huh group with text inputs for each connection field.
+// buildFieldInputs creates a huh group with inline text inputs for each connection field.
 // fieldPtrs must be pre-allocated string pointers, one per field.
 func buildFieldInputs(fields []registry.ConnectionField, fieldPtrs []*string) *huh.Group {
 	var huhFields []huh.Field
 
 	for i, f := range fields {
-		input := huh.NewInput().
-			Title(f.Label).
-			Placeholder(f.Placeholder).
-			Value(fieldPtrs[i])
-
-		// Add "Optional" hints for non-required fields.
+		// Build placeholder: merge help text into it for non-required fields.
+		placeholder := f.Placeholder
 		if !f.Required {
 			if f.Default != "" {
-				input = input.Description(fmt.Sprintf("Optional · defaults to %s", f.Default))
-			} else {
-				input = input.Description("Optional")
+				placeholder = fmt.Sprintf("optional · defaults to %s", f.Default)
+			} else if placeholder == "" {
+				placeholder = "optional"
 			}
 		}
+
+		input := huh.NewInput().
+			Title(f.Label).
+			Inline(true).
+			Prompt("> ").
+			Placeholder(placeholder).
+			Value(fieldPtrs[i])
 
 		if f.Sensitive {
 			input = input.EchoMode(huh.EchoModePassword)
@@ -536,13 +541,15 @@ func buildFieldInputs(fields []registry.ConnectionField, fieldPtrs []*string) *h
 	return huh.NewGroup(huhFields...)
 }
 
-// buildTunnelFieldInputs creates a huh group with text inputs for each tunnel field.
+// buildTunnelFieldInputs creates a huh group with inline text inputs for each tunnel field.
 func buildTunnelFieldInputs(fields []tunnel.Field, fieldPtrs []*string) *huh.Group {
 	var huhFields []huh.Field
 
 	for i, f := range fields {
 		input := huh.NewInput().
 			Title(f.Label).
+			Inline(true).
+			Prompt("> ").
 			Placeholder(f.Placeholder).
 			Value(fieldPtrs[i])
 

@@ -9,16 +9,19 @@ import (
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 
 var inspectCmd = &cobra.Command{
-	Use:   "inspect <table>",
+	Use:   "inspect <table> [connection-name]",
 	Short: "Show detailed state for a table",
 	Long: `Display detailed state for a specific table: delta row count, tombstone
 count, schema diffs (added/dropped/renamed columns), sequence offset,
-and primary key information.`,
-	Args: cobra.ExactArgs(1),
+and primary key information.
+
+If multiple connections are initialized, specify which one as the second argument.`,
+	Args: cobra.RangeArgs(1, 2),
 	RunE: runInspect,
 }
 
@@ -29,14 +32,21 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to determine project root: %w", err)
 	}
-	if !config.IsInitialized(projectRoot) {
-		return fmt.Errorf("mori is not initialized — run 'mori init --from <conn_string>' first")
+
+	// Resolve connection: second arg or auto-detect.
+	var connArgs []string
+	if len(args) >= 2 {
+		connArgs = args[1:]
+	}
+	connName, err := resolveInitializedConnection(projectRoot, connArgs)
+	if err != nil {
+		return err
 	}
 
-	moriDir := config.MoriDirPath(projectRoot)
+	connDir := config.ConnDir(projectRoot, connName)
 
 	// Verify the table exists in metadata.
-	tables, err := schema.ReadTables(moriDir)
+	tables, err := schema.ReadTables(connDir)
 	if err != nil {
 		return fmt.Errorf("failed to read table metadata: %w", err)
 	}
@@ -52,20 +62,22 @@ func runInspect(cmd *cobra.Command, args []string) error {
 	}
 
 	// Header.
-	fmt.Printf("Table: %s\n", table)
+	fmt.Printf("Table: %s\n", ui.Cyan(table))
 	if len(meta.PKColumns) > 0 {
 		fmt.Printf("  PK:         %s (%s)\n", strings.Join(meta.PKColumns, ", "), meta.PKType)
 	} else {
-		fmt.Println("  PK:         (none)")
+		fmt.Printf("  PK:         %s\n", ui.Dim("(none)"))
 	}
 
 	// Delta rows.
-	if dm, err := delta.ReadDeltaMap(moriDir); err == nil {
+	if dm, err := delta.ReadDeltaMap(connDir); err == nil {
 		count := dm.CountForTable(table)
 		pks := dm.DeltaPKs(table)
 		hasInserts := dm.HasInserts(table)
 		if count > 0 || hasInserts {
-			line := fmt.Sprintf("  Deltas:     %d modified %s", count, pluralize(count, "row", "rows"))
+			line := fmt.Sprintf("  Deltas:     %s %d modified %s",
+				ui.Yellow("~"),
+				count, pluralize(count, "row", "rows"))
 			if hasInserts {
 				line += " + inserts"
 			}
@@ -82,14 +94,14 @@ func runInspect(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Println(line)
 		} else {
-			fmt.Println("  Deltas:     (none)")
+			fmt.Printf("  Deltas:     %s\n", ui.Dim("(none)"))
 		}
 	} else {
-		fmt.Println("  Deltas:     (none)")
+		fmt.Printf("  Deltas:     %s\n", ui.Dim("(none)"))
 	}
 
 	// Tombstones.
-	if ts, err := delta.ReadTombstoneSet(moriDir); err == nil {
+	if ts, err := delta.ReadTombstoneSet(connDir); err == nil {
 		count := ts.CountForTable(table)
 		pks := ts.TombstonedPKs(table)
 		if count > 0 {
@@ -97,7 +109,8 @@ func runInspect(cmd *cobra.Command, args []string) error {
 			if len(display) > 10 {
 				display = display[:10]
 			}
-			line := fmt.Sprintf("  Tombstones: %d %s (PKs: %s",
+			line := fmt.Sprintf("  Tombstones: %s %d %s (PKs: %s",
+				ui.Red("-"),
 				count, pluralize(count, "row", "rows"), strings.Join(display, ", "))
 			if len(pks) > 10 {
 				line += fmt.Sprintf(", ... +%d more", len(pks)-10)
@@ -105,47 +118,47 @@ func runInspect(cmd *cobra.Command, args []string) error {
 			line += ")"
 			fmt.Println(line)
 		} else {
-			fmt.Println("  Tombstones: (none)")
+			fmt.Printf("  Tombstones: %s\n", ui.Dim("(none)"))
 		}
 	} else {
-		fmt.Println("  Tombstones: (none)")
+		fmt.Printf("  Tombstones: %s\n", ui.Dim("(none)"))
 	}
 
 	// Schema diffs.
-	if sr, err := coreSchema.ReadRegistry(moriDir); err == nil {
+	if sr, err := coreSchema.ReadRegistry(connDir); err == nil {
 		if diff := sr.GetDiff(table); diff != nil {
 			fmt.Println("  Schema Diffs:")
 			for _, col := range diff.Added {
-				fmt.Printf("    + %s (%s)\n", col.Name, col.Type)
+				fmt.Printf("    %s %s (%s)\n", ui.Green("+"), col.Name, col.Type)
 			}
 			for _, col := range diff.Dropped {
-				fmt.Printf("    - %s\n", col)
+				fmt.Printf("    %s %s\n", ui.Red("-"), col)
 			}
 			for old, newName := range diff.Renamed {
-				fmt.Printf("    ~ %s -> %s\n", old, newName)
+				fmt.Printf("    %s %s %s %s\n", ui.Purple("~"), old, ui.IconArrow, newName)
 			}
 			for col, types := range diff.TypeChanged {
-				fmt.Printf("    ~ %s: %s -> %s\n", col, types[0], types[1])
+				fmt.Printf("    %s %s: %s %s %s\n", ui.Purple("~"), col, types[0], ui.IconArrow, types[1])
 			}
 		} else {
-			fmt.Println("  Schema Diffs: (none)")
+			fmt.Printf("  Schema Diffs: %s\n", ui.Dim("(none)"))
 		}
 	} else {
-		fmt.Println("  Schema Diffs: (none)")
+		fmt.Printf("  Schema Diffs: %s\n", ui.Dim("(none)"))
 	}
 
 	// Sequence offset.
-	if seqs, err := schema.ReadSequences(moriDir); err == nil {
+	if seqs, err := schema.ReadSequences(connDir); err == nil {
 		if offset, ok := seqs[table]; ok {
 			fmt.Printf("  Sequence:   %s.%s start=%s (prod max: %s)\n",
 				table, offset.Column,
 				formatNumber(offset.ShadowStart),
 				formatNumber(offset.ProdMax))
 		} else {
-			fmt.Println("  Sequence:   (none)")
+			fmt.Printf("  Sequence:   %s\n", ui.Dim("(none)"))
 		}
 	} else {
-		fmt.Println("  Sequence:   (none)")
+		fmt.Printf("  Sequence:   %s\n", ui.Dim("(none)"))
 	}
 
 	return nil
