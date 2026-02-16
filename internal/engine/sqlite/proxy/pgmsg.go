@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // pgMsg represents a single PostgreSQL wire protocol message.
@@ -207,5 +208,131 @@ func buildEmptyQueryResponse() []byte {
 	var result []byte
 	result = append(result, buildPGMsg('I', nil)...)
 	result = append(result, buildReadyForQueryMsg()...)
+	return result
+}
+
+// buildParseCompleteMsg constructs a ParseComplete ('1') message.
+func buildParseCompleteMsg() []byte {
+	return buildPGMsg('1', nil)
+}
+
+// buildBindCompleteMsg constructs a BindComplete ('2') message.
+func buildBindCompleteMsg() []byte {
+	return buildPGMsg('2', nil)
+}
+
+// buildNoDataMsg constructs a NoData ('n') message.
+func buildNoDataMsg() []byte {
+	return buildPGMsg('n', nil)
+}
+
+// isExtendedProtocolMsg returns true for PG extended query protocol message types.
+func isExtendedProtocolMsg(t byte) bool {
+	switch t {
+	case 'P', 'B', 'D', 'E', 'C', 'S', 'H':
+		return true
+	}
+	return false
+}
+
+// parseParseMsgPayload extracts the statement name and SQL text from a Parse ('P') payload.
+func parseParseMsgPayload(payload []byte) (stmtName, sql string, err error) {
+	if len(payload) == 0 {
+		return "", "", fmt.Errorf("empty Parse payload")
+	}
+	pos := 0
+	stmtName, pos, err = readNullTerminatedString(payload, pos)
+	if err != nil {
+		return "", "", fmt.Errorf("reading statement name: %w", err)
+	}
+	sql, _, err = readNullTerminatedString(payload, pos)
+	if err != nil {
+		return "", "", fmt.Errorf("reading query: %w", err)
+	}
+	return stmtName, sql, nil
+}
+
+// parseBindMsgPayload extracts the statement name and parameter values from a Bind ('B') payload.
+func parseBindMsgPayload(payload []byte) (stmtName string, params []string, err error) {
+	if len(payload) == 0 {
+		return "", nil, fmt.Errorf("empty Bind payload")
+	}
+	pos := 0
+	// Skip portal name.
+	_, pos, err = readNullTerminatedString(payload, pos)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading portal name: %w", err)
+	}
+	// Read statement name.
+	stmtName, pos, err = readNullTerminatedString(payload, pos)
+	if err != nil {
+		return "", nil, fmt.Errorf("reading statement name: %w", err)
+	}
+	// Skip format codes.
+	if pos+2 > len(payload) {
+		return stmtName, nil, nil
+	}
+	fmtCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
+	pos += 2 + fmtCount*2
+	// Read parameter values.
+	if pos+2 > len(payload) {
+		return stmtName, nil, nil
+	}
+	paramCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
+	pos += 2
+	for i := 0; i < paramCount; i++ {
+		if pos+4 > len(payload) {
+			break
+		}
+		paramLen := int(int32(binary.BigEndian.Uint32(payload[pos : pos+4])))
+		pos += 4
+		if paramLen == -1 {
+			params = append(params, "")
+			continue
+		}
+		if pos+paramLen > len(payload) {
+			break
+		}
+		params = append(params, string(payload[pos:pos+paramLen]))
+		pos += paramLen
+	}
+	return stmtName, params, nil
+}
+
+// parseCloseMsgPayload extracts the close target type and name from a Close ('C') payload.
+func parseCloseMsgPayload(payload []byte) (closeType byte, name string, err error) {
+	if len(payload) < 2 {
+		return 0, "", fmt.Errorf("Close payload too short")
+	}
+	closeType = payload[0]
+	name, _, err = readNullTerminatedString(payload, 1)
+	if err != nil {
+		return closeType, "", fmt.Errorf("reading name: %w", err)
+	}
+	return closeType, name, nil
+}
+
+// readNullTerminatedString reads a null-terminated string from payload starting at pos.
+func readNullTerminatedString(payload []byte, pos int) (string, int, error) {
+	for i := pos; i < len(payload); i++ {
+		if payload[i] == 0 {
+			return string(payload[pos:i]), i + 1, nil
+		}
+	}
+	return "", pos, fmt.Errorf("unterminated string at offset %d", pos)
+}
+
+// reconstructSQL substitutes parameter placeholders ($1, $2, ...) in SQL with quoted literal values.
+func reconstructSQL(sql string, params []string) string {
+	result := sql
+	for i := len(params) - 1; i >= 0; i-- {
+		placeholder := fmt.Sprintf("$%d", i+1)
+		if params[i] == "" {
+			result = strings.ReplaceAll(result, placeholder, "NULL")
+		} else {
+			escaped := strings.ReplaceAll(params[i], "'", "''")
+			result = strings.ReplaceAll(result, placeholder, "'"+escaped+"'")
+		}
+	}
 	return result
 }

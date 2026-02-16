@@ -96,7 +96,7 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 			return fmt.Errorf("failed to connect to shadow SQLite: %w", err)
 		}
 		p.shadowDB.Exec("PRAGMA journal_mode=WAL")
-		p.shadowDB.Exec("PRAGMA foreign_keys=ON")
+		p.shadowDB.Exec("PRAGMA foreign_keys=OFF")
 	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", p.port)

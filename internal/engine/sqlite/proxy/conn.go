@@ -65,6 +65,22 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 	}
 	defer closeAll()
 
+	// Per-connection handlers.
+	var txh *TxnHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		txh = &TxnHandler{proxy: p, connID: connID}
+	}
+
+	var eh *ExtHandler
+	if p.classifier != nil && p.router != nil {
+		eh = &ExtHandler{
+			proxy:     p,
+			connID:    connID,
+			txh:       txh,
+			stmtCache: make(map[string]string),
+		}
+	}
+
 	for {
 		msg, err := readMsg(clientConn)
 		if err != nil {
@@ -82,6 +98,15 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 			return
 		}
 
+		// Extended query protocol: accumulate messages, dispatch on Sync.
+		if eh != nil && isExtendedProtocolMsg(msg.Type) {
+			eh.Accumulate(msg)
+			if msg.Type == 'S' {
+				eh.FlushBatch(clientConn)
+			}
+			continue
+		}
+
 		// Simple Query ('Q'): classify and route.
 		if msg.Type == 'Q' {
 			sqlStr := querySQL(msg.Payload)
@@ -91,6 +116,12 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 			}
 
 			decision := p.classifyAndRoute(sqlStr, connID)
+
+			// Handle transaction control via TxnHandler.
+			if txh != nil && decision.strategy == core.StrategyTransaction && decision.classification != nil {
+				txh.HandleTxn(clientConn, decision.classification)
+				continue
+			}
 
 			// Handle merged reads: query both prod and shadow, merge in-process.
 			if decision.strategy == core.StrategyMergedRead || decision.strategy == core.StrategyJoinPatch {
@@ -123,7 +154,7 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 
 				// Track deltas/tombstones/schema after successful writes.
 				if decision.classification != nil {
-					p.trackWriteEffects(decision.classification, decision.strategy, connID)
+					p.trackWriteEffects(decision.classification, decision.strategy, connID, txh)
 				}
 
 			case targetBoth:
@@ -132,19 +163,6 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 				resp := p.executeQuery(p.prodDB, sqlStr, connID)
 				clientConn.Write(resp)
 			}
-			continue
-		}
-
-		// Extended query protocol (Parse/Bind/Describe/Execute/Sync/Close):
-		// For v1, return an error for unsupported message types.
-		if msg.Type == 'P' || msg.Type == 'B' || msg.Type == 'D' || msg.Type == 'E' || msg.Type == 'H' {
-			clientConn.Write(buildErrorResponse("mori-sqlite: extended query protocol not supported, use simple query mode"))
-			continue
-		}
-
-		// Sync ('S'): respond with ReadyForQuery.
-		if msg.Type == 'S' {
-			clientConn.Write(buildReadyForQueryMsg())
 			continue
 		}
 
@@ -964,7 +982,10 @@ func buildHydrateInsert(table string, cols []string, row []sql.NullString) strin
 
 // trackWriteEffects updates delta/tombstone state after a write operation,
 // mirroring the PostgreSQL proxy's write tracking.
-func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.RoutingStrategy, connID int64) {
+// When txh is non-nil and a transaction is active, deltas are staged instead of committed.
+func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.RoutingStrategy, connID int64, txh *TxnHandler) {
+	inTxn := txh != nil && txh.InTxn()
+
 	switch strategy {
 	case core.StrategyShadowWrite:
 		// INSERT: mark table as having inserts.
@@ -973,9 +994,13 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 		}
 
 	case core.StrategyHydrateAndWrite:
-		// UPDATE: add PKs to delta map.
+		// UPDATE: add PKs to delta map (staged if in txn).
 		for _, pk := range cl.PKs {
-			p.deltaMap.Add(pk.Table, pk.PK)
+			if inTxn {
+				p.deltaMap.Stage(pk.Table, pk.PK)
+			} else {
+				p.deltaMap.Add(pk.Table, pk.PK)
+			}
 		}
 		// If no PKs extractable, at least mark table as having changes.
 		if len(cl.PKs) == 0 {
@@ -983,18 +1008,24 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 				p.deltaMap.MarkInserted(table)
 			}
 		}
-		// Persist delta map.
-		if err := delta.WriteDeltaMap(p.moriDir, p.deltaMap); err != nil {
-			if p.verbose {
-				log.Printf("[conn %d] failed to persist delta map: %v", connID, err)
+		// Persist delta map (only outside transactions).
+		if !inTxn {
+			if err := delta.WriteDeltaMap(p.moriDir, p.deltaMap); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] failed to persist delta map: %v", connID, err)
+				}
 			}
 		}
 
 	case core.StrategyShadowDelete:
-		// DELETE: add tombstones and remove from delta map.
+		// DELETE: add tombstones and remove from delta map (staged if in txn).
 		for _, pk := range cl.PKs {
-			p.tombstones.Add(pk.Table, pk.PK)
-			p.deltaMap.Remove(pk.Table, pk.PK)
+			if inTxn {
+				p.tombstones.Stage(pk.Table, pk.PK)
+			} else {
+				p.tombstones.Add(pk.Table, pk.PK)
+				p.deltaMap.Remove(pk.Table, pk.PK)
+			}
 		}
 		// If no PKs, at least mark table as affected.
 		if len(cl.PKs) == 0 {
@@ -1002,15 +1033,17 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 				p.deltaMap.MarkInserted(table)
 			}
 		}
-		// Persist tombstones and delta map.
-		if err := delta.WriteTombstoneSet(p.moriDir, p.tombstones); err != nil {
-			if p.verbose {
-				log.Printf("[conn %d] failed to persist tombstone set: %v", connID, err)
+		// Persist tombstones and delta map (only outside transactions).
+		if !inTxn {
+			if err := delta.WriteTombstoneSet(p.moriDir, p.tombstones); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] failed to persist tombstone set: %v", connID, err)
+				}
 			}
-		}
-		if err := delta.WriteDeltaMap(p.moriDir, p.deltaMap); err != nil {
-			if p.verbose {
-				log.Printf("[conn %d] failed to persist delta map: %v", connID, err)
+			if err := delta.WriteDeltaMap(p.moriDir, p.deltaMap); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] failed to persist delta map: %v", connID, err)
+				}
 			}
 		}
 
@@ -1030,6 +1063,15 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
 
 	switch {
+	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "RENAME COLUMN"):
+		table, oldName, newName := parseAlterRenameColumn(sqlStr)
+		if table != "" && oldName != "" && newName != "" {
+			p.schemaRegistry.RecordRenameColumn(table, oldName, newName)
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: RENAME COLUMN %s.%s → %s", connID, table, oldName, newName)
+			}
+		}
+
 	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "ADD COLUMN"):
 		table, col, colType := parseAlterAddColumn(sqlStr)
 		if table != "" && col != "" {
@@ -1068,6 +1110,38 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 			log.Printf("[conn %d] failed to persist schema registry: %v", connID, err)
 		}
 	}
+}
+
+// parseAlterRenameColumn extracts table, old column name, and new column name from
+// "ALTER TABLE <table> RENAME COLUMN <old> TO <new>".
+func parseAlterRenameColumn(sqlStr string) (table, oldName, newName string) {
+	fields := strings.Fields(sqlStr)
+	// Expected: ALTER TABLE <table> RENAME [COLUMN] <old> TO <new>
+	if len(fields) < 6 {
+		return "", "", ""
+	}
+	table = strings.Trim(fields[2], `"'`)
+	idx := 3
+	// Skip "RENAME"
+	if idx < len(fields) && strings.EqualFold(fields[idx], "RENAME") {
+		idx++
+	}
+	// Skip optional "COLUMN"
+	if idx < len(fields) && strings.EqualFold(fields[idx], "COLUMN") {
+		idx++
+	}
+	if idx < len(fields) {
+		oldName = strings.Trim(fields[idx], `"'`)
+		idx++
+	}
+	// Skip "TO"
+	if idx < len(fields) && strings.EqualFold(fields[idx], "TO") {
+		idx++
+	}
+	if idx < len(fields) {
+		newName = strings.Trim(fields[idx], `"'`)
+	}
+	return table, oldName, newName
 }
 
 // parseAlterAddColumn extracts table, column name, and column type from
