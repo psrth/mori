@@ -11,6 +11,7 @@ import (
 
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/engine/firestore/connstr"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/mori-dev/mori/internal/engine/firestore/schema"
 	"github.com/mori-dev/mori/internal/engine/firestore/shadow"
 )
@@ -19,6 +20,7 @@ import (
 type InitOptions struct {
 	ProdConnStr string
 	ProjectRoot string
+	ConnName    string
 }
 
 // InitResult holds the result of a successful initialization.
@@ -38,67 +40,75 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 
 	// 2. Connect to prod Firestore.
-	fmt.Println("Connecting to production Firestore...")
-	prodClient, err := newFirestoreClient(ctx, info)
-	if err != nil {
+	var prodClient *firestore.Client
+	if err := ui.Spinner("Connecting to production Firestore...", func() error {
+		var e error
+		prodClient, e = newFirestoreClient(ctx, info)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("cannot connect to Firestore project %q: %w", info.ProjectID, err)
 	}
 	defer prodClient.Close()
 
 	// 3. Detect collections.
-	fmt.Println("Detecting collections...")
-	collections, err := schema.DetectCollections(ctx, prodClient)
-	if err != nil {
+	var collections map[string]schema.CollectionMeta
+	if err := ui.Spinner("Detecting collections...", func() error {
+		var e error
+		collections, e = schema.DetectCollections(ctx, prodClient)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("collection detection failed: %w", err)
 	}
-	fmt.Printf("  %d collections\n", len(collections))
+	ui.StepDone(fmt.Sprintf("Connected — %d collections", len(collections)))
 
 	// 4. Create .mori directory.
-	moriDir := config.MoriDirPath(opts.ProjectRoot)
-	if err := config.InitDir(opts.ProjectRoot); err != nil {
-		return nil, fmt.Errorf("failed to create .mori directory: %w", err)
+	moriDir := config.ConnDir(opts.ProjectRoot, opts.ConnName)
+	if err := config.InitConnDir(opts.ProjectRoot, opts.ConnName); err != nil {
+		return nil, fmt.Errorf("failed to create state directory: %w", err)
 	}
 
 	// 5. Start shadow emulator container.
-	fmt.Println("Starting Firestore emulator container...")
 	mgr, err := shadow.NewManager()
 	if err != nil {
 		return nil, err
 	}
 
-	fmt.Println("  Pulling emulator image (this may take a moment)...")
-	if err := mgr.Pull(ctx); err != nil {
+	if err := ui.Spinner("Pulling Firestore emulator image...", func() error {
+		return mgr.Pull(ctx)
+	}); err != nil {
 		return nil, fmt.Errorf("failed to pull emulator image: %w", err)
 	}
 
-	containerInfo, err := mgr.Create(ctx, shadow.ContainerConfig{
-		ProjectID: info.ProjectID,
-		HostPort:  shadow.DefaultHostPort,
-	})
-	if err != nil {
+	var containerInfo *shadow.ContainerInfo
+	if err := ui.Spinner("Creating Firestore emulator container...", func() error {
+		var e error
+		containerInfo, e = mgr.Create(ctx, shadow.ContainerConfig{
+			ProjectID: info.ProjectID,
+			HostPort:  shadow.DefaultHostPort,
+		})
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("failed to create emulator container: %w", err)
 	}
-	fmt.Printf("  Emulator: %s (port %d)\n", containerInfo.ContainerName, containerInfo.HostPort)
+	ui.StepDone(fmt.Sprintf("Emulator ready on port %d", containerInfo.HostPort))
 
 	// 6. Seed shadow emulator with prod data.
 	if len(collections) > 0 {
-		fmt.Println("Seeding shadow emulator from production...")
-		shadowClient, err := newEmulatorClient(ctx, info.ProjectID, containerInfo.HostPort)
-		if err != nil {
-			mgr.StopAndRemove(ctx, containerInfo.ContainerID)
-			return nil, fmt.Errorf("failed to connect to emulator: %w", err)
-		}
-		defer shadowClient.Close()
-
-		if err := schema.SeedShadow(ctx, prodClient, shadowClient, collections, schema.DefaultSeedLimit); err != nil {
+		if err := ui.Spinner("Seeding shadow emulator from production...", func() error {
+			shadowClient, e := newEmulatorClient(ctx, info.ProjectID, containerInfo.HostPort)
+			if e != nil {
+				return e
+			}
+			defer shadowClient.Close()
+			return schema.SeedShadow(ctx, prodClient, shadowClient, collections, schema.DefaultSeedLimit)
+		}); err != nil {
 			mgr.StopAndRemove(ctx, containerInfo.ContainerID)
 			return nil, fmt.Errorf("failed to seed shadow: %w", err)
 		}
-		fmt.Println("  Shadow seeded.")
+		ui.StepDone("Shadow seeded")
 	}
 
 	// 7. Persist configuration.
-	fmt.Println("Persisting configuration...")
 	cfg := &config.Config{
 		ProdConnection:  info.Raw,
 		ShadowPort:      containerInfo.HostPort,
@@ -110,7 +120,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		InitializedAt:   time.Now(),
 	}
 
-	if err := config.WriteConfig(opts.ProjectRoot, cfg); err != nil {
+	if err := config.WriteConnConfig(opts.ProjectRoot, opts.ConnName, cfg); err != nil {
 		mgr.StopAndRemove(ctx, containerInfo.ContainerID)
 		return nil, fmt.Errorf("failed to write config: %w", err)
 	}

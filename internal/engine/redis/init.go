@@ -7,6 +7,7 @@ import (
 
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/engine/redis/connstr"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/mori-dev/mori/internal/engine/redis/schema"
 	"github.com/mori-dev/mori/internal/engine/redis/shadow"
 )
@@ -15,6 +16,7 @@ import (
 type InitOptions struct {
 	ProdConnStr string
 	ProjectRoot string
+	ConnName    string
 }
 
 // InitResult holds the result of a successful initialization.
@@ -32,28 +34,29 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 
 	// 2. Ping Redis.
-	fmt.Println("Connecting to production Redis...")
-	if err := schema.PingRedis(info); err != nil {
+	var infoOutput string
+	if err := ui.Spinner("Connecting to production Redis...", func() error {
+		if e := schema.PingRedis(info); e != nil {
+			return e
+		}
+		var e error
+		infoOutput, e = schema.GetRedisInfo(info)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("cannot connect to production Redis: %w", err)
 	}
 
 	// 3. Get Redis version.
-	fmt.Println("Detecting Redis version...")
-	infoOutput, err := schema.GetRedisInfo(info)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get Redis info: %w", err)
-	}
 	version := schema.ParseRedisVersion(infoOutput)
-	fmt.Printf("  Redis %s detected\n", version)
+	ui.StepDone(fmt.Sprintf("Connected — Redis %s", version))
 
 	// 4. Create .mori directory.
-	moriDir := config.MoriDirPath(opts.ProjectRoot)
-	if err := config.InitDir(opts.ProjectRoot); err != nil {
-		return nil, fmt.Errorf("failed to create .mori directory: %w", err)
+	moriDir := config.ConnDir(opts.ProjectRoot, opts.ConnName)
+	if err := config.InitConnDir(opts.ProjectRoot, opts.ConnName); err != nil {
+		return nil, fmt.Errorf("failed to create state directory: %w", err)
 	}
 
 	// 5. Start shadow Redis container, matching production version.
-	fmt.Println("Creating Shadow Redis container...")
 	mgr, err := shadow.NewManager()
 	if err != nil {
 		return nil, fmt.Errorf("Docker not available: %w", err)
@@ -61,37 +64,40 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	defer mgr.Close()
 
 	shadowImage := shadow.ImageForVersion(version)
-	fmt.Printf("  Pulling %s (matching prod %s)...\n", shadowImage, version)
-	if err := mgr.Pull(ctx, shadowImage); err != nil {
-		// Fall back to default image if version-matched image is unavailable.
-		fmt.Printf("  Warning: %s not available, falling back to %s\n", shadowImage, shadow.DefaultImage)
-		shadowImage = shadow.DefaultImage
-		if err := mgr.Pull(ctx, shadowImage); err != nil {
-			return nil, fmt.Errorf("failed to pull Redis image: %w", err)
+	if err := ui.Spinner(fmt.Sprintf("Pulling Redis image %s...", shadowImage), func() error {
+		if e := mgr.Pull(ctx, shadowImage); e != nil {
+			// Fall back to default image if version-matched image is unavailable.
+			shadowImage = shadow.DefaultImage
+			return mgr.Pull(ctx, shadowImage)
 		}
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to pull Redis image: %w", err)
 	}
 
-	containerInfo, err := mgr.Create(ctx, shadow.ContainerConfig{
-		Image:    shadowImage,
-		HostPort: shadow.DefaultHostPort,
-	})
-	if err != nil {
+	var containerInfo *shadow.ContainerInfo
+	if err := ui.Spinner("Creating Shadow Redis container...", func() error {
+		var e error
+		containerInfo, e = mgr.Create(ctx, shadow.ContainerConfig{
+			Image:    shadowImage,
+			HostPort: shadow.DefaultHostPort,
+		})
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("failed to create shadow container: %w", err)
 	}
-	fmt.Printf("  Shadow: localhost:%d (container: %s)\n", containerInfo.HostPort, containerInfo.ContainerName)
+	ui.StepDone(fmt.Sprintf("Shadow container ready on port %d", containerInfo.HostPort))
 
 	// 6. Discover key patterns.
-	fmt.Println("Detecting key patterns...")
 	tables, err := schema.DetectKeyMetadata(info)
 	if err != nil {
-		// Non-fatal: Redis might be empty.
-		fmt.Printf("  Warning: key detection failed: %v (starting with empty metadata)\n", err)
+		ui.StepWarn(fmt.Sprintf("Key detection failed: %v (starting with empty metadata)", err))
 		tables = make(map[string]schema.KeyMeta)
+	} else {
+		ui.StepDone(fmt.Sprintf("%d key prefixes detected", len(tables)))
 	}
-	fmt.Printf("  %d key prefixes\n", len(tables))
 
 	// 7. Persist configuration.
-	fmt.Println("Persisting configuration...")
 	cfg := &config.Config{
 		ProdConnection:  info.Raw,
 		ShadowPort:      containerInfo.HostPort,
@@ -103,7 +109,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		InitializedAt:   time.Now(),
 	}
 
-	if err := config.WriteConfig(opts.ProjectRoot, cfg); err != nil {
+	if err := config.WriteConnConfig(opts.ProjectRoot, opts.ConnName, cfg); err != nil {
 		return nil, fmt.Errorf("failed to write config: %w", err)
 	}
 

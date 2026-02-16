@@ -1,9 +1,9 @@
 package main
 
 import (
-	"fmt"
 	"os"
 
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 
 	_ "github.com/mori-dev/mori/internal/auth/providers"
@@ -21,7 +21,9 @@ production, writes are captured locally. Your application sees one unified
 database. Production is never written to.
 
 Break something, reset, start over.`,
-	Version: Version,
+	Version:       Version,
+	SilenceUsage:  true,
+	SilenceErrors: true,
 }
 
 func init() {
@@ -40,7 +42,7 @@ func init() {
 
 func main() {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		ui.StepFail(err.Error())
 		os.Exit(1)
 	}
 }
