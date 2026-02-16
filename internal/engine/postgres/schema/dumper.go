@@ -2,14 +2,40 @@ package schema
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 )
+
+// isRecoveryConflict reports whether err is a PostgreSQL "conflict with
+// recovery" error (SQLSTATE 40001) that occurs on read replicas when a
+// query conflicts with WAL replay.
+func isRecoveryConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "40001"
+}
+
+// retryOnConflict retries fn up to maxAttempts times when it returns a
+// recovery-conflict error, sleeping briefly between attempts.
+func retryOnConflict(maxAttempts int, fn func() error) error {
+	var err error
+	for i := range maxAttempts {
+		if err = fn(); err == nil || !isRecoveryConflict(err) {
+			return err
+		}
+		if i < maxAttempts-1 {
+			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+		}
+	}
+	return err
+}
 
 // Extension represents a PostgreSQL extension installed on Prod.
 type Extension struct {
@@ -39,10 +65,27 @@ type DumpResult struct {
 	Tables     map[string]TableMeta
 }
 
-// DetectExtensions queries Prod for all installed extensions.
+// managedExtensions lists cloud-provider internal extensions that are injected
+// for operational purposes and cannot (or need not) be replicated in Shadow.
+var managedExtensions = map[string]bool{
+	"plpgsql":                  true,
+	"google_vacuum_mgmt":       true, // GCP Cloud SQL
+	"google_columnar_engine":   true, // GCP Cloud SQL
+	"google_db_advisor":        true, // GCP Cloud SQL
+	"google_ml_integration":    true, // GCP Cloud SQL
+	"rds_tools":                true, // AWS RDS
+	"rdsutils":                 true, // AWS RDS
+	"aiven_extras":             true, // Aiven
+	"azure":                    true, // Azure Database
+	"citus_columnar":           true, // Azure CosmosDB for PG
+	"supautils":                true, // Supabase
+}
+
+// DetectExtensions queries Prod for all installed extensions, filtering out
+// cloud-provider managed extensions that cannot be replicated locally.
 func DetectExtensions(ctx context.Context, conn *pgx.Conn) ([]Extension, error) {
 	rows, err := conn.Query(ctx,
-		"SELECT extname, extversion FROM pg_extension WHERE extname != 'plpgsql'")
+		"SELECT extname, extversion FROM pg_extension")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query extensions: %w", err)
 	}
@@ -53,6 +96,9 @@ func DetectExtensions(ctx context.Context, conn *pgx.Conn) ([]Extension, error) 
 		var e Extension
 		if err := rows.Scan(&e.Name, &e.Version); err != nil {
 			return nil, fmt.Errorf("failed to scan extension: %w", err)
+		}
+		if managedExtensions[e.Name] {
+			continue
 		}
 		exts = append(exts, e)
 	}
@@ -102,6 +148,22 @@ func StripPsqlMeta(schemaSQL string) string {
 	return psqlMetaRegex.ReplaceAllString(schemaSQL, "")
 }
 
+// StripManagedExtensions removes CREATE EXTENSION statements for cloud-provider
+// managed extensions from a pg_dump schema dump.
+func StripManagedExtensions(schemaSQL string) string {
+	for name := range managedExtensions {
+		// pg_dump emits: CREATE EXTENSION IF NOT EXISTS <name> WITH SCHEMA ...;
+		// Match both quoted and unquoted extension names.
+		for _, pat := range []string{
+			`(?m)^CREATE EXTENSION [^\n]*\b` + regexp.QuoteMeta(name) + `\b[^\n]*;\n?`,
+			`(?m)^COMMENT ON EXTENSION [^\n]*\b` + regexp.QuoteMeta(name) + `\b[^\n]*;\n?`,
+		} {
+			schemaSQL = regexp.MustCompile(pat).ReplaceAllString(schemaSQL, "")
+		}
+	}
+	return schemaSQL
+}
+
 // ExtInstallOptions provides container context for auto-installing extensions.
 type ExtInstallOptions struct {
 	ContainerID string // Docker container ID or name for docker exec
@@ -144,12 +206,23 @@ func InstallExtensions(ctx context.Context, shadowConnStr string, exts []Extensi
 	return nil
 }
 
+// extToPkg maps PostgreSQL extension names to their PGDG apt package suffix
+// when the two differ. Extensions not listed here use the extension name as-is.
+var extToPkg = map[string]string{
+	"vector":  "pgvector",
+	"postgis": "postgis-3",
+}
+
 // aptInstallExtension runs apt-get inside the Shadow container to install a
 // PostgreSQL extension package. Official Postgres Docker images ship with PGDG
-// apt repos pre-configured, so packages like postgresql-16-pgvector are available.
+// apt repos pre-configured, so packages like postgresql-17-pgvector are available.
 func aptInstallExtension(ctx context.Context, containerID string, pgMajor int, extName string) error {
 	// The standard PGDG package naming convention is postgresql-<major>-<extension>.
-	pkgName := fmt.Sprintf("postgresql-%d-%s", pgMajor, extName)
+	pkg := extName
+	if mapped, ok := extToPkg[extName]; ok {
+		pkg = mapped
+	}
+	pkgName := fmt.Sprintf("postgresql-%d-%s", pgMajor, pkg)
 
 	// Run apt-get update + install inside the container.
 	cmd := exec.CommandContext(ctx, "docker", "exec", containerID,
@@ -177,93 +250,78 @@ func ApplySchema(ctx context.Context, shadowConnStr string, schemaSQL string) er
 }
 
 // DetectTableMetadata queries Prod for all user tables and their PK info.
+// It uses a single query against pg_catalog (instead of N+1 queries against
+// information_schema) to minimise the window for read-replica recovery
+// conflicts.
 func DetectTableMetadata(ctx context.Context, conn *pgx.Conn) (map[string]TableMeta, error) {
-	// Get all public tables
-	tableRows, err := conn.Query(ctx,
-		"SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'")
-	if err != nil {
-		return nil, fmt.Errorf("failed to query tables: %w", err)
-	}
-	defer tableRows.Close()
-
-	var tableNames []string
-	for tableRows.Next() {
-		var name string
-		if err := tableRows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("failed to scan table name: %w", err)
-		}
-		tableNames = append(tableNames, name)
-	}
-	if err := tableRows.Err(); err != nil {
-		return nil, err
-	}
-
-	tables := make(map[string]TableMeta)
-	for _, tableName := range tableNames {
-		meta, err := detectTablePK(ctx, conn, tableName)
-		if err != nil {
-			return nil, err
-		}
-		tables[tableName] = meta
-	}
-	return tables, nil
-}
-
-func detectTablePK(ctx context.Context, conn *pgx.Conn, tableName string) (TableMeta, error) {
-	// Query PK columns for this table
 	rows, err := conn.Query(ctx, `
-		SELECT kcu.column_name, c.data_type, c.column_default
-		FROM information_schema.table_constraints tc
-		JOIN information_schema.key_column_usage kcu
-			ON kcu.constraint_name = tc.constraint_name
-			AND kcu.table_schema = tc.table_schema
-		JOIN information_schema.columns c
-			ON c.table_name = kcu.table_name
-			AND c.column_name = kcu.column_name
-			AND c.table_schema = kcu.table_schema
-		WHERE tc.table_name = $1
-			AND tc.table_schema = 'public'
-			AND tc.constraint_type = 'PRIMARY KEY'
-		ORDER BY kcu.ordinal_position`, tableName)
+		SELECT c.relname                          AS table_name,
+		       COALESCE(a.attname, '')             AS pk_column,
+		       COALESCE(format_type(a.atttypid, a.atttypmod), '') AS data_type,
+		       COALESCE(pg_get_expr(ad.adbin, ad.adrelid), '')    AS col_default,
+		       COALESCE(arr.ord, 0)                AS ordinal
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_index i   ON i.indrelid = c.oid AND i.indisprimary
+		LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS arr(attnum, ord)
+		          ON true
+		LEFT JOIN pg_attribute a  ON a.attrelid = c.oid AND a.attnum = arr.attnum
+		LEFT JOIN pg_attrdef   ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+		WHERE n.nspname = 'public'
+		  AND c.relkind = 'r'
+		ORDER BY c.relname, arr.ord`)
 	if err != nil {
-		return TableMeta{}, fmt.Errorf("failed to query PK for table %q: %w", tableName, err)
+		return nil, fmt.Errorf("failed to query table metadata: %w", err)
 	}
 	defer rows.Close()
 
-	var pkColumns []string
-	var pkTypes []string
-	var defaults []string
+	tables := make(map[string]TableMeta)
+	// Accumulate PK columns per table as we scan.
+	type pkAccum struct {
+		columns  []string
+		types    []string
+		defaults []string
+	}
+	accum := make(map[string]*pkAccum)
+
 	for rows.Next() {
-		var col, dataType string
-		var colDefault *string
-		if err := rows.Scan(&col, &dataType, &colDefault); err != nil {
-			return TableMeta{}, fmt.Errorf("failed to scan PK column for table %q: %w", tableName, err)
+		var tableName, pkCol, dataType, colDefault string
+		var ordinal int
+		if err := rows.Scan(&tableName, &pkCol, &dataType, &colDefault, &ordinal); err != nil {
+			return nil, fmt.Errorf("failed to scan table metadata: %w", err)
 		}
-		pkColumns = append(pkColumns, col)
-		pkTypes = append(pkTypes, dataType)
-		d := ""
-		if colDefault != nil {
-			d = *colDefault
+		if pkCol == "" {
+			// Table exists but has no PK.
+			if _, ok := tables[tableName]; !ok {
+				tables[tableName] = TableMeta{PKType: "none"}
+			}
+			continue
 		}
-		defaults = append(defaults, d)
+		a, ok := accum[tableName]
+		if !ok {
+			a = &pkAccum{}
+			accum[tableName] = a
+		}
+		a.columns = append(a.columns, pkCol)
+		a.types = append(a.types, dataType)
+		a.defaults = append(a.defaults, colDefault)
 	}
 	if err := rows.Err(); err != nil {
-		return TableMeta{}, err
+		return nil, err
 	}
 
-	if len(pkColumns) == 0 {
-		return TableMeta{PKType: "none"}, nil
+	for tableName, a := range accum {
+		pkType := classifyPKType(a.types, a.defaults)
+		if len(a.columns) > 1 {
+			pkType = "composite"
+		}
+		tables[tableName] = TableMeta{
+			PKColumns: a.columns,
+			PKType:    pkType,
+		}
 	}
 
-	pkType := classifyPKType(pkTypes, defaults)
-	if len(pkColumns) > 1 {
-		pkType = "composite"
-	}
-
-	return TableMeta{
-		PKColumns: pkColumns,
-		PKType:    pkType,
-	}, nil
+	return tables, nil
 }
 
 func classifyPKType(dataTypes []string, defaults []string) string {
@@ -322,7 +380,9 @@ func DetectSequenceOffsets(ctx context.Context, conn *pgx.Conn, tables map[strin
 		var maxVal *int64
 		query := fmt.Sprintf("SELECT MAX(%s) FROM %s",
 			quoteIdent(pkCol), quoteIdent(tableName))
-		if err := conn.QueryRow(ctx, query).Scan(&maxVal); err != nil {
+		if err := retryOnConflict(5, func() error {
+			return conn.QueryRow(ctx, query).Scan(&maxVal)
+		}); err != nil {
 			return nil, fmt.Errorf("failed to get max PK for table %q: %w", tableName, err)
 		}
 
@@ -397,8 +457,16 @@ func ApplySequenceOffsets(ctx context.Context, shadowConnStr string, offsets map
 // FullDump performs the complete schema dump pipeline from Prod.
 // The image parameter specifies which Docker image to use for pg_dump.
 func FullDump(ctx context.Context, conn *pgx.Conn, dsn *connstr.ProdDSN, image string) (*DumpResult, error) {
-	exts, err := DetectExtensions(ctx, conn)
-	if err != nil {
+	// Read-replica queries may hit "conflict with recovery" (SQLSTATE 40001)
+	// when WAL replay invalidates a running query. Retry transparently.
+	const maxRetries = 5
+
+	var exts []Extension
+	if err := retryOnConflict(maxRetries, func() error {
+		var e error
+		exts, e = DetectExtensions(ctx, conn)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("extension detection failed: %w", err)
 	}
 
@@ -408,14 +476,23 @@ func FullDump(ctx context.Context, conn *pgx.Conn, dsn *connstr.ProdDSN, image s
 	}
 	schemaSQL = StripForeignKeys(schemaSQL)
 	schemaSQL = StripPsqlMeta(schemaSQL)
+	schemaSQL = StripManagedExtensions(schemaSQL)
 
-	tables, err := DetectTableMetadata(ctx, conn)
-	if err != nil {
+	var tables map[string]TableMeta
+	if err := retryOnConflict(maxRetries, func() error {
+		var e error
+		tables, e = DetectTableMetadata(ctx, conn)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("table metadata detection failed: %w", err)
 	}
 
-	sequences, err := DetectSequenceOffsets(ctx, conn, tables)
-	if err != nil {
+	var sequences map[string]SequenceOffset
+	if err := retryOnConflict(maxRetries, func() error {
+		var e error
+		sequences, e = DetectSequenceOffsets(ctx, conn, tables)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("sequence offset detection failed: %w", err)
 	}
 
