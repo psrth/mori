@@ -12,7 +12,9 @@ type StateRefreshedMsg struct {
 
 // LogEntriesMsg carries new log entries from the tailer.
 type LogEntriesMsg struct {
-	Entries []logging.LogEntry
+	Entries      []logging.LogEntry
+	Reset        bool   // true when the log file was deleted (e.g. mori reset)
+	NewTailerPath string // non-empty when a new log file appeared and needs a tailer
 }
 
 // stateTickMsg triggers a state file re-read.

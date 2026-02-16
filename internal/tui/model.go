@@ -105,6 +105,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, readLogCmd(m.tailer, m.logPath)
 
 	case LogEntriesMsg:
+		if msg.Reset {
+			m.logEntries = nil
+			m.totalQueries = 0
+			m.metricsP50 = nil
+			m.metricsP95 = nil
+			m.metricsP99 = nil
+			m.metricsQPS = nil
+			m.tailer = nil
+			return m, scheduleLogTick()
+		}
+		if msg.NewTailerPath != "" {
+			m.tailer, _ = NewTailer(msg.NewTailerPath, 0)
+			return m, scheduleLogTick()
+		}
 		if len(msg.Entries) > 0 {
 			m.logEntries = append(m.logEntries, msg.Entries...)
 			if len(m.logEntries) > 2000 {
@@ -262,11 +276,16 @@ func readStateCmd(projectRoot, connName, moriDir string) tea.Cmd {
 
 func readLogCmd(tailer *Tailer, logPath string) tea.Cmd {
 	return func() tea.Msg {
-		if tailer == nil {
-			if _, err := os.Stat(logPath); err == nil {
-				return LogEntriesMsg{}
+		// If the log file was deleted (e.g. mori reset), signal a reset.
+		if _, err := os.Stat(logPath); err != nil {
+			if tailer != nil {
+				return LogEntriesMsg{Reset: true}
 			}
 			return LogEntriesMsg{}
+		}
+		// Tailer is nil but log file exists — create a new tailer.
+		if tailer == nil {
+			return LogEntriesMsg{NewTailerPath: logPath}
 		}
 		entries := tailer.ReadNew()
 		return LogEntriesMsg{Entries: entries}
