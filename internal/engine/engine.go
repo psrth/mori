@@ -31,8 +31,9 @@ type ConnInfo struct {
 
 // InitOptions holds engine-agnostic init parameters.
 type InitOptions struct {
-	ProdConnStr string
-	ProjectRoot string
+	ProdConnStr   string
+	ProjectRoot   string
+	ImageOverride string // Optional: Docker image override (e.g. custom image with extensions)
 }
 
 // InitResult holds engine-agnostic init results.

@@ -21,7 +21,7 @@ var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
 
 // runInteractiveInit walks the user through engine → provider → fields → name
 // and writes the result to mori.yaml.
-func runInteractiveInit(projectRoot string, existingCfg *config.ProjectConfig) error {
+func runInteractiveInit(projectRoot string, existingCfg *config.ProjectConfig, imageOverride string) error {
 	// ── Step 1: Select engine ────────────────────────────────────
 	engineOptions := buildEngineOptions()
 	var engineID string
@@ -183,6 +183,12 @@ func runInteractiveInit(projectRoot string, existingCfg *config.ProjectConfig) e
 	// ── Step 6: Build and save connection ────────────────────────
 	conn := buildConnection(engineID, providerID, fields, values)
 	conn.Tunnel = tunnelCfg
+	if imageOverride != "" {
+		if conn.Extra == nil {
+			conn.Extra = make(map[string]string)
+		}
+		conn.Extra["image"] = imageOverride
+	}
 
 	if existingCfg == nil {
 		existingCfg = config.NewProjectConfig()

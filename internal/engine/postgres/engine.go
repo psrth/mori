@@ -28,8 +28,9 @@ func (e *pgEngine) ID() registry.EngineID {
 
 func (e *pgEngine) Init(ctx context.Context, opts engine.InitOptions) (*engine.InitResult, error) {
 	result, err := Init(ctx, InitOptions{
-		ProdConnStr: opts.ProdConnStr,
-		ProjectRoot: opts.ProjectRoot,
+		ProdConnStr:   opts.ProdConnStr,
+		ImageOverride: opts.ImageOverride,
+		ProjectRoot:   opts.ProjectRoot,
 	})
 	if err != nil {
 		return nil, err
