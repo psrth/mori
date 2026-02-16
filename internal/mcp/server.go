@@ -2,34 +2,36 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
-	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// Server wraps an MCP server that exposes a db_query tool.
-// It connects to the Mori proxy as a regular PostgreSQL client,
-// so all queries go through the proxy's routing/merge logic.
-type Server struct {
-	mcpPort   int
-	connStr   string
-	httpSrv   *server.StreamableHTTPServer
+// EngineConfig holds engine-specific connection parameters for the MCP server.
+type EngineConfig struct {
+	Engine    string // engine ID from config: "postgres", "mysql", "redis", etc.
+	ProxyPort int    // port the Mori proxy is listening on
+	DBName    string
+	User      string
+	Password  string
 }
 
-// New creates a new MCP server that will connect to the Mori proxy.
-func New(mcpPort, proxyPort int, dbName, user, password string) *Server {
-	connStr := fmt.Sprintf("postgres://%s:%s@127.0.0.1:%d/%s?sslmode=disable",
-		user, password, proxyPort, dbName)
+// Server wraps an MCP server that exposes engine-appropriate tools.
+// It connects to the Mori proxy as a regular database client,
+// so all queries go through the proxy's routing/merge logic.
+type Server struct {
+	mcpPort int
+	cfg     EngineConfig
+	httpSrv *server.StreamableHTTPServer
+}
 
+// New creates a new MCP server for the given engine configuration.
+func New(mcpPort int, cfg EngineConfig) *Server {
 	return &Server{
 		mcpPort: mcpPort,
-		connStr: connStr,
+		cfg:     cfg,
 	}
 }
 
@@ -38,21 +40,12 @@ func New(mcpPort, proxyPort int, dbName, user, password string) *Server {
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	mcpSrv := server.NewMCPServer("mori", "0.1.0")
 
-	mcpSrv.AddTool(
-		mcp.NewTool("db_query",
-			mcp.WithDescription("Execute a SQL query against the database through Mori"),
-			mcp.WithString("query",
-				mcp.Description("SQL query to execute"),
-				mcp.Required(),
-			),
-		),
-		s.handleDBQuery,
-	)
+	s.registerTools(mcpSrv)
 
 	s.httpSrv = server.NewStreamableHTTPServer(mcpSrv)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.mcpPort)
-	log.Printf("MCP server listening on %s/mcp", addr)
+	log.Printf("MCP server listening on %s/mcp (engine: %s)", addr, s.cfg.Engine)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -75,120 +68,46 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// handleDBQuery is the MCP tool handler for db_query. It connects to the
-// Mori proxy via pgx, executes the query, and returns results as JSON.
-func (s *Server) handleDBQuery(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	query, err := request.RequireString("query")
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{mcp.NewTextContent("Error: 'query' argument is required")},
-			IsError: true,
-		}, nil
+// registerTools registers engine-appropriate MCP tools on the server.
+func (s *Server) registerTools(mcpSrv *server.MCPServer) {
+	switch s.cfg.Engine {
+	case "redis":
+		s.registerRedisTools(mcpSrv)
+	case "firestore":
+		s.registerFirestoreTools(mcpSrv)
+	default:
+		// All SQL engines get db_query. The connector varies by protocol.
+		s.registerSQLTools(mcpSrv)
 	}
-
-	query = strings.TrimSpace(query)
-	if query == "" {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{mcp.NewTextContent("Error: query cannot be empty")},
-			IsError: true,
-		}, nil
-	}
-
-	// Connect to the Mori proxy.
-	connCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	conn, err := pgx.Connect(connCtx, s.connStr)
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{mcp.NewTextContent(fmt.Sprintf("Error connecting to database: %v", err))},
-			IsError: true,
-		}, nil
-	}
-	defer conn.Close(ctx)
-
-	// Detect if the query is a SELECT/WITH (returns rows) or a mutation.
-	upper := strings.ToUpper(strings.TrimSpace(query))
-	isRead := strings.HasPrefix(upper, "SELECT") ||
-		strings.HasPrefix(upper, "WITH") ||
-		strings.HasPrefix(upper, "EXPLAIN") ||
-		strings.HasPrefix(upper, "SHOW")
-
-	if isRead {
-		return s.execQuery(ctx, conn, query)
-	}
-	return s.execExec(ctx, conn, query)
 }
 
-// execQuery handles queries that return rows (SELECT, WITH, etc.).
-func (s *Server) execQuery(ctx context.Context, conn *pgx.Conn, query string) (*mcp.CallToolResult, error) {
-	rows, err := conn.Query(ctx, query)
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{mcp.NewTextContent(fmt.Sprintf("Query error: %v", err))},
-			IsError: true,
-		}, nil
-	}
-	defer rows.Close()
+// registerSQLTools registers the db_query tool for SQL engines.
+// Uses pgx for pgwire engines (postgres, cockroachdb, sqlite, duckdb) and
+// database/sql for MySQL wire and TDS engines (mysql, mariadb, mssql).
+func (s *Server) registerSQLTools(mcpSrv *server.MCPServer) {
+	var handler func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error)
 
-	columns := make([]string, len(rows.FieldDescriptions()))
-	for i, fd := range rows.FieldDescriptions() {
-		columns[i] = fd.Name
-	}
-
-	var results []map[string]any
-	for rows.Next() {
-		values, err := rows.Values()
-		if err != nil {
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{mcp.NewTextContent(fmt.Sprintf("Error reading row: %v", err))},
-				IsError: true,
-			}, nil
-		}
-
-		row := make(map[string]any, len(columns))
-		for i, col := range columns {
-			row[col] = values[i]
-		}
-		results = append(results, row)
-	}
-	if err := rows.Err(); err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{mcp.NewTextContent(fmt.Sprintf("Query error: %v", err))},
-			IsError: true,
-		}, nil
+	switch s.cfg.Engine {
+	case "mysql", "mariadb":
+		h := newMySQLHandler(s.cfg)
+		handler = h.handleDBQuery
+	case "mssql":
+		h := newMSSQLHandler(s.cfg)
+		handler = h.handleDBQuery
+	default:
+		// postgres, cockroachdb, sqlite, duckdb — all speak pgwire
+		h := newPgwireHandler(s.cfg)
+		handler = h.handleDBQuery
 	}
 
-	if results == nil {
-		results = []map[string]any{}
-	}
-
-	data, err := json.MarshalIndent(results, "", "  ")
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{mcp.NewTextContent(fmt.Sprintf("Error marshaling results: %v", err))},
-			IsError: true,
-		}, nil
-	}
-
-	text := fmt.Sprintf("%d row(s) returned\n\n%s", len(results), string(data))
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{mcp.NewTextContent(text)},
-	}, nil
-}
-
-// execExec handles mutations (INSERT, UPDATE, DELETE, DDL, etc.).
-func (s *Server) execExec(ctx context.Context, conn *pgx.Conn, query string) (*mcp.CallToolResult, error) {
-	tag, err := conn.Exec(ctx, query)
-	if err != nil {
-		return &mcp.CallToolResult{
-			Content: []mcp.Content{mcp.NewTextContent(fmt.Sprintf("Query error: %v", err))},
-			IsError: true,
-		}, nil
-	}
-
-	text := fmt.Sprintf("OK: %s", tag.String())
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{mcp.NewTextContent(text)},
-	}, nil
+	mcpSrv.AddTool(
+		mcp.NewTool("db_query",
+			mcp.WithDescription("Execute a SQL query against the database through Mori"),
+			mcp.WithString("query",
+				mcp.Description("SQL query to execute"),
+				mcp.Required(),
+			),
+		),
+		handler,
+	)
 }

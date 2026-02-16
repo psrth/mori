@@ -26,10 +26,10 @@ import (
 
 	// Register engine implementations via side-effect imports.
 	_ "github.com/mori-dev/mori/internal/tunnel/tunnels"
+	_ "github.com/mori-dev/mori/internal/engine/duckdb"
 	_ "github.com/mori-dev/mori/internal/engine/firestore"
 	_ "github.com/mori-dev/mori/internal/engine/mssql"
 	_ "github.com/mori-dev/mori/internal/engine/mysql"
-	_ "github.com/mori-dev/mori/internal/engine/oracle"
 	_ "github.com/mori-dev/mori/internal/engine/postgres"
 	_ "github.com/mori-dev/mori/internal/engine/redis"
 	_ "github.com/mori-dev/mori/internal/engine/sqlite"
@@ -144,9 +144,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("failed to build connection string: %w", err)
 		}
+		imageOverride := ""
+		if conn.Extra != nil {
+			imageOverride = conn.Extra["image"]
+		}
 		result, err := eng.Init(cmd.Context(), engine.InitOptions{
-			ProdConnStr: connStr,
-			ProjectRoot: projectRoot,
+			ProdConnStr:   connStr,
+			ProjectRoot:   projectRoot,
+			ImageOverride: imageOverride,
 		})
 		if err != nil {
 			return err
@@ -273,7 +278,13 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 19. Optionally start MCP server.
 	var mcpSrv *morimcp.Server
 	if mcpEnabled {
-		mcpSrv = morimcp.New(mcpPort, port, connInfo.DBName, connInfo.User, connInfo.Password)
+		mcpSrv = morimcp.New(mcpPort, morimcp.EngineConfig{
+			Engine:    cfg.Engine,
+			ProxyPort: port,
+			DBName:    connInfo.DBName,
+			User:      connInfo.User,
+			Password:  connInfo.Password,
+		})
 		go func() {
 			if err := mcpSrv.ListenAndServe(ctx); err != nil {
 				log.Printf("MCP server error: %v", err)
