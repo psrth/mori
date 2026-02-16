@@ -10,6 +10,7 @@ import (
 
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/engine/duckdb/connstr"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/mori-dev/mori/internal/engine/duckdb/schema"
 	"github.com/mori-dev/mori/internal/engine/duckdb/shadow"
 )
@@ -18,6 +19,7 @@ import (
 type InitOptions struct {
 	ProdConnStr string
 	ProjectRoot string
+	ConnName    string
 }
 
 // InitResult holds the result of a successful initialization.
@@ -40,47 +42,50 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 
 	// 3. Open and verify the prod database.
-	fmt.Println("Connecting to production DuckDB database...")
-	prodDB, err := sql.Open("duckdb", info.DSN())
-	if err != nil {
+	var prodDB *sql.DB
+	if err := ui.Spinner("Connecting to production DuckDB database...", func() error {
+		var e error
+		prodDB, e = sql.Open("duckdb", info.DSN())
+		if e != nil {
+			return e
+		}
+		return prodDB.PingContext(ctx)
+	}); err != nil {
 		return nil, fmt.Errorf("cannot open production database %q: %w", info.FilePath, err)
 	}
 	defer prodDB.Close()
 
-	if err := prodDB.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("cannot connect to production database %q: %w", info.FilePath, err)
-	}
-
 	// 4. Detect DuckDB version.
-	fmt.Println("Detecting DuckDB version...")
 	var versionStr string
 	if err := prodDB.QueryRowContext(ctx, "SELECT version()").Scan(&versionStr); err != nil {
 		return nil, fmt.Errorf("failed to detect DuckDB version: %w", err)
 	}
-	fmt.Printf("  DuckDB %s detected\n", versionStr)
+	ui.StepDone(fmt.Sprintf("Connected — DuckDB %s", versionStr))
 
 	// 5. Create .mori directory.
-	moriDir := config.MoriDirPath(opts.ProjectRoot)
-	if err := config.InitDir(opts.ProjectRoot); err != nil {
-		return nil, fmt.Errorf("failed to create .mori directory: %w", err)
+	moriDir := config.ConnDir(opts.ProjectRoot, opts.ConnName)
+	if err := config.InitConnDir(opts.ProjectRoot, opts.ConnName); err != nil {
+		return nil, fmt.Errorf("failed to create state directory: %w", err)
 	}
 
 	// 6. Copy prod database to shadow.
-	fmt.Println("Creating Shadow database (file copy)...")
-	shadowPath, err := shadow.CreateShadow(info.FilePath, moriDir)
-	if err != nil {
+	var shadowPath string
+	if err := ui.Spinner("Creating Shadow database...", func() error {
+		var e error
+		shadowPath, e = shadow.CreateShadow(info.FilePath, moriDir)
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("failed to create shadow database: %w", err)
 	}
-	fmt.Printf("  Shadow: %s\n", shadowPath)
+	ui.StepDone(fmt.Sprintf("Shadow database created: %s", shadowPath))
 
 	// 7. Detect table metadata from prod.
-	fmt.Println("Detecting table metadata...")
 	tables, err := schema.DetectTableMetadata(ctx, prodDB)
 	if err != nil {
 		shadow.RemoveShadow(moriDir)
 		return nil, fmt.Errorf("table metadata detection failed: %w", err)
 	}
-	fmt.Printf("  %d tables\n", len(tables))
+	ui.StepDone(fmt.Sprintf("%d tables detected", len(tables)))
 
 	// 8. Detect auto-increment offsets.
 	offsets, err := schema.DetectSequenceOffsets(ctx, prodDB, tables)
@@ -91,7 +96,6 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 
 	// 9. Apply offsets to shadow.
 	if len(offsets) > 0 {
-		fmt.Println("Applying sequence offsets to Shadow...")
 		shadowDB, err := sql.Open("duckdb", shadowPath)
 		if err != nil {
 			shadow.RemoveShadow(moriDir)
@@ -106,7 +110,6 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 
 	// 10. Persist configuration.
-	fmt.Println("Persisting configuration...")
 	cfg := &config.Config{
 		ProdConnection:  info.FilePath,
 		ShadowPort:      0,  // Embedded — no port.
@@ -118,7 +121,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		InitializedAt:   time.Now(),
 	}
 
-	if err := config.WriteConfig(opts.ProjectRoot, cfg); err != nil {
+	if err := config.WriteConnConfig(opts.ProjectRoot, opts.ConnName, cfg); err != nil {
 		shadow.RemoveShadow(moriDir)
 		return nil, fmt.Errorf("failed to write config: %w", err)
 	}

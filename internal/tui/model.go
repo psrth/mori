@@ -18,6 +18,7 @@ type Model struct {
 
 	// Paths.
 	projectRoot string
+	connName    string
 	moriDir     string
 	logPath     string
 
@@ -47,13 +48,13 @@ type Model struct {
 	searchQuery  string
 }
 
-// NewModel creates a new TUI model.
-func NewModel(projectRoot string, initialTail int) Model {
-	moriDir := config.MoriDirPath(projectRoot)
-	logPath := config.LogFilePath(projectRoot)
+// NewModel creates a new TUI model for a specific connection.
+func NewModel(projectRoot, connName string, initialTail int) Model {
+	moriDir := config.ConnDir(projectRoot, connName)
+	logPath := config.ConnLogFilePath(projectRoot, connName)
 
 	// Read initial state.
-	snap := ReadSnapshot(projectRoot, moriDir)
+	snap := ReadSnapshot(projectRoot, connName, moriDir)
 
 	// Initialize log tailer.
 	var tailer *Tailer
@@ -64,6 +65,7 @@ func NewModel(projectRoot string, initialTail int) Model {
 
 	return Model{
 		projectRoot:  projectRoot,
+		connName:     connName,
 		moriDir:      moriDir,
 		logPath:      logPath,
 		snap:         snap,
@@ -90,7 +92,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case stateTickMsg:
-		return m, readStateCmd(m.projectRoot, m.moriDir)
+		return m, readStateCmd(m.projectRoot, m.connName, m.moriDir)
 
 	case StateRefreshedMsg:
 		if msg.Err == nil {
@@ -251,9 +253,9 @@ func scheduleLogTick() tea.Cmd {
 	})
 }
 
-func readStateCmd(projectRoot, moriDir string) tea.Cmd {
+func readStateCmd(projectRoot, connName, moriDir string) tea.Cmd {
 	return func() tea.Msg {
-		snap := ReadSnapshot(projectRoot, moriDir)
+		snap := ReadSnapshot(projectRoot, connName, moriDir)
 		return StateRefreshedMsg{Snap: snap}
 	}
 }

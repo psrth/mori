@@ -16,13 +16,7 @@ type upstashProvider struct{}
 func (p *upstashProvider) ID() registry.ProviderID { return registry.Upstash }
 
 func (p *upstashProvider) Fields(engine registry.EngineID) []registry.ConnectionField {
-	return []registry.ConnectionField{
-		{Key: "rest_url", Label: "REST URL (optional)", Placeholder: "https://us1-example.upstash.io"},
-		{Key: "rest_token", Label: "REST Token (optional)", Sensitive: true, Placeholder: "AXxx..."},
-		{Key: "host", Label: "Host", Required: true, Placeholder: "us1-example.upstash.io"},
-		{Key: "port", Label: "Port", Default: "6379", Placeholder: "6379"},
-		{Key: "password", Label: "Password", Sensitive: true, Placeholder: "enter password"},
-	}
+	return nil // use registry defaults with provider overrides
 }
 
 func (p *upstashProvider) ConnString(_ context.Context, conn *config.Connection) (string, error) {

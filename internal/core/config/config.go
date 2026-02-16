@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -37,6 +38,10 @@ type Config struct {
 	InitializedAt    time.Time `json:"initialized_at"`
 	ActiveConnection string    `json:"active_connection,omitempty"` // name from mori.yaml
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Legacy global paths (kept for backward compat with TUI and old state).
+// ──────────────────────────────────────────────────────────────────
 
 // MoriDirPath returns the absolute path to the .mori/ directory
 // relative to the given project root.
@@ -104,6 +109,157 @@ func ReadConfig(projectRoot string) (*Config, error) {
 	}
 	return &cfg, nil
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Per-connection paths: .mori/<connName>/
+// ──────────────────────────────────────────────────────────────────
+
+// ConnDir returns the per-connection state directory: .mori/<connName>/
+func ConnDir(projectRoot, connName string) string {
+	return filepath.Join(projectRoot, MoriDir, connName)
+}
+
+// ConnConfigFilePath returns the per-connection config file path.
+func ConnConfigFilePath(projectRoot, connName string) string {
+	return filepath.Join(ConnDir(projectRoot, connName), ConfigFile)
+}
+
+// ConnPidFilePath returns the per-connection PID file path.
+func ConnPidFilePath(projectRoot, connName string) string {
+	return filepath.Join(ConnDir(projectRoot, connName), PidFile)
+}
+
+// ConnTunnelPidFilePath returns the per-connection tunnel PID file path.
+func ConnTunnelPidFilePath(projectRoot, connName string) string {
+	return filepath.Join(ConnDir(projectRoot, connName), TunnelPidFile)
+}
+
+// ConnLogFilePath returns the per-connection log file path.
+func ConnLogFilePath(projectRoot, connName string) string {
+	return filepath.Join(ConnDir(projectRoot, connName), LogDir, LogFile)
+}
+
+// IsConnInitialized checks whether config.json exists for a specific connection.
+func IsConnInitialized(projectRoot, connName string) bool {
+	_, err := os.Stat(ConnConfigFilePath(projectRoot, connName))
+	return err == nil
+}
+
+// InitConnDir creates the per-connection state directory.
+func InitConnDir(projectRoot, connName string) error {
+	return os.MkdirAll(ConnDir(projectRoot, connName), 0755)
+}
+
+// WriteConnConfig serializes and writes the config to .mori/<connName>/config.json.
+func WriteConnConfig(projectRoot, connName string, cfg *Config) error {
+	if err := InitConnDir(projectRoot, connName); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(ConnConfigFilePath(projectRoot, connName), data, 0644)
+}
+
+// ReadConnConfig reads and deserializes the config for a specific connection.
+func ReadConnConfig(projectRoot, connName string) (*Config, error) {
+	if !IsConnInitialized(projectRoot, connName) {
+		return nil, errors.New("connection is not initialized (no config.json found)")
+	}
+	data, err := os.ReadFile(ConnConfigFilePath(projectRoot, connName))
+	if err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+// InitializedConnections returns the names of all connections that have been
+// initialized (have a config.json in .mori/<name>/).
+func InitializedConnections(projectRoot string) []string {
+	moriDir := MoriDirPath(projectRoot)
+	entries, err := os.ReadDir(moriDir)
+	if err != nil {
+		return nil
+	}
+	var conns []string
+	for _, e := range entries {
+		if e.IsDir() {
+			cfgPath := filepath.Join(moriDir, e.Name(), ConfigFile)
+			if _, err := os.Stat(cfgPath); err == nil {
+				conns = append(conns, e.Name())
+			}
+		}
+	}
+	sort.Strings(conns)
+	return conns
+}
+
+// NextAvailablePort returns the next available proxy port starting from basePort.
+// It checks existing per-connection configs to avoid collisions.
+func NextAvailablePort(projectRoot string, basePort int) int {
+	used := make(map[int]bool)
+	for _, name := range InitializedConnections(projectRoot) {
+		if cfg, err := ReadConnConfig(projectRoot, name); err == nil && cfg.ProxyPort > 0 {
+			used[cfg.ProxyPort] = true
+		}
+	}
+	port := basePort
+	for used[port] {
+		port++
+	}
+	return port
+}
+
+// MigrateToConnDir migrates legacy .mori/ state into .mori/<connName>/ if
+// an old-style .mori/config.json exists at the project root. This enables
+// seamless transition to per-connection directories.
+func MigrateToConnDir(projectRoot, connName string) error {
+	oldCfgPath := ConfigFilePath(projectRoot)
+	if _, err := os.Stat(oldCfgPath); err != nil {
+		return nil // nothing to migrate
+	}
+
+	connDir := ConnDir(projectRoot, connName)
+	if _, err := os.Stat(filepath.Join(connDir, ConfigFile)); err == nil {
+		return nil // already migrated
+	}
+
+	if err := os.MkdirAll(connDir, 0755); err != nil {
+		return err
+	}
+
+	moriDir := MoriDirPath(projectRoot)
+	// Files to move into the connection subdirectory.
+	filesToMove := []string{
+		ConfigFile, PidFile, TunnelPidFile,
+		"tables.json", "sequences.json",
+		"delta.json", "tombstones.json", "schema_registry.json",
+	}
+	for _, f := range filesToMove {
+		src := filepath.Join(moriDir, f)
+		dst := filepath.Join(connDir, f)
+		if _, err := os.Stat(src); err == nil {
+			os.Rename(src, dst)
+		}
+	}
+	// Move log directory.
+	oldLog := filepath.Join(moriDir, LogDir)
+	newLog := filepath.Join(connDir, LogDir)
+	if _, err := os.Stat(oldLog); err == nil {
+		os.Rename(oldLog, newLog)
+	}
+
+	return nil
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Common helpers.
+// ──────────────────────────────────────────────────────────────────
 
 // RedactedProdConnection returns ProdConnection with the password masked.
 // If ProdConnection cannot be parsed, returns it as-is.

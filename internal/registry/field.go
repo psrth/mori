@@ -93,7 +93,7 @@ var engineFields = map[EngineID][]ConnectionField{
 		withDefault(fieldPort, "26257"),
 		fieldUser,
 		fieldPassword,
-		fieldDatabase,
+		withDefault(fieldDatabase, "defaultdb"),
 		fieldSSLMode,
 	},
 	MySQL: {

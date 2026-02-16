@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/shadow"
 )
@@ -17,6 +18,7 @@ type InitOptions struct {
 	ProdConnStr   string // Required: production connection string
 	ImageOverride string // Optional: Docker image override
 	ProjectRoot   string // Required: path to the project root directory
+	ConnName      string // Required: connection name for per-connection state
 }
 
 // InitResult holds the result of a successful initialization.
@@ -35,15 +37,17 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 
 	// 2. Connect to Prod
-	fmt.Println("Connecting to production database...")
-	prodConn, err := pgx.Connect(ctx, dsn.ConnString())
-	if err != nil {
+	var prodConn *pgx.Conn
+	if err := ui.Spinner("Connecting to production database...", func() error {
+		var e error
+		prodConn, e = pgx.Connect(ctx, dsn.ConnString())
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("cannot connect to production database at %s:%d: %w", dsn.Host, dsn.Port, err)
 	}
 	defer prodConn.Close(ctx)
 
 	// 3. Detect PostgreSQL version
-	fmt.Println("Detecting PostgreSQL version...")
 	var versionStr string
 	if err := prodConn.QueryRow(ctx, "SHOW server_version").Scan(&versionStr); err != nil {
 		return nil, fmt.Errorf("failed to detect PostgreSQL version: %w", err)
@@ -52,7 +56,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse PostgreSQL version: %w", err)
 	}
-	fmt.Printf("  PostgreSQL %s detected\n", version.Full)
+	ui.StepDone(fmt.Sprintf("Connected — PostgreSQL %s", version.Full))
 
 	// 4. Determine Docker image
 	imageName := version.ImageTag
@@ -61,24 +65,28 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 
 	// 5. Set up Docker container
-	fmt.Printf("Pulling Docker image %s...\n", imageName)
 	mgr, err := shadow.NewManager()
 	if err != nil {
 		return nil, err
 	}
 	defer mgr.Close()
 
-	if err := mgr.Pull(ctx, imageName); err != nil {
+	if err := ui.Spinner(fmt.Sprintf("Pulling Docker image %s...", imageName), func() error {
+		return mgr.Pull(ctx, imageName)
+	}); err != nil {
 		return nil, err
 	}
 
-	fmt.Println("Creating Shadow container...")
-	containerInfo, err := mgr.Create(ctx, shadow.ContainerConfig{
-		Image:    imageName,
-		DBName:   dsn.DBName,
-		Password: "mori",
-	})
-	if err != nil {
+	var containerInfo *shadow.ContainerInfo
+	if err := ui.Spinner("Creating Shadow container...", func() error {
+		var e error
+		containerInfo, e = mgr.Create(ctx, shadow.ContainerConfig{
+			Image:    imageName,
+			DBName:   dsn.DBName,
+			Password: "mori",
+		})
+		return e
+	}); err != nil {
 		return nil, fmt.Errorf("failed to create Shadow container: %w", err)
 	}
 
@@ -86,37 +94,39 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	var initErr error
 	defer func() {
 		if initErr != nil {
-			fmt.Println("Cleaning up Shadow container due to error...")
+			ui.StepWarn("Cleaning up Shadow container...")
 			mgr.StopAndRemove(ctx, containerInfo.ContainerID)
 		}
 	}()
 
-	fmt.Printf("  Shadow container %s running on port %d\n", containerInfo.ContainerName, containerInfo.HostPort)
+	ui.StepDone(fmt.Sprintf("Shadow container ready on port %d", containerInfo.HostPort))
 
 	// 6. Dump production schema
-	fmt.Println("Dumping production schema...")
-	dumpResult, err := schema.FullDump(ctx, prodConn, dsn, imageName)
-	if err != nil {
+	var dumpResult *schema.DumpResult
+	if err := ui.Spinner("Dumping production schema...", func() error {
+		var e error
+		dumpResult, e = schema.FullDump(ctx, prodConn, dsn, imageName)
+		return e
+	}); err != nil {
 		initErr = err
 		return nil, err
 	}
-	fmt.Printf("  %d tables, %d extensions, %d sequences to offset\n",
-		len(dumpResult.Tables), len(dumpResult.Extensions), len(dumpResult.Sequences))
+	ui.StepDone(fmt.Sprintf("%d tables, %d extensions dumped", len(dumpResult.Tables), len(dumpResult.Extensions)))
 
 	// 7. Apply schema to Shadow
 	shadowConnStr := connstr.ShadowDSN(containerInfo.HostPort, dsn.DBName)
-	fmt.Println("Applying schema to Shadow...")
 	extOpts := &schema.ExtInstallOptions{
 		ContainerID: containerInfo.ContainerID,
 		PGMajor:     version.Major,
 	}
-	if err := schema.ApplyToShadow(ctx, shadowConnStr, dumpResult, extOpts); err != nil {
+	if err := ui.Spinner("Applying schema to Shadow...", func() error {
+		return schema.ApplyToShadow(ctx, shadowConnStr, dumpResult, extOpts)
+	}); err != nil {
 		initErr = err
 		return nil, fmt.Errorf("failed to apply schema to Shadow: %w", err)
 	}
 
 	// 8. Persist configuration
-	fmt.Println("Persisting configuration...")
 	cfg := &config.Config{
 		ProdConnection:  dsn.ConnString(),
 		ShadowPort:      containerInfo.HostPort,
@@ -129,12 +139,12 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		InitializedAt:   time.Now(),
 	}
 
-	if err := config.WriteConfig(opts.ProjectRoot, cfg); err != nil {
+	if err := config.WriteConnConfig(opts.ProjectRoot, opts.ConnName, cfg); err != nil {
 		initErr = err
 		return nil, fmt.Errorf("failed to write config: %w", err)
 	}
 
-	moriDir := config.MoriDirPath(opts.ProjectRoot)
+	moriDir := config.ConnDir(opts.ProjectRoot, opts.ConnName)
 	if err := schema.WriteSequences(moriDir, dumpResult.Sequences); err != nil {
 		initErr = err
 		return nil, fmt.Errorf("failed to write sequences: %w", err)

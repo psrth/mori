@@ -9,11 +9,12 @@ import (
 )
 
 var dashCmd = &cobra.Command{
-	Use:   "dash",
+	Use:   "dash [connection-name]",
 	Short: "Launch the interactive dashboard",
 	Long: `Open a live TUI dashboard that monitors the running Mori proxy.
 Shows table state, live query stream, and session statistics.
 The proxy must be started separately with 'mori start'.`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runDash,
 }
 
@@ -28,12 +29,14 @@ func runDash(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to determine project root: %w", err)
 	}
-	if !config.IsInitialized(projectRoot) {
+
+	connName, err := resolveInitializedConnection(projectRoot, args)
+	if err != nil {
 		if config.HasProjectConfig(projectRoot) {
-			return fmt.Errorf("mori has connections configured but no active session — run 'mori start' first")
+			return fmt.Errorf("no initialized connections — run 'mori start' first")
 		}
 		return fmt.Errorf("mori is not initialized — run 'mori init' first")
 	}
 
-	return tui.Run(projectRoot, tailN)
+	return tui.Run(projectRoot, connName, tailN)
 }

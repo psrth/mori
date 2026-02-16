@@ -6,6 +6,7 @@ import (
 
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/registry"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -37,12 +38,6 @@ func runLs(cmd *cobra.Command, args []string) error {
 	if len(names) == 0 {
 		fmt.Println("No connections in mori.yaml. Run 'mori init' to add one.")
 		return nil
-	}
-
-	// Read runtime config for active connection info.
-	var runtimeCfg *config.Config
-	if config.IsInitialized(projectRoot) {
-		runtimeCfg, _ = config.ReadConfig(projectRoot)
 	}
 
 	// Determine column widths.
@@ -79,30 +74,27 @@ func runLs(cmd *cobra.Command, args []string) error {
 		if host == "" {
 			host = "-"
 		}
-		status := connectionStatus(name, conn, runtimeCfg, projectRoot)
+		status := styledConnectionStatus(name, conn, projectRoot)
 		fmt.Printf(fmtStr, name, conn.Engine, conn.Provider, host, status)
 	}
 
 	return nil
 }
 
-// connectionStatus returns a human-readable status string for a connection.
-func connectionStatus(name string, conn *config.Connection, runtimeCfg *config.Config, projectRoot string) string {
+// styledConnectionStatus returns a styled status string for a connection.
+func styledConnectionStatus(name string, conn *config.Connection, projectRoot string) string {
 	// Check if engine is supported.
 	if !registry.IsEngineSupported(registry.EngineID(conn.Engine)) {
-		return "unsupported"
+		return ui.Red(ui.IconFail + " unsupported")
 	}
 
-	// Check if this is the active connection.
-	if runtimeCfg == nil || runtimeCfg.ActiveConnection != name {
-		return "ready"
+	// Check if this connection is initialized and proxy is running.
+	if config.IsConnInitialized(projectRoot, name) {
+		pidPath := config.ConnPidFilePath(projectRoot, name)
+		if pid, running := isProxyRunning(pidPath); running {
+			return ui.Green(fmt.Sprintf("%s running (PID %d)", ui.IconActive, pid))
+		}
 	}
 
-	// Check if proxy is running.
-	pidPath := config.PidFilePath(projectRoot)
-	if pid, running := isProxyRunning(pidPath); running {
-		return fmt.Sprintf("running (PID %d)", pid)
-	}
-
-	return "stopped"
+	return ui.Dim(ui.IconInactive + " ready")
 }

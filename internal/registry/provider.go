@@ -35,9 +35,15 @@ type Provider struct {
 	DisplayName       string
 	Tier              ProviderTier
 	Category          string
-	CompatibleEngines []EngineID  // which engines this provider offers
-	SSLDefault        string      // override the engine's ssl default (e.g. "require")
+	CompatibleEngines []EngineID        // which engines this provider offers
+	SSLDefault        string            // override the engine's ssl default (e.g. "require")
 	ExtraFields       []ConnectionField // provider-specific metadata beyond engine fields
+
+	// Provider-specific defaults that override engine defaults.
+	PortDefault     string // override engine's port default
+	HostPlaceholder string // provider-specific host hint
+	DatabaseDefault string // override engine's database default
+	UserDefault     string // override engine's user default
 }
 
 var providers = []Provider{
@@ -53,20 +59,16 @@ var providers = []Provider{
 		Tier: ProviderTierT1, Category: "PRIMARY",
 		CompatibleEngines: []EngineID{Postgres, MySQL, MSSQL},
 		SSLDefault:        "require",
-		ExtraFields: []ConnectionField{
-			{Key: "gcp_project", Label: "GCP Project", Placeholder: "my-project"},
-			{Key: "gcp_instance", Label: "Instance Name", Placeholder: "my-instance"},
-			{Key: "gcp_region", Label: "Region", Placeholder: "us-central1"},
-		},
+		HostPlaceholder:   "10.0.0.1 (or Cloud SQL Proxy at 127.0.0.1)",
 	},
 	{
 		ID: AWSRDS, DisplayName: "AWS RDS / Aurora",
 		Tier: ProviderTierT1, Category: "PRIMARY",
 		CompatibleEngines: []EngineID{Postgres, MySQL, MariaDB, MSSQL},
 		SSLDefault:        "require",
+		HostPlaceholder:   "mydb.abc123.us-east-1.rds.amazonaws.com",
 		ExtraFields: []ConnectionField{
 			{Key: "aws_region", Label: "AWS Region", Placeholder: "us-east-1"},
-			{Key: "aws_instance_id", Label: "Instance Identifier", Placeholder: "my-db-instance"},
 		},
 	},
 	{
@@ -74,19 +76,17 @@ var providers = []Provider{
 		Tier: ProviderTierT1, Category: "PRIMARY",
 		CompatibleEngines: []EngineID{Postgres},
 		SSLDefault:        "require",
-		ExtraFields: []ConnectionField{
-			{Key: "neon_project_id", Label: "Neon Project ID", Placeholder: "autumn-forest-12345"},
-			{Key: "neon_branch", Label: "Branch", Default: "main", Placeholder: "main"},
-		},
+		HostPlaceholder:   "ep-cool-darkness-123456.us-east-2.aws.neon.tech",
+		DatabaseDefault:   "neondb",
+		UserDefault:       "neondb_owner",
 	},
 	{
 		ID: Supabase, DisplayName: "Supabase",
 		Tier: ProviderTierT1, Category: "PRIMARY",
 		CompatibleEngines: []EngineID{Postgres},
 		SSLDefault:        "require",
-		ExtraFields: []ConnectionField{
-			{Key: "supabase_project_ref", Label: "Project Reference", Placeholder: "abcdefghijklmnop"},
-		},
+		HostPlaceholder:   "db.abcdefghijklmnop.supabase.co",
+		DatabaseDefault:   "postgres",
 	},
 
 	// ── T2: Platforms ────────────────────────────────────────────
@@ -95,19 +95,14 @@ var providers = []Provider{
 		Tier: ProviderTierT2, Category: "PLATFORMS",
 		CompatibleEngines: []EngineID{Postgres, MySQL, MariaDB, MSSQL},
 		SSLDefault:        "require",
-		ExtraFields: []ConnectionField{
-			{Key: "azure_resource_group", Label: "Resource Group", Placeholder: "my-rg"},
-			{Key: "azure_server_name", Label: "Server Name", Placeholder: "my-server"},
-		},
+		HostPlaceholder:   "myserver.postgres.database.azure.com",
 	},
 	{
 		ID: PlanetScale, DisplayName: "PlanetScale",
 		Tier: ProviderTierT2, Category: "PLATFORMS",
-		CompatibleEngines: []EngineID{MySQL},
+		CompatibleEngines: []EngineID{MySQL, Postgres},
 		SSLDefault:        "require",
-		ExtraFields: []ConnectionField{
-			{Key: "ps_organization", Label: "Organization", Placeholder: "my-org"},
-		},
+		HostPlaceholder:   "aws.connect.psdb.cloud",
 	},
 	{
 		ID: VercelPG, DisplayName: "Vercel Postgres",
@@ -129,9 +124,9 @@ var providers = []Provider{
 		Tier: ProviderTierT2, Category: "PLATFORMS",
 		CompatibleEngines: []EngineID{Postgres, MySQL, Redis, MongoDB},
 		SSLDefault:        "require",
-		ExtraFields: []ConnectionField{
-			{Key: "do_cluster_id", Label: "Cluster ID", Placeholder: "abc-123"},
-		},
+		PortDefault:       "25060",
+		DatabaseDefault:   "defaultdb",
+		UserDefault:       "doadmin",
 	},
 
 	// ── T3: Serverless ───────────────────────────────────────────
@@ -140,15 +135,14 @@ var providers = []Provider{
 		Tier: ProviderTierT3, Category: "SERVERLESS",
 		CompatibleEngines: []EngineID{Postgres, MySQL, Redis, MongoDB},
 		SSLDefault:        "require",
-		ExtraFields: []ConnectionField{
-			{Key: "railway_project_id", Label: "Project ID", Placeholder: "abc-123"},
-		},
+		HostPlaceholder:   "containers-us-west-123.railway.app",
 	},
 	{
 		ID: Upstash, DisplayName: "Upstash",
 		Tier: ProviderTierT3, Category: "SERVERLESS",
 		CompatibleEngines: []EngineID{Redis},
 		SSLDefault:        "true",
+		HostPlaceholder:   "us1-shining-condor-12345.upstash.io",
 	},
 	{
 		ID: Cloudflare, DisplayName: "Cloudflare D1 / KV",
