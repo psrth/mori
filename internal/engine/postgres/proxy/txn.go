@@ -105,6 +105,7 @@ func (th *TxnHandler) handleCommit(clientConn net.Conn, rawMsg []byte) error {
 	// Only promote staged deltas if both backends committed successfully.
 	if !shadowHadError && !prodHadError {
 		th.deltaMap.Commit()
+		th.deltaMap.CommitInsertCounts()
 		th.tombstones.Commit()
 
 		// Persist state.
@@ -126,6 +127,7 @@ func (th *TxnHandler) handleCommit(clientConn net.Conn, rawMsg []byte) error {
 	} else {
 		// An error occurred — discard staged entries.
 		th.deltaMap.Rollback()
+		th.deltaMap.RollbackInsertCounts()
 		th.tombstones.Rollback()
 		if th.verbose {
 			log.Printf("[conn %d] COMMIT failed (shadow=%v prod=%v): staged deltas discarded",
@@ -153,6 +155,7 @@ func (th *TxnHandler) handleRollback(clientConn net.Conn, rawMsg []byte) error {
 
 	// Discard staged entries.
 	th.deltaMap.Rollback()
+	th.deltaMap.RollbackInsertCounts()
 	th.tombstones.Rollback()
 
 	if th.verbose {
