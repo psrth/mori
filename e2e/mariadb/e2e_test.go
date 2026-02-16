@@ -25,6 +25,7 @@ var (
 	proxyDSN      string
 	proxyPort     = 19022
 	prodPort      = 15436
+	mcpPort       = 19024
 	dbName        = "mori_test"
 	dbUser        = "root"
 	dbPass        = "moripass"
@@ -200,6 +201,8 @@ func startMoriProxy(ctx context.Context) error {
 	moriProcess = exec.CommandContext(ctx, moriBin, "start", "e2e",
 		"--port", fmt.Sprintf("%d", proxyPort),
 		"--verbose",
+		"--mcp",
+		"--mcp-port", fmt.Sprintf("%d", mcpPort),
 	)
 	moriProcess.Dir = projectDir
 	moriProcess.Stdout = os.Stdout

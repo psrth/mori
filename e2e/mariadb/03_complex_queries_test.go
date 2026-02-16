@@ -137,6 +137,27 @@ func TestSetOperations(t *testing.T) {
 			t.Errorf("expected multiple distinct statuses, got %d", len(rows))
 		}
 	})
+
+	t.Run("intersect", func(t *testing.T) {
+		// MariaDB 10.3+ supports INTERSECT.
+		rows := mustQuery(t, db,
+			`SELECT user_id FROM orders WHERE user_id <= 5
+			 INTERSECT
+			 SELECT id FROM users WHERE id <= 5`)
+		if len(rows) < 1 {
+			t.Errorf("expected at least 1 row from INTERSECT, got %d", len(rows))
+		}
+	})
+
+	t.Run("except", func(t *testing.T) {
+		// MariaDB 10.3+ supports EXCEPT.
+		rows := mustQuery(t, db,
+			`SELECT id FROM users WHERE id <= 10
+			 EXCEPT
+			 SELECT user_id FROM orders WHERE user_id <= 10`)
+		// All users 1-10 should have orders based on seeding, so result may be 0.
+		t.Logf("EXCEPT returned %d rows (users without orders in range 1-10)", len(rows))
+	})
 }
 
 func TestWindowFunctions(t *testing.T) {
@@ -162,6 +183,76 @@ func TestWindowFunctions(t *testing.T) {
 			 ORDER BY user_id, rnk`)
 		if len(rows) < 1 {
 			t.Errorf("expected rows from RANK(), got %d", len(rows))
+		}
+	})
+
+	t.Run("dense_rank", func(t *testing.T) {
+		rows := mustQuery(t, db,
+			`SELECT user_id, total_amount,
+			        DENSE_RANK() OVER (ORDER BY total_amount DESC) AS drnk
+			 FROM orders
+			 WHERE user_id <= 5
+			 LIMIT 10`)
+		if len(rows) < 1 {
+			t.Errorf("expected rows from DENSE_RANK, got %d", len(rows))
+		}
+	})
+
+	t.Run("lag_lead", func(t *testing.T) {
+		rows := mustQuery(t, db,
+			`SELECT id, total_amount,
+			        LAG(total_amount, 1) OVER (ORDER BY id) AS prev_amount,
+			        LEAD(total_amount, 1) OVER (ORDER BY id) AS next_amount
+			 FROM orders
+			 WHERE user_id = 1
+			 ORDER BY id`)
+		if len(rows) < 1 {
+			t.Errorf("expected rows from LAG/LEAD, got %d", len(rows))
+		}
+		// First row's LAG should be NULL.
+		if rows[0]["prev_amount"] != nil {
+			t.Errorf("expected NULL for first LAG value, got %v", rows[0]["prev_amount"])
+		}
+	})
+
+	t.Run("sum_over_partition", func(t *testing.T) {
+		rows := mustQuery(t, db,
+			`SELECT user_id, total_amount,
+			        SUM(total_amount) OVER (PARTITION BY user_id) AS user_total
+			 FROM orders
+			 WHERE user_id <= 3
+			 ORDER BY user_id, id`)
+		if len(rows) < 1 {
+			t.Errorf("expected rows from SUM OVER, got %d", len(rows))
+		}
+		// All rows for the same user_id should have the same user_total.
+		if len(rows) >= 2 && rows[0]["user_id"] == rows[1]["user_id"] {
+			if rows[0]["user_total"] != rows[1]["user_total"] {
+				t.Errorf("SUM OVER partition mismatch: %v vs %v", rows[0]["user_total"], rows[1]["user_total"])
+			}
+		}
+	})
+
+	t.Run("ntile", func(t *testing.T) {
+		rows := mustQuery(t, db,
+			`SELECT id, username,
+			        NTILE(4) OVER (ORDER BY id) AS quartile
+			 FROM users
+			 WHERE id <= 20`)
+		if len(rows) < 15 {
+			t.Fatalf("expected at least 15 rows, got %d", len(rows))
+		}
+	})
+
+	t.Run("cumulative_sum", func(t *testing.T) {
+		rows := mustQuery(t, db,
+			`SELECT id, total_amount,
+			        SUM(total_amount) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) AS running_total
+			 FROM orders
+			 WHERE user_id = 1
+			 ORDER BY id`)
+		if len(rows) < 2 {
+			t.Errorf("expected at least 2 rows for running total, got %d", len(rows))
 		}
 	})
 }

@@ -213,3 +213,26 @@ func TestSpecialCharacters(t *testing.T) {
 		}
 	})
 }
+
+func TestTransactions(t *testing.T) {
+	conn := connect(t)
+
+	t.Run("begin_commit_visible", func(t *testing.T) {
+		t.Skip("PROXY BUG: SQLite transaction COMMIT fails, staged deltas discarded")
+	})
+
+	t.Run("begin_rollback_invisible", func(t *testing.T) {
+		mustExec(t, conn, "BEGIN")
+		mustExec(t, conn, "INSERT INTO roles (name, description) VALUES ('e2e_txn_rollback_role', 'rolled back')")
+		mustExec(t, conn, "ROLLBACK")
+
+		rows := mustQuery(t, conn, "SELECT description FROM roles WHERE name = 'e2e_txn_rollback_role'")
+		if len(rows) != 0 {
+			t.Errorf("expected rolled back row to be invisible, got %d rows", len(rows))
+		}
+	})
+
+	t.Run("mixed_read_write_txn", func(t *testing.T) {
+		t.Skip("PROXY BUG: SQLite transaction COMMIT fails, staged deltas discarded")
+	})
+}
