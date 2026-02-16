@@ -371,6 +371,165 @@ func TestHandleUpdateBulkFallback(t *testing.T) {
 	}
 }
 
+func TestHandleUpdateBulkHydration(t *testing.T) {
+	shadowConn, shadowBackend := newMockBackend()
+	defer shadowConn.Close()
+	defer shadowBackend.conn.Close()
+
+	prodConn, prodBackend := newMockBackend()
+	defer prodConn.Close()
+	defer prodBackend.conn.Close()
+
+	clientConn, clientSide := net.Pipe()
+	defer clientConn.Close()
+	defer clientSide.Close()
+
+	tables := map[string]schema.TableMeta{
+		"users": {PKColumns: []string{"id"}, PKType: "serial"},
+	}
+	wh := newTestWriteHandler(prodConn, shadowConn, tables, t)
+
+	// Prod responds to the bulk SELECT * with 3 matching rows.
+	prodBackend.respondWith(selectResponse(
+		[]string{"id", "name", "active"},
+		[][]interface{}{
+			{"10", "alice", "t"},
+			{"20", "bob", "t"},
+			{"30", "carol", "t"},
+		},
+		"SELECT 3",
+	))
+
+	// Shadow responds to 3 hydration INSERTs and then the UPDATE.
+	shadowBackend.respondToMultiple([][]byte{
+		simpleResponse("INSERT 0 1"),
+		simpleResponse("INSERT 0 1"),
+		simpleResponse("INSERT 0 1"),
+		simpleResponse("UPDATE 3"),
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		readRelayedResponse(clientSide) //nolint: errcheck
+	}()
+
+	// No PKs — bulk update with table metadata available.
+	rawMsg := buildQueryMsg("UPDATE users SET active = false WHERE last_login < '2020-01-01'")
+	cl := &core.Classification{
+		OpType:  core.OpWrite,
+		SubType: core.SubUpdate,
+		Tables:  []string{"users"},
+		PKs:     nil,
+		RawSQL:  "UPDATE users SET active = false WHERE last_login < '2020-01-01'",
+	}
+
+	err := wh.HandleWrite(clientConn, rawMsg, cl, core.StrategyHydrateAndWrite)
+	if err != nil {
+		t.Fatalf("HandleWrite() error: %v", err)
+	}
+
+	wg.Wait()
+
+	// Prod should have received 1 message (the bulk SELECT *).
+	received := prodBackend.getReceived()
+	if len(received) != 1 {
+		t.Errorf("prod received %d messages, want 1 (bulk SELECT)", len(received))
+	}
+
+	// All 3 PKs should be tracked in delta map.
+	for _, pk := range []string{"10", "20", "30"} {
+		if !wh.deltaMap.IsDelta("users", pk) {
+			t.Errorf("expected (users, %s) in delta map after bulk hydration", pk)
+		}
+	}
+	if wh.deltaMap.CountForTable("users") != 3 {
+		t.Errorf("delta map count = %d, want 3", wh.deltaMap.CountForTable("users"))
+	}
+
+	// Shadow should have received 4 messages (3 INSERTs + 1 UPDATE).
+	shadowReceived := shadowBackend.getReceived()
+	if len(shadowReceived) != 4 {
+		t.Errorf("shadow received %d messages, want 4", len(shadowReceived))
+	}
+}
+
+func TestHandleUpdateBulkSkipsAlreadyDelta(t *testing.T) {
+	shadowConn, shadowBackend := newMockBackend()
+	defer shadowConn.Close()
+	defer shadowBackend.conn.Close()
+
+	prodConn, prodBackend := newMockBackend()
+	defer prodConn.Close()
+	defer prodBackend.conn.Close()
+
+	clientConn, clientSide := net.Pipe()
+	defer clientConn.Close()
+	defer clientSide.Close()
+
+	tables := map[string]schema.TableMeta{
+		"users": {PKColumns: []string{"id"}, PKType: "serial"},
+	}
+	wh := newTestWriteHandler(prodConn, shadowConn, tables, t)
+
+	// Pre-populate: row 10 is already in Shadow.
+	wh.deltaMap.Add("users", "10")
+
+	// Prod responds with 2 matching rows (10 and 20).
+	prodBackend.respondWith(selectResponse(
+		[]string{"id", "name"},
+		[][]interface{}{
+			{"10", "alice"},
+			{"20", "bob"},
+		},
+		"SELECT 2",
+	))
+
+	// Shadow: only 1 hydration INSERT (for 20, since 10 is already delta) + UPDATE.
+	shadowBackend.respondToMultiple([][]byte{
+		simpleResponse("INSERT 0 1"),
+		simpleResponse("UPDATE 2"),
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		readRelayedResponse(clientSide) //nolint: errcheck
+	}()
+
+	rawMsg := buildQueryMsg("UPDATE users SET active = false WHERE id > 5")
+	cl := &core.Classification{
+		OpType:  core.OpWrite,
+		SubType: core.SubUpdate,
+		Tables:  []string{"users"},
+		PKs:     nil,
+		RawSQL:  "UPDATE users SET active = false WHERE id > 5",
+	}
+
+	err := wh.HandleWrite(clientConn, rawMsg, cl, core.StrategyHydrateAndWrite)
+	if err != nil {
+		t.Fatalf("HandleWrite() error: %v", err)
+	}
+
+	wg.Wait()
+
+	// Both PKs should be in the delta map.
+	if !wh.deltaMap.IsDelta("users", "10") {
+		t.Error("expected (users, 10) still in delta map")
+	}
+	if !wh.deltaMap.IsDelta("users", "20") {
+		t.Error("expected (users, 20) in delta map")
+	}
+
+	// Shadow should have received 2 messages (1 INSERT + 1 UPDATE).
+	shadowReceived := shadowBackend.getReceived()
+	if len(shadowReceived) != 2 {
+		t.Errorf("shadow received %d messages, want 2", len(shadowReceived))
+	}
+}
+
 func TestHandleUpdateHydrationProdRowNotFound(t *testing.T) {
 	shadowConn, shadowBackend := newMockBackend()
 	defer shadowConn.Close()
@@ -591,6 +750,59 @@ func TestHandleDeleteMultiplePKs(t *testing.T) {
 	// Delta for 10 should be removed.
 	if wh.deltaMap.IsDelta("users", "10") {
 		t.Error("expected (users, 10) removed from delta map")
+	}
+}
+
+func TestBuildBulkHydrationQuery(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:  "simple WHERE",
+			input: "UPDATE users SET active = false WHERE last_login < '2020-01-01'",
+			want:  "SELECT * FROM users WHERE last_login < '2020-01-01'",
+		},
+		{
+			name:  "IS NULL",
+			input: "UPDATE conversations SET org_id = 1 WHERE org_id IS NULL",
+			want:  "SELECT * FROM conversations WHERE org_id IS NULL",
+		},
+		{
+			name:  "aliased table",
+			input: "UPDATE conversations c SET org_id = 1 WHERE c.org_id IS NULL",
+			want:  "SELECT * FROM conversations c WHERE c.org_id IS NULL",
+		},
+		{
+			name:  "complex SET expression",
+			input: "UPDATE conversations SET org_id = (request_metadata->>'org_context')::int WHERE created_at > '2026-02-01'",
+			want:  "SELECT * FROM conversations WHERE created_at > '2026-02-01'",
+		},
+		{
+			name:    "not an UPDATE",
+			input:   "SELECT * FROM users",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := buildBulkHydrationQuery(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("got:  %s\nwant: %s", got, tt.want)
+			}
+		})
 	}
 }
 

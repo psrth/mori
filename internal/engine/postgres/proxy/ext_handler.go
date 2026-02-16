@@ -362,17 +362,30 @@ func (eh *ExtHandler) handleExtInsert(clientConn net.Conn, batchRaw []byte, cl *
 
 // handleExtUpdate hydrates missing rows then forwards batch to Shadow.
 func (eh *ExtHandler) handleExtUpdate(clientConn net.Conn, batchRaw []byte, cl *core.Classification) error {
-	// Hydrate missing rows before forwarding the batch (uses simple queries).
-	if eh.writeHandler != nil && len(cl.PKs) > 0 {
-		for _, pk := range cl.PKs {
-			if eh.deltaMap != nil && eh.deltaMap.IsDelta(pk.Table, pk.PK) {
-				continue
+	if eh.writeHandler == nil {
+		return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+	}
+
+	// Bulk update (no extractable PKs): delegate to WriteHandler's bulk path.
+	if len(cl.PKs) == 0 {
+		if !cl.IsJoin && len(cl.Tables) == 1 {
+			if meta, ok := eh.tables[cl.Tables[0]]; ok && len(meta.PKColumns) > 0 {
+				return eh.writeHandler.handleBulkUpdate(clientConn, batchRaw, cl)
 			}
-			if err := eh.writeHandler.hydrateRow(pk.Table, pk.PK); err != nil {
-				if eh.verbose {
-					log.Printf("[conn %d] ext: hydration failed for (%s, %s): %v",
-						eh.connID, pk.Table, pk.PK, err)
-				}
+		}
+		// Fallback: forward to Shadow without hydration.
+		return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+	}
+
+	// Point update: hydrate missing rows before forwarding the batch.
+	for _, pk := range cl.PKs {
+		if eh.deltaMap != nil && eh.deltaMap.IsDelta(pk.Table, pk.PK) {
+			continue
+		}
+		if err := eh.writeHandler.hydrateRow(pk.Table, pk.PK); err != nil {
+			if eh.verbose {
+				log.Printf("[conn %d] ext: hydration failed for (%s, %s): %v",
+					eh.connID, pk.Table, pk.PK, err)
 			}
 		}
 	}
