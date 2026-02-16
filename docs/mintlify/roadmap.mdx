@@ -7,17 +7,17 @@ sidebarTitle: "Roadmap"
 ## Current State (v1)
 
 <CardGroup cols={2}>
-  <Card title="PostgreSQL Core">
-    Full CRUD, merged reads (single table + JOINs), transactions, DDL, schema adaptation. 202+ E2E tests.
+  <Card title="Full Engine Parity">
+    All SQL engines support merged reads, write hydration, transactions, DDL tracking, and extended query protocol. Redis supports Pub/Sub fan-in, EVAL/EVALSHA, and merged SCAN. Firestore supports SDK-based merged reads and delta/tombstone tracking. 202+ E2E tests.
   </Card>
   <Card title="9 Engines">
-    PostgreSQL, CockroachDB, MySQL, MariaDB, MS SQL Server, Oracle, SQLite, Redis, Firestore.
+    PostgreSQL, CockroachDB, MySQL, MariaDB, MS SQL Server, SQLite, DuckDB, Redis, Firestore.
   </Card>
   <Card title="14 Auth Providers">
     AWS RDS, GCP Cloud SQL, Neon, Supabase, Azure, PlanetScale, Vercel, DigitalOcean, Railway, Upstash, Cloudflare, Firebase, MongoDB Atlas, and self-hosted.
   </Card>
   <Card title="Developer Tools">
-    TUI dashboard, MCP server for AI agents, structured logging, full CLI.
+    TUI dashboard, multi-engine MCP server for AI agents (SQL, Redis, Firestore tools), structured logging, full CLI with `--image` flag for custom Docker images.
   </Card>
 </CardGroup>
 

@@ -43,7 +43,7 @@ Testing status for all engines and auth providers.
 - **Unit tests**: Pass (shares MySQL packages)
 - **E2E tests**: Not written
 - **Build tag**: `e2e_mariadb`
-- **Docker image**: `mariadb:11`
+- **Docker image**: Auto-detected from `SELECT VERSION()` (e.g. `mariadb:10.11`); fallback `mariadb:11`
 - **What's needed**: Clone MySQL E2E tests with MariaDB Docker image. Thin MySQL variant (`internal/engine/mysql/mariadb.go`).
 - **Notes**: Depends on MySQL E2E suite being written first.
 
@@ -58,18 +58,6 @@ Testing status for all engines and auth providers.
 - **Docker image**: `mcr.microsoft.com/mssql/server:2022-latest` (~1.5GB, ARM emulated)
 - **What's needed**: Run E2E suite. Previous P0 bugs (TDS proxy shadow login) may have been fixed.
 - **Notes**: ARM hosts face emulation overhead. Shadow readiness timeout set to 300s.
-
----
-
-### Oracle — Pending: Run E2E suite
-
-- **Unit tests**: Pass (4 packages: classify, connstr, proxy, schema)
-- **E2E tests**: Written at `e2e/oracle/` (5 test files)
-- **Build tag**: `e2e_oracle`
-- **Command**: `go test -tags e2e_oracle -v -count=1 -timeout 20m ./e2e/oracle/`
-- **Docker image**: `gvenzl/oracle-xe:21-slim` (~2GB, ARM emulated)
-- **What's needed**: Run E2E suite. Previous P0 bug (sequence MAX_VALUE int64 overflow) may have been fixed.
-- **Notes**: Very large Docker image. ARM hosts face heavy emulation overhead. Shadow readiness timeout set to 480s.
 
 ---
 
@@ -97,6 +85,17 @@ Testing status for all engines and auth providers.
 
 ---
 
+### DuckDB — Pending: Write E2E suite
+
+- **Unit tests**: Pass (3 packages: classify, connstr, proxy)
+- **E2E tests**: Not written
+- **Build tag**: `e2e_duckdb`
+- **Docker image**: None (file-based, embedded)
+- **What's needed**: Create `e2e/duckdb/` directory. DuckDB uses pgwire, so many SQLite/PostgreSQL E2E patterns apply. File-based shadow (copies `.duckdb` file).
+- **Notes**: Embedded engine, no Docker needed. Uses `github.com/marcboeker/go-duckdb` (CGo-based driver). 47 unit tests passing (classify: 23, connstr: 12, proxy: 12).
+
+---
+
 ### Firestore — Pending: Run E2E suite
 
 - **Unit tests**: Pass
@@ -117,7 +116,7 @@ All providers have passing unit tests (`internal/auth/providers/`). Integration 
 |----------|-------------------|-----------|-----------------|---------------|
 | **Direct / Self-Hosted** | All | Pass | Covered by E2E | Covered by engine E2E tests (all use Direct) |
 | **GCP Cloud SQL** | Postgres, MySQL, MSSQL | Pass | Pending | GCP project (free tier available) |
-| **AWS RDS / Aurora** | Postgres, MySQL, MariaDB, MSSQL, Oracle | Pass | Pending | AWS account (free tier for some engines) |
+| **AWS RDS / Aurora** | Postgres, MySQL, MariaDB, MSSQL | Pass | Pending | AWS account (free tier for some engines) |
 | **Neon** | Postgres | Pass | Pending | Neon project (free tier available) |
 | **Supabase** | Postgres | Pass | Pending | Supabase project (free tier available) |
 | **Azure Database** | Postgres, MySQL, MariaDB, MSSQL | Pass | Pending | Azure account |

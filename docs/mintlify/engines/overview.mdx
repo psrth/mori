@@ -13,8 +13,8 @@ sidebarTitle: "Engines"
 | `mysql` | MySQL | SQL / MySQL | 3306 | Supported |
 | `mariadb` | MariaDB | SQL / MySQL | 3306 | Supported |
 | `mssql` | MS SQL Server | SQL / TDS | 1433 | Supported |
-| `oracle` | Oracle | SQL / Net8 | 1521 | Supported |
 | `sqlite` | SQLite | SQL / Embedded | N/A | Supported |
+| `duckdb` | DuckDB | SQL / Embedded | N/A | Supported |
 | `redis` | Redis | NoSQL | 6379 | Supported |
 | `firestore` | Firestore | NoSQL | N/A | Supported |
 | `mongodb` | MongoDB | NoSQL | 27017 | Planned |
@@ -60,19 +60,17 @@ Each engine requires specific connection parameters:
     | `encrypt` | Encryption setting |
     | `trust_server_cert` | Trust server certificate |
   </Tab>
-  <Tab title="Oracle">
-    | Field | Description |
-    |-------|------------|
-    | `host` | Database host |
-    | `port` | Database port (default: 1521) |
-    | `user` | Username |
-    | `password` | Password |
-    | `service_name` | Oracle service name |
-  </Tab>
   <Tab title="SQLite">
     | Field | Description |
     |-------|------------|
     | `file_path` | Path to the SQLite database file |
+  </Tab>
+  <Tab title="DuckDB">
+    | Field | Description |
+    |-------|------------|
+    | `file_path` | Path to the DuckDB database file (e.g., `/path/to/db.duckdb`) |
+
+    Also supports URI format: `duckdb:///path/to/db.duckdb` and in-memory: `:memory:`
   </Tab>
   <Tab title="Redis">
     | Field | Description |

@@ -6,11 +6,19 @@ sidebarTitle: "Transactions"
 
 ## Transaction Model
 
+Transactions are supported on **all SQL engines**: PostgreSQL, CockroachDB, MySQL, MariaDB, MS SQL Server, SQLite, and DuckDB. Each engine's TxnHandler implements the same staged delta/tombstone pattern adapted to its wire protocol.
+
 | Operation | Behavior |
 |-----------|----------|
 | `BEGIN` | Open read-only transaction on Prod (REPEATABLE READ) + read-write transaction on Shadow |
 | `COMMIT` | Commit Shadow, close Prod, promote staged deltas/tombstones to persistent state |
 | `ROLLBACK` | Rollback Shadow, close Prod, discard staged deltas/tombstones |
+
+Engine-specific details:
+- **PostgreSQL / CockroachDB / DuckDB**: pgwire protocol, `BEGIN` / `COMMIT` / `ROLLBACK`
+- **MySQL / MariaDB**: MySQL wire protocol, `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK`
+- **MSSQL**: TDS protocol, `BEGIN TRAN` / `COMMIT` / `ROLLBACK`, with TDS token scanning for error detection
+- **SQLite**: pgwire protocol (via embedded pgwire server), `BEGIN` / `COMMIT` / `ROLLBACK`, plus `SAVEPOINT` / `RELEASE`
 
 ## Staged Deltas
 

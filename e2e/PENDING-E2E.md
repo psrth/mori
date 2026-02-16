@@ -54,8 +54,9 @@
 - **Bug fix applied**: Added `case "redis":` in `config.Connection.ToConnString()` (`internal/core/config/project.go`) — Redis connections previously fell through to the default Postgres handler.
 - **Issues**:
   - `TestMget/mget_prod_keys`: Test ordering dependency — earlier tests modify shadow state for `user:1` and `user:2`, so MGET merged read returns shadow values instead of original prod values. Fix: use unique keys not modified by earlier tests.
-  - `TestMset/mset_multiple_keys`: **Proxy bug** — MSET handler only writes first key-value pair to shadow. Second key (`e2e:mset2`) returns empty after `MSET e2e:mset1 val1 e2e:mset2 val2`.
+  - ~~`TestMset/mset_multiple_keys`: **Proxy bug** — MSET handler only writes first key-value pair to shadow.~~ **FIXED**: MSET now correctly writes all key-value pairs to shadow.
 - **Coverage gaps**: Large values, special characters, concurrent writes, KEYS/SCAN, EXPIRE/PERSIST, RENAME.
+- **New features**: Pub/Sub fan-in (SUBSCRIBE to both backends), EVAL/EVALSHA with key hydration, merged SCAN, version-matched shadow images.
 
 ---
 
@@ -138,7 +139,7 @@
 | Oracle | VERIFY-ONLY | — | — | — | 71 (existing) |
 
 ### Bugs Found
-1. **Redis MSET proxy bug**: Only writes first key-value pair to shadow (affects `e2e/redis/02_basic_crud_test.go`)
+1. ~~**Redis MSET proxy bug**: Only writes first key-value pair to shadow (affects `e2e/redis/02_basic_crud_test.go`)~~ **FIXED**
 2. **Redis MGET test ordering**: Test depends on clean prod state but earlier tests modify shadow
 
 ### Engine Fixes Applied

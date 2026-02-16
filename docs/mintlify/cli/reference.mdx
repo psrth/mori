@@ -20,6 +20,21 @@ Non-interactive init with a connection string:
 mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
 ```
 
+Use a custom Docker image for the Shadow container (e.g., for PostgreSQL with pre-installed extensions):
+
+```bash
+mori init --image myregistry/postgres-custom:16
+```
+
+| Flag | Description |
+|------|-------------|
+| `--from` | Connection string for non-interactive mode |
+| `--image` | Custom Docker image for the Shadow container. Persisted in `mori.yaml` and used by `mori start`. Useful when extensions cannot be auto-installed via `apt-get` (e.g., distroless images, proprietary extensions). |
+
+<Info>
+For PostgreSQL, Mori automatically attempts to install extensions via `apt-get` inside the Shadow container when `CREATE EXTENSION` fails. The `--image` flag is an escape hatch for cases where auto-install does not work.
+</Info>
+
 ## Running
 
 ### `mori start`
