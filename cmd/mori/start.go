@@ -128,6 +128,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 		ui.StepDone(fmt.Sprintf("Tunnel ready on %s", tunnelMgr.LocalAddr()))
 
+		// Ensure the per-connection state directory exists before writing the PID file.
+		if err := config.InitConnDir(projectRoot, connName); err != nil {
+			log.Printf("Warning: could not create connection state directory: %v", err)
+		}
+
 		// Write tunnel PID file for stop command.
 		tunnelPidPath := config.ConnTunnelPidFilePath(projectRoot, connName)
 		if err := os.WriteFile(tunnelPidPath, []byte(strconv.Itoa(tunnelMgr.PID())), 0644); err != nil {
@@ -135,8 +140,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}
 
 		// Rewrite connection to go through the tunnel.
+		// The tunnel handles TLS to the remote database, so the local
+		// connection must use plain TCP (sslmode=disable).
 		conn.Host = "127.0.0.1"
 		conn.Port = tunnelMgr.LocalPort()
+		conn.SSLMode = "disable"
 	}
 
 	// 8. If no runtime config exists for this connection, run the engine init (first start).
@@ -170,6 +178,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 		tableLabel := fmt.Sprintf("%d %s", result.TableCount, pluralize(result.TableCount, "table", "tables"))
 		ui.StepDone(fmt.Sprintf("Shadow ready — %s %s · %s", cfg.Engine, cfg.EngineVersion, tableLabel))
+	}
+
+	// 8b. If a tunnel is active, refresh the prod connection string in the config
+	// with the current tunnel address (the ephemeral port changes each restart).
+	if tunnelMgr != nil && cfg != nil {
+		authProvider := auth.Lookup(registry.ProviderID(conn.Provider))
+		freshConnStr, err := authProvider.ConnString(cmd.Context(), conn)
+		if err != nil {
+			return fmt.Errorf("failed to rebuild connection string for tunnel: %w", err)
+		}
+		cfg.ProdConnection = freshConnStr
 	}
 
 	// 9. Determine proxy port: explicit flag > existing config > auto-assign.
