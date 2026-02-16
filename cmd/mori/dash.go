@@ -32,10 +32,7 @@ func runDash(cmd *cobra.Command, args []string) error {
 
 	connName, err := resolveInitializedConnection(projectRoot, args)
 	if err != nil {
-		if config.HasProjectConfig(projectRoot) {
-			return fmt.Errorf("no initialized connections — run 'mori start' first")
-		}
-		return fmt.Errorf("mori is not initialized — run 'mori init' first")
+		return err
 	}
 
 	return tui.Run(projectRoot, connName, tailN)
