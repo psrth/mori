@@ -81,13 +81,19 @@ func renderTableRow(table string, selected bool, nameW, totalW int, snap Snapsho
 	hasInserts := false
 	hasDeltaCount := false
 	if snap.DeltaMap != nil {
-		count := snap.DeltaMap.CountForTable(table)
+		editCount := snap.DeltaMap.CountForTable(table)
 		hasInserts = snap.DeltaMap.HasInserts(table)
-		if count > 0 {
+		insertCount := snap.DeltaMap.InsertCountForTable(table)
+		if editCount > 0 {
 			hasDeltaCount = true
-			indicators = append(indicators, InsertIndicator.Render(fmt.Sprintf("+%d", count)))
-		} else if hasInserts {
-			indicators = append(indicators, InsertIndicator.Render("+"))
+			indicators = append(indicators, EditStyle.Render(fmt.Sprintf("~%d", editCount)))
+		}
+		if hasInserts {
+			if insertCount > 0 {
+				indicators = append(indicators, InsertIndicator.Render(fmt.Sprintf("+%d", insertCount)))
+			} else {
+				indicators = append(indicators, InsertIndicator.Render("+"))
+			}
 		}
 	}
 

@@ -82,9 +82,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 				fmt.Printf("  %-20s %d %s\n", t, count, pluralize(count, "row", "rows"))
 				shown[t] = true
 			}
-			for _, t := range insertedTables {
+			for t, c := range insertedTables {
 				if !shown[t] {
-					fmt.Printf("  %-20s %s\n", t, ui.Dim("(inserts)"))
+					if c > 0 {
+						fmt.Printf("  %-20s %d %s\n", t, c, pluralize(c, "insert", "inserts"))
+					} else {
+						fmt.Printf("  %-20s %s\n", t, ui.Dim("(inserts)"))
+					}
 				}
 			}
 		} else {

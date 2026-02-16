@@ -74,13 +74,22 @@ func runInspect(cmd *cobra.Command, args []string) error {
 		count := dm.CountForTable(table)
 		pks := dm.DeltaPKs(table)
 		hasInserts := dm.HasInserts(table)
+		insertCount := dm.InsertCountForTable(table)
 		if count > 0 || hasInserts {
-			line := fmt.Sprintf("  Deltas:     %s %d modified %s",
-				ui.Yellow("~"),
-				count, pluralize(count, "row", "rows"))
-			if hasInserts {
-				line += " + inserts"
+			var parts []string
+			if count > 0 {
+				parts = append(parts, fmt.Sprintf("%d edited", count))
 			}
+			if hasInserts {
+				if insertCount > 0 {
+					parts = append(parts, fmt.Sprintf("%d inserted", insertCount))
+				} else {
+					parts = append(parts, "inserts")
+				}
+			}
+			line := fmt.Sprintf("  Edits:      %s %s",
+				ui.Yellow("~"),
+				strings.Join(parts, ", "))
 			if len(pks) > 0 {
 				display := pks
 				if len(display) > 10 {

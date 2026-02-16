@@ -14,25 +14,28 @@ func RenderSummary(innerW, innerH int, snap Snapshot, totalQueries int) string {
 
 	rows = append(rows, fmt.Sprintf(" %-*s%d", labelW, "Queries", totalQueries))
 
-	// Deltas.
-	deltaRows := 0
-	deltaTables := 0
+	// Edits (deltas + inserts).
+	editRows := 0
+	editTables := 0
 	if snap.DeltaMap != nil {
+		seen := make(map[string]bool)
 		for _, t := range snap.DeltaMap.Tables() {
 			c := snap.DeltaMap.CountForTable(t)
-			deltaRows += c
+			editRows += c
 			if c > 0 {
-				deltaTables++
+				editTables++
+				seen[t] = true
 			}
 		}
-		for _, t := range snap.DeltaMap.InsertedTablesList() {
-			if snap.DeltaMap.CountForTable(t) == 0 {
-				deltaTables++
+		for t, c := range snap.DeltaMap.InsertedTablesList() {
+			editRows += c
+			if !seen[t] {
+				editTables++
 			}
 		}
 	}
-	deltaVal := fmt.Sprintf("%d rows / %d tables", deltaRows, deltaTables)
-	rows = append(rows, DeltaStyle.Render(fmt.Sprintf(" %-*s%s", labelW, "∆ Deltas", deltaVal)))
+	editVal := fmt.Sprintf("%d rows / %d tables", editRows, editTables)
+	rows = append(rows, EditStyle.Render(fmt.Sprintf(" %-*s%s", labelW, "~ Edits", editVal)))
 
 	// Tombstones.
 	tombRows := 0
@@ -47,7 +50,7 @@ func RenderSummary(innerW, innerH int, snap Snapshot, totalQueries int) string {
 		}
 	}
 	tombVal := fmt.Sprintf("%d rows / %d tables", tombRows, tombTables)
-	rows = append(rows, TombstoneStyle.Render(fmt.Sprintf(" %-*s%s", labelW, "✗ Tombs", tombVal)))
+	rows = append(rows, DeleteStyle.Render(fmt.Sprintf(" %-*s%s", labelW, "- Deletes", tombVal)))
 
 	// Schema.
 	schemaTables := 0

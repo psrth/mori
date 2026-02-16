@@ -19,24 +19,35 @@ func RenderInspectInline(innerW, innerH int, table string, snap Snapshot) string
 		}
 	}
 
-	// Deltas.
+	// Edits + inserts.
 	if snap.DeltaMap != nil {
-		count := snap.DeltaMap.CountForTable(table)
+		editCount := snap.DeltaMap.CountForTable(table)
 		hasInserts := snap.DeltaMap.HasInserts(table)
-		if count > 0 || hasInserts {
-			label := fmt.Sprintf(" ∆ %d %s", count, ui.Pluralize(count, "row", "rows"))
-			if hasInserts {
-				label += " + inserts"
+		insertCount := snap.DeltaMap.InsertCountForTable(table)
+		if editCount > 0 || hasInserts {
+			var parts []string
+			if editCount > 0 {
+				parts = append(parts, fmt.Sprintf("%d edited", editCount))
 			}
-			rows = append(rows, DeltaStyle.Render(label))
+			if hasInserts {
+				if insertCount > 0 {
+					parts = append(parts, fmt.Sprintf("%d inserted", insertCount))
+				} else if editCount > 0 {
+					parts = append(parts, "inserts")
+				} else {
+					parts = append(parts, "inserted")
+				}
+			}
+			label := " ~ " + strings.Join(parts, ", ")
+			rows = append(rows, EditStyle.Render(label))
 		}
 	}
 
-	// Tombstones.
+	// Deletes.
 	if snap.Tombstones != nil {
 		count := snap.Tombstones.CountForTable(table)
 		if count > 0 {
-			rows = append(rows, TombstoneStyle.Render(fmt.Sprintf(" ✗ %d %s", count, ui.Pluralize(count, "row", "rows"))))
+			rows = append(rows, DeleteStyle.Render(fmt.Sprintf(" - %d deleted", count)))
 		}
 	}
 
