@@ -25,13 +25,13 @@ func (e *mariadbEngine) ID() registry.EngineID {
 }
 
 // Init overrides the MySQL Init to use a MariaDB Docker image for the shadow
-// container. MySQL 8.0's mysqldump queries COLUMN_STATISTICS which MariaDB
-// does not support, so we must use mariadb:11 for both shadow and schema dump.
+// container. The image version is auto-detected from SELECT VERSION() to match
+// production. MySQL 8.0's mysqldump queries COLUMN_STATISTICS which MariaDB
+// does not support, so we use the mariadb image for both shadow and schema dump.
 func (e *mariadbEngine) Init(ctx context.Context, opts engine.InitOptions) (*engine.InitResult, error) {
 	result, err := Init(ctx, InitOptions{
 		ProdConnStr: opts.ProdConnStr,
 		ProjectRoot: opts.ProjectRoot,
-		Image:       "mariadb:11",
 		EngineName:  "mariadb",
 	})
 	if err != nil {

@@ -132,6 +132,43 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		}
 	}
 
+	// Create a TxnHandler for transaction coordination.
+	var txh *TxnHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		txh = &TxnHandler{
+			prodConn:   prodConn,
+			shadowConn: shadowConn,
+			deltaMap:   p.deltaMap,
+			tombstones: p.tombstones,
+			moriDir:    p.moriDir,
+			connID:     connID,
+			verbose:    p.verbose,
+			logger:     p.logger,
+		}
+	}
+
+	// Create an ExtHandler for prepared statement support.
+	var exh *ExtHandler
+	if p.deltaMap != nil && p.tombstones != nil {
+		exh = &ExtHandler{
+			prodConn:     prodConn,
+			shadowConn:   shadowConn,
+			classifier:   p.classifier,
+			router:       p.router,
+			deltaMap:     p.deltaMap,
+			tombstones:   p.tombstones,
+			tables:       p.tables,
+			moriDir:      p.moriDir,
+			connID:       connID,
+			verbose:      p.verbose,
+			logger:       p.logger,
+			txnHandler:   txh,
+			writeHandler: wh,
+			readHandler:  rh,
+			stmtCache:    make(map[string]stmtCacheEntry),
+		}
+	}
+
 	for {
 		pkt, err := readMySQLPacket(clientConn)
 		if err != nil {
@@ -177,8 +214,18 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		}
 
 		// COM_STMT_PREPARE, COM_STMT_EXECUTE, COM_STMT_CLOSE:
-		// Pass through to prod for v1. (Prepared statement support is a future enhancement.)
+		// Route through ExtHandler for classified routing of prepared statements.
 		if cmd == comStmtPrepare || cmd == comStmtExecute || cmd == comStmtClose {
+			if exh != nil {
+				if err := exh.HandleCommand(clientConn, pkt, cmd); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] ext handler error: %v", connID, err)
+					}
+					return
+				}
+				continue
+			}
+			// Fallback: forward to prod.
 			if err := forwardAndRelay(pkt.Raw, prodConn, clientConn); err != nil {
 				if p.verbose {
 					log.Printf("[conn %d] prepared stmt relay error: %v", connID, err)
@@ -193,17 +240,38 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			sql := extractQuerySQL(pkt.Payload)
 			decision := p.classifyAndRoute(sql, connID)
 
+			// Dispatch transaction control to TxnHandler when available.
+			if txh != nil && decision.classification != nil && decision.strategy == core.StrategyTransaction {
+				if err := txh.HandleTxn(clientConn, pkt.Raw, decision.classification); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] txn handler error: %v", connID, err)
+					}
+					return
+				}
+				continue
+			}
+
 			// Dispatch write strategies to WriteHandler when available.
+			// Inside a transaction, use Stage instead of Add for delta tracking.
 			if wh != nil && decision.classification != nil {
 				switch decision.strategy {
 				case core.StrategyShadowWrite,
 					core.StrategyHydrateAndWrite,
 					core.StrategyShadowDelete:
-					if err := wh.HandleWrite(clientConn, pkt.Raw, decision.classification, decision.strategy); err != nil {
-						if p.verbose {
-							log.Printf("[conn %d] write handler error: %v", connID, err)
+					if txh != nil && txh.InTxn() {
+						if err := handleTxnWrite(wh, txh, clientConn, pkt.Raw, decision.classification, decision.strategy); err != nil {
+							if p.verbose {
+								log.Printf("[conn %d] txn write handler error: %v", connID, err)
+							}
+							return
 						}
-						return
+					} else {
+						if err := wh.HandleWrite(clientConn, pkt.Raw, decision.classification, decision.strategy); err != nil {
+							if p.verbose {
+								log.Printf("[conn %d] write handler error: %v", connID, err)
+							}
+							return
+						}
 					}
 					continue
 				}
@@ -287,6 +355,63 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			return
 		}
 	}
+}
+
+// handleTxnWrite wraps WriteHandler to use staging (Stage) instead of Add
+// when inside a transaction. The staged deltas are promoted on COMMIT or
+// discarded on ROLLBACK by TxnHandler.
+func handleTxnWrite(
+	wh *WriteHandler,
+	txh *TxnHandler,
+	clientConn net.Conn,
+	rawPkt []byte,
+	cl *core.Classification,
+	strategy core.RoutingStrategy,
+) error {
+	// For inserts: forward to shadow, mark inserted (inserts don't need staging).
+	if strategy == core.StrategyShadowWrite {
+		if err := forwardAndRelay(rawPkt, wh.shadowConn, clientConn); err != nil {
+			return err
+		}
+		for _, table := range cl.Tables {
+			wh.deltaMap.MarkInserted(table)
+		}
+		return nil
+	}
+
+	// For updates: hydrate, forward, then stage.
+	if strategy == core.StrategyHydrateAndWrite {
+		for _, pk := range cl.PKs {
+			if wh.deltaMap.IsDelta(pk.Table, pk.PK) {
+				continue
+			}
+			if err := wh.hydrateRow(pk.Table, pk.PK); err != nil {
+				if wh.verbose {
+					log.Printf("[conn %d] txn hydration failed for (%s, %s): %v", wh.connID, pk.Table, pk.PK, err)
+				}
+			}
+		}
+		if err := forwardAndRelay(rawPkt, wh.shadowConn, clientConn); err != nil {
+			return err
+		}
+		for _, pk := range cl.PKs {
+			wh.deltaMap.Stage(pk.Table, pk.PK)
+		}
+		return nil
+	}
+
+	// For deletes: forward, then stage tombstones.
+	if strategy == core.StrategyShadowDelete {
+		if err := forwardAndRelay(rawPkt, wh.shadowConn, clientConn); err != nil {
+			return err
+		}
+		for _, pk := range cl.PKs {
+			wh.tombstones.Stage(pk.Table, pk.PK)
+		}
+		return nil
+	}
+
+	return wh.HandleWrite(clientConn, rawPkt, cl, strategy)
 }
 
 // classifyAndRoute determines which backend should handle a query.

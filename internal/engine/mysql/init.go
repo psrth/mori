@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -56,10 +57,10 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 	fmt.Printf("  MySQL %s detected\n", versionStr)
 
-	// 4. Docker image — default to mysql:8.0, allow override for MariaDB.
+	// 4. Docker image — match production version, allow override.
 	imageName := opts.Image
 	if imageName == "" {
-		imageName = "mysql:8.0"
+		imageName = matchDockerImage(versionStr, opts.EngineName)
 	}
 
 	// 5. Set up Docker container.
@@ -195,4 +196,59 @@ func engineName(override string) string {
 		return override
 	}
 	return "mysql"
+}
+
+// matchDockerImage selects a Docker image tag that matches the production
+// MySQL/MariaDB version. For example, "8.0.35-0ubuntu0.22.04.1" -> "mysql:8.0"
+// and "10.11.6-MariaDB" -> "mariadb:10.11".
+func matchDockerImage(versionStr, engine string) string {
+	versionStr = strings.TrimSpace(versionStr)
+	lower := strings.ToLower(versionStr)
+
+	// Detect MariaDB from version string (e.g., "10.11.6-MariaDB-1:10.11.6+maria~ubu2204").
+	if strings.Contains(lower, "mariadb") || engine == "mariadb" {
+		major, minor := parseMajorMinor(versionStr)
+		if major > 0 {
+			return fmt.Sprintf("mariadb:%d.%d", major, minor)
+		}
+		return "mariadb:11"
+	}
+
+	// MySQL: parse major.minor.
+	major, minor := parseMajorMinor(versionStr)
+	if major > 0 {
+		return fmt.Sprintf("mysql:%d.%d", major, minor)
+	}
+	return "mysql:8.0"
+}
+
+// parseMajorMinor extracts the major and minor version numbers from a version string.
+func parseMajorMinor(version string) (int, int) {
+	// Strip leading non-digit characters.
+	start := 0
+	for start < len(version) && (version[start] < '0' || version[start] > '9') {
+		start++
+	}
+	version = version[start:]
+
+	parts := strings.SplitN(version, ".", 3)
+	if len(parts) < 2 {
+		return 0, 0
+	}
+
+	major := parseDigits(parts[0])
+	minor := parseDigits(parts[1])
+	return major, minor
+}
+
+// parseDigits extracts a leading integer from a string.
+func parseDigits(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			break
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
