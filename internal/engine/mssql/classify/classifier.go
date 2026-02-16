@@ -83,9 +83,14 @@ func (c *MSSQLClassifier) Classify(query string) (*core.Classification, error) {
 		hasPrefix(upper, "EXEC"), hasPrefix(upper, "EXECUTE"),
 		hasPrefix(upper, "DECLARE"), hasPrefix(upper, "USE"),
 		hasPrefix(upper, "DBCC"), hasPrefix(upper, "WAITFOR"),
-		hasPrefix(upper, "RAISERROR"), hasPrefix(upper, "THROW"):
+		hasPrefix(upper, "RAISERROR"), hasPrefix(upper, "THROW"),
+		hasPrefix(upper, "GRANT"), hasPrefix(upper, "REVOKE"),
+		hasPrefix(upper, "DENY"):
 		cl.OpType = core.OpOther
 		cl.SubType = core.SubOther
+	case hasPrefix(upper, "IF"):
+		// T-SQL IF ... can contain any statement. Classify based on body.
+		c.classifyConditional(trimmed, upper, cl)
 	case hasPrefix(upper, "WITH"):
 		c.classifyCTE(trimmed, upper, cl)
 	default:
@@ -153,9 +158,21 @@ func (c *MSSQLClassifier) classifySelect(raw, upper string, cl *core.Classificat
 	// Detect set operations.
 	cl.HasSetOp = reSetOp.MatchString(upper)
 
-	// Detect complex reads (subqueries in FROM).
+	// Detect window functions (ROW_NUMBER, RANK, etc.).
+	if reWindowFunc.MatchString(upper) {
+		cl.IsComplexRead = true
+	}
+
+	// Detect complex reads (subqueries in FROM, PIVOT, UNPIVOT, APPLY).
 	if reSubqueryFrom.MatchString(upper) {
 		cl.IsComplexRead = true
+	}
+	if rePivot.MatchString(upper) {
+		cl.IsComplexRead = true
+	}
+	if reApply.MatchString(upper) {
+		cl.IsComplexRead = true
+		cl.IsJoin = true
 	}
 
 	// Extract PKs from WHERE clause.
@@ -263,6 +280,25 @@ func (c *MSSQLClassifier) classifyCTE(raw, upper string, cl *core.Classification
 	cl.IsComplexRead = true
 }
 
+func (c *MSSQLClassifier) classifyConditional(raw, upper string, cl *core.Classification) {
+	// T-SQL IF ... can wrap any statement. Detect writes within the body.
+	if strings.Contains(upper, "INSERT") ||
+		strings.Contains(upper, "UPDATE") ||
+		strings.Contains(upper, "DELETE") ||
+		strings.Contains(upper, "MERGE") ||
+		strings.Contains(upper, "CREATE") ||
+		strings.Contains(upper, "ALTER") ||
+		strings.Contains(upper, "DROP") ||
+		strings.Contains(upper, "TRUNCATE") {
+		cl.OpType = core.OpWrite
+		cl.SubType = core.SubOther
+		cl.Tables = extractFromTables(upper)
+	} else {
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubOther
+	}
+}
+
 // extractPKs extracts primary key values from WHERE clauses.
 func (c *MSSQLClassifier) extractPKs(raw string, tables []string) []core.TablePK {
 	var pks []core.TablePK
@@ -307,9 +343,12 @@ var (
 	reJoin         = regexp.MustCompile(`(?i)\b(INNER|LEFT|RIGHT|CROSS|FULL|OUTER)\s+JOIN\b`)
 	reTop          = regexp.MustCompile(`(?i)\bTOP\s*\(?(\d+)\)?`)
 	reFetch        = regexp.MustCompile(`(?i)\bFETCH\s+(?:NEXT|FIRST)\s+(\d+)\s+ROWS?\s+ONLY`)
-	reAggregate    = regexp.MustCompile(`(?i)\b(COUNT|SUM|AVG|MIN|MAX|STRING_AGG|CHECKSUM_AGG)\s*\(`)
+	reAggregate    = regexp.MustCompile(`(?i)\b(COUNT|SUM|AVG|MIN|MAX|STRING_AGG|CHECKSUM_AGG|STDEV|STDEVP|VAR|VARP|COUNT_BIG)\s*\(`)
 	reSetOp        = regexp.MustCompile(`(?i)\b(UNION|INTERSECT|EXCEPT)\b`)
 	reSubqueryFrom = regexp.MustCompile(`(?i)\bFROM\s*\(`)
+	reWindowFunc   = regexp.MustCompile(`(?i)\b(ROW_NUMBER|RANK|DENSE_RANK|NTILE|LAG|LEAD|FIRST_VALUE|LAST_VALUE)\s*\(`)
+	rePivot        = regexp.MustCompile(`(?i)\b(PIVOT|UNPIVOT)\b`)
+	reApply        = regexp.MustCompile(`(?i)\b(CROSS|OUTER)\s+APPLY\b`)
 
 	reInsertTable  = regexp.MustCompile(`(?i)INSERT\s+INTO\s+` + tablePattern)
 	reMergeTable   = regexp.MustCompile(`(?i)MERGE\s+(?:INTO\s+)?` + tablePattern)
