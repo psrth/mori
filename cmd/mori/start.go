@@ -21,9 +21,11 @@ import (
 	"github.com/mori-dev/mori/internal/logging"
 	morimcp "github.com/mori-dev/mori/internal/mcp"
 	"github.com/mori-dev/mori/internal/registry"
+	"github.com/mori-dev/mori/internal/tunnel"
 	"github.com/spf13/cobra"
 
 	// Register engine implementations via side-effect imports.
+	_ "github.com/mori-dev/mori/internal/tunnel/tunnels"
 	_ "github.com/mori-dev/mori/internal/engine/firestore"
 	_ "github.com/mori-dev/mori/internal/engine/mssql"
 	_ "github.com/mori-dev/mori/internal/engine/mysql"
@@ -106,6 +108,32 @@ func runStart(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("connection %q is currently active — run 'mori stop' first, then 'mori start %s'",
 				cfg.ActiveConnection, connName)
 		}
+	}
+
+	// 5.5 Start tunnel if configured.
+	var tunnelMgr *tunnel.Manager
+	if conn.Tunnel != nil {
+		tunnelMgr, err = tunnel.NewManager(conn.Tunnel)
+		if err != nil {
+			return fmt.Errorf("tunnel setup failed: %w", err)
+		}
+	}
+	if tunnelMgr != nil {
+		fmt.Printf("  Starting %s...\n", tunnelMgr.DisplayName())
+		if err := tunnelMgr.Start(cmd.Context()); err != nil {
+			return fmt.Errorf("failed to start tunnel: %w", err)
+		}
+		fmt.Printf("  Tunnel ready on %s\n", tunnelMgr.LocalAddr())
+
+		// Write tunnel PID file for stop command.
+		tunnelPidPath := config.TunnelPidFilePath(projectRoot)
+		if err := os.WriteFile(tunnelPidPath, []byte(strconv.Itoa(tunnelMgr.PID())), 0644); err != nil {
+			log.Printf("Warning: could not write tunnel PID file: %v", err)
+		}
+
+		// Rewrite connection to go through the tunnel.
+		conn.Host = "127.0.0.1"
+		conn.Port = tunnelMgr.LocalPort()
 	}
 
 	// 6. If no runtime config exists, run the engine init (first start).
@@ -253,6 +281,20 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
+	// Monitor tunnel health if active.
+	if tunnelMgr != nil {
+		go func() {
+			select {
+			case err := <-tunnelMgr.Done():
+				if err != nil && ctx.Err() == nil {
+					fmt.Printf("\n  WARNING: Tunnel died unexpectedly: %v\n", err)
+					fmt.Println("  Database connections may fail. Restart with 'mori stop && mori start'.")
+				}
+			case <-ctx.Done():
+			}
+		}()
+	}
+
 	fmt.Printf("Mori proxy started on 127.0.0.1:%d → %s [%s]\n", port, prodAddr, connName)
 	fmt.Printf("  Prod:   %s\n", cfg.RedactedProdConnection())
 	fmt.Printf("  Shadow: %s\n", shadowAddr)
@@ -288,7 +330,16 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("Shutdown timeout: %v", err)
 	}
 
-	// 22. Remove PID file.
+	// 22. Stop tunnel if active.
+	if tunnelMgr != nil {
+		fmt.Printf("Stopping tunnel (PID %d)...\n", tunnelMgr.PID())
+		if err := tunnelMgr.Stop(); err != nil {
+			log.Printf("Warning: failed to stop tunnel: %v", err)
+		}
+		os.Remove(config.TunnelPidFilePath(projectRoot))
+	}
+
+	// 23. Remove PID file.
 	os.Remove(pidPath)
 	fmt.Printf("Mori proxy stopped [%s].\n", connName)
 

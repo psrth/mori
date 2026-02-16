@@ -10,6 +10,10 @@ import (
 	"github.com/mori-dev/mori/internal/auth"
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/registry"
+	"github.com/mori-dev/mori/internal/tunnel"
+
+	// Register tunnel implementations via side-effect imports.
+	_ "github.com/mori-dev/mori/internal/tunnel/tunnels"
 )
 
 // nameRe validates connection names: lowercase alphanumeric + hyphens, 1-40 chars.
@@ -59,7 +63,69 @@ func runInteractiveInit(projectRoot string, existingCfg *config.ProjectConfig) e
 		return err
 	}
 
-	// ── Step 3: Collect connection fields ────────────────────────
+	// ── Step 3: How do you connect? ─────────────────────────────
+	var tunnelCfg *config.TunnelConfig
+
+	connectivityOpts := tunnel.ConnectivityOptionsFor(
+		registry.EngineID(engineID),
+		registry.ProviderID(providerID),
+	)
+
+	// Only show the picker if there are tunnel options beyond "Public IP".
+	if len(connectivityOpts) > 1 {
+		var selectedTunnelType string
+		var tunnelOptions []huh.Option[string]
+		for _, opt := range connectivityOpts {
+			tunnelOptions = append(tunnelOptions, huh.NewOption(opt.Label, opt.TunnelType))
+		}
+
+		err = huh.NewForm(
+			huh.NewGroup(
+				huh.NewSelect[string]().
+					Title("How do you connect?").
+					Options(tunnelOptions...).
+					Value(&selectedTunnelType),
+			),
+		).Run()
+		if err != nil {
+			return err
+		}
+
+		// ── Step 3b: Tunnel-specific fields ─────────────────────
+		if selectedTunnelType != "" && selectedTunnelType != "none" {
+			t, ok := tunnel.Lookup(selectedTunnelType)
+			if !ok {
+				return fmt.Errorf("unknown tunnel type: %s", selectedTunnelType)
+			}
+
+			tunnelFields := t.Fields()
+			tunnelPtrs := make([]*string, len(tunnelFields))
+			for i, f := range tunnelFields {
+				v := f.Default
+				tunnelPtrs[i] = &v
+			}
+
+			tunnelGroup := buildTunnelFieldInputs(tunnelFields, tunnelPtrs)
+			err = huh.NewForm(tunnelGroup).Run()
+			if err != nil {
+				return err
+			}
+
+			params := make(map[string]string)
+			for i, f := range tunnelFields {
+				if *tunnelPtrs[i] != "" {
+					params[f.Key] = *tunnelPtrs[i]
+				}
+			}
+
+			tunnelCfg = &config.TunnelConfig{
+				Type:   selectedTunnelType,
+				Params: params,
+			}
+		}
+	}
+
+	// ── Step 4: Collect connection fields ────────────────────────
 	authProvider := auth.Lookup(registry.ProviderID(providerID))
 	fields := authProvider.Fields(registry.EngineID(engineID))
 	if fields == nil {
@@ -88,7 +154,7 @@ func runInteractiveInit(projectRoot string, existingCfg *config.ProjectConfig) e
 		values[f.Key] = *fieldPtrs[i]
 	}
 
-	// ── Step 4: Connection name ──────────────────────────────────
+	// ── Step 5: Connection name ──────────────────────────────────
 	var connName string
 	err = huh.NewForm(
 		huh.NewGroup(
@@ -114,8 +180,9 @@ func runInteractiveInit(projectRoot string, existingCfg *config.ProjectConfig) e
 		return err
 	}
 
-	// ── Step 5: Build and save connection ────────────────────────
+	// ── Step 6: Build and save connection ────────────────────────
 	conn := buildConnection(engineID, providerID, fields, values)
+	conn.Tunnel = tunnelCfg
 
 	if existingCfg == nil {
 		existingCfg = config.NewProjectConfig()
@@ -138,6 +205,11 @@ func runInteractiveInit(projectRoot string, existingCfg *config.ProjectConfig) e
 	}
 	if conn.Database != "" {
 		fmt.Printf("    Database: %s\n", conn.Database)
+	}
+	if conn.Tunnel != nil {
+		if t, ok := tunnel.Lookup(conn.Tunnel.Type); ok {
+			fmt.Printf("    Tunnel:   %s\n", t.DisplayName())
+		}
 	}
 	fmt.Println()
 	if engine.Supported {
@@ -188,6 +260,29 @@ func buildProviderOptions(engineID registry.EngineID) []huh.Option[string] {
 // buildFieldInputs creates a huh group with text inputs for each connection field.
 // fieldPtrs must be pre-allocated string pointers, one per field.
 func buildFieldInputs(fields []registry.ConnectionField, fieldPtrs []*string) *huh.Group {
+	var huhFields []huh.Field
+
+	for i, f := range fields {
+		input := huh.NewInput().
+			Title(f.Label).
+			Placeholder(f.Placeholder).
+			Value(fieldPtrs[i])
+
+		if f.Sensitive {
+			input = input.EchoMode(huh.EchoModePassword)
+		}
+		if f.Validate != nil {
+			input = input.Validate(f.Validate)
+		}
+
+		huhFields = append(huhFields, input)
+	}
+
+	return huh.NewGroup(huhFields...)
+}
+
+// buildTunnelFieldInputs creates a huh group with text inputs for each tunnel field.
+func buildTunnelFieldInputs(fields []tunnel.Field, fieldPtrs []*string) *huh.Group {
 	var huhFields []huh.Field
 
 	for i, f := range fields {

@@ -89,13 +89,44 @@ func runStop(cmd *cobra.Command, args []string) error {
 		case <-ticker.C:
 			if _, err := os.Stat(pidPath); os.IsNotExist(err) {
 				fmt.Println("Mori proxy stopped.")
+				stopTunnelIfRunning(projectRoot)
 				return nil
 			}
 			if err := process.Signal(syscall.Signal(0)); err != nil {
 				os.Remove(pidPath)
 				fmt.Println("Mori proxy stopped.")
+				stopTunnelIfRunning(projectRoot)
 				return nil
 			}
 		}
+	}
+}
+
+// stopTunnelIfRunning kills the tunnel subprocess if a tunnel PID file exists.
+func stopTunnelIfRunning(projectRoot string) {
+	tunnelPidPath := config.TunnelPidFilePath(projectRoot)
+	data, err := os.ReadFile(tunnelPidPath)
+	if err != nil {
+		return
+	}
+	defer os.Remove(tunnelPidPath)
+
+	tunnelPid, err := strconv.Atoi(string(data))
+	if err != nil {
+		return
+	}
+	process, err := os.FindProcess(tunnelPid)
+	if err != nil {
+		return
+	}
+	if err := process.Signal(syscall.Signal(0)); err != nil {
+		return // already dead
+	}
+	fmt.Printf("Stopping tunnel (PID %d)...\n", tunnelPid)
+	_ = process.Signal(syscall.SIGTERM)
+	time.Sleep(2 * time.Second)
+	// Force kill if still running.
+	if err := process.Signal(syscall.Signal(0)); err == nil {
+		_ = process.Kill()
 	}
 }

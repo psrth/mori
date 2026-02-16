@@ -16,6 +16,8 @@ const (
 	ConfigFile = "config.json"
 	// PidFile is the name of the proxy PID file.
 	PidFile = "proxy.pid"
+	// TunnelPidFile is the name of the tunnel PID file.
+	TunnelPidFile = "tunnel.pid"
 	// LogDir is the subdirectory for log files within .mori/.
 	LogDir = "log"
 	// LogFile is the name of the structured query log file.
@@ -50,6 +52,11 @@ func ConfigFilePath(projectRoot string) string {
 // PidFilePath returns the absolute path to the proxy PID file.
 func PidFilePath(projectRoot string) string {
 	return filepath.Join(projectRoot, MoriDir, PidFile)
+}
+
+// TunnelPidFilePath returns the absolute path to the tunnel PID file.
+func TunnelPidFilePath(projectRoot string) string {
+	return filepath.Join(projectRoot, MoriDir, TunnelPidFile)
 }
 
 // LogFilePath returns the absolute path to the structured query log file.
