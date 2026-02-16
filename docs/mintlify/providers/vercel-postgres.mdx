@@ -1,0 +1,28 @@
+---
+title: "Vercel Postgres"
+description: "Connect Mori to Vercel Postgres (powered by Neon)."
+sidebarTitle: "Vercel Postgres"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `vercel-postgres` |
+| Compatible Engines | PostgreSQL |
+| SSL Default | `require` |
+
+## Connection
+
+Vercel Postgres is powered by Neon. You can either paste the full connection URL or provide individual fields. SSL is enforced automatically.
+
+```bash
+# Using the connection URL from Vercel dashboard
+mori init --from "postgres://user:pass@ep-something.us-east-1.aws.neon.tech:5432/verceldb?sslmode=require"
+```
+
+<Tip>
+Copy the `POSTGRES_URL` from your Vercel project's environment variables. Mori accepts the URL directly via `--from`.
+</Tip>
+
+The provider also supports a `connection_url` extra field for the full URL when using the interactive wizard.

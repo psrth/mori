@@ -1,0 +1,51 @@
+---
+title: "AWS RDS / Aurora"
+description: "Connect Mori to AWS RDS and Aurora databases."
+sidebarTitle: "AWS RDS"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `aws-rds` |
+| Compatible Engines | PostgreSQL, MySQL, MariaDB, MSSQL |
+| SSL Default | `require` |
+| Auth | Password or AWS IAM token |
+
+## Connection
+
+### With Password
+
+Provide host, user, and password. SSL is enforced automatically.
+
+```bash
+mori init --from "postgres://user:pass@mydb.abc123.us-east-1.rds.amazonaws.com:5432/mydb"
+```
+
+### With IAM Authentication
+
+If you omit the password, Mori generates an IAM auth token via the AWS CLI:
+
+```bash
+aws rds generate-db-auth-token --hostname <host> --port <port> --region <region> --username <user>
+```
+
+This requires:
+
+1. AWS CLI installed and configured (`aws configure`)
+2. IAM policy granting `rds-db:connect`
+
+## Extra Fields
+
+| Field | Description | Example |
+|-------|-------------|---------|
+| `aws_region` | AWS region (required for IAM auth) | `us-east-1` |
+
+<Note>
+The `aws_region` field is only required when using IAM authentication (no password). If you provide a password, the region is not needed.
+</Note>
+
+## Host Placeholder
+
+`mydb.abc123.us-east-1.rds.amazonaws.com`

@@ -1,0 +1,29 @@
+---
+title: "Supabase"
+description: "Connect Mori to Supabase PostgreSQL."
+sidebarTitle: "Supabase"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `supabase` |
+| Compatible Engines | PostgreSQL |
+| SSL Default | `require` |
+
+## Connection
+
+Supabase provides managed PostgreSQL. SSL is enforced automatically. Default database is `postgres`.
+
+```bash
+mori init --from "postgres://postgres:pass@db.abcdefghijklmnop.supabase.co:5432/postgres?sslmode=require"
+```
+
+<Tip>
+Find your connection string in the Supabase dashboard under Settings > Database. Use the "Direct" connection string (not the pooled one via PgBouncer) for best results with Mori.
+</Tip>
+
+## Host Placeholder
+
+`db.abcdefghijklmnop.supabase.co`

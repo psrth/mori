@@ -1,12 +1,5 @@
 "use client";
 
-import Image from "next/image";
-import {
-  Accordion,
-  AccordionContent,
-  AccordionItem,
-  AccordionTrigger,
-} from "@/components/ui/accordion";
 import { FadeIn } from "./fade-in";
 
 const features = [
@@ -52,46 +45,22 @@ export function Features() {
           </h2>
         </FadeIn>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-12">
-          <FadeIn delay={0.1}>
-            <Accordion type="single" collapsible defaultValue="item-0">
-              {features.map((feature, i) => (
-                <AccordionItem
-                  key={feature.number}
-                  value={`item-${i}`}
-                  className="border-white/10"
-                >
-                  <AccordionTrigger className="hover:no-underline py-5">
-                    <div className="flex items-center gap-4">
-                      <span className="font-[family-name:var(--font-dm-mono)] text-brand-purple text-sm tracking-[-0.02em]">
-                        {feature.number}
-                      </span>
-                      <span className="font-[family-name:var(--font-manrope)] font-bold text-header-white text-base tracking-[-0.03em]">
-                        {feature.title}
-                      </span>
-                    </div>
-                  </AccordionTrigger>
-                  <AccordionContent>
-                    <p className="font-[family-name:var(--font-inter)] text-card-white/70 text-sm leading-relaxed tracking-[-0.01em] pl-12">
-                      {feature.description}
-                    </p>
-                  </AccordionContent>
-                </AccordionItem>
-              ))}
-            </Accordion>
-          </FadeIn>
-
-          <FadeIn delay={0.2} className="hidden lg:block">
-            <div className="lg:sticky lg:top-24">
-              <Image
-                src="/images/feature-0.png"
-                alt="mori feature preview"
-                width={600}
-                height={500}
-                className="w-full rounded-xl"
-              />
-            </div>
-          </FadeIn>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {features.map((feature, i) => (
+            <FadeIn key={feature.number} delay={0.1 + i * 0.05}>
+              <div className="bg-card-gray border border-card-white/10 rounded-xl p-6 h-full hover:border-card-white/20 transition-colors">
+                <span className="font-[family-name:var(--font-dm-mono)] text-brand-purple text-sm tracking-[-0.02em]">
+                  {feature.number}
+                </span>
+                <h3 className="font-[family-name:var(--font-manrope)] font-bold text-header-white text-base tracking-[-0.03em] mt-3">
+                  {feature.title}
+                </h3>
+                <p className="font-[family-name:var(--font-inter)] text-card-white/70 text-sm leading-relaxed tracking-[-0.01em] mt-3">
+                  {feature.description}
+                </p>
+              </div>
+            </FadeIn>
+          ))}
         </div>
       </div>
     </section>

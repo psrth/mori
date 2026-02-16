@@ -1,0 +1,77 @@
+---
+title: "SQLite"
+description: "SQLite engine implementation in Mori."
+sidebarTitle: "SQLite"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `sqlite` |
+| Wire Protocol | pgwire (exposed by Mori) |
+| Default Port | N/A (embedded) |
+| Status | Supported |
+| Classifier | Regex-based |
+| Shadow | Local file copy |
+
+SQLite is an embedded database with no server process. Mori exposes it over the pgwire protocol so your application can connect using any PostgreSQL driver. The shadow is a file-level copy of the production database -- no Docker container needed.
+
+## Connection Parameters
+
+| Field | Description |
+|-------|------------|
+| `file_path` | Path to the SQLite database file |
+
+## Implementation Details
+
+### Query Classification
+
+Uses regex-based classification for SQLite SQL. Handles:
+
+- Standard DML (SELECT, INSERT, UPDATE, DELETE)
+- SQLite-specific constructs (UPSERT via `ON CONFLICT`, `REPLACE INTO`)
+- DDL (CREATE, ALTER, DROP)
+- Transaction control (BEGIN, COMMIT, ROLLBACK)
+- PRAGMA statements
+
+### Shadow Strategy
+
+The shadow is a local file copy of the production SQLite database, stored at `.mori/shadow.db`. No Docker container is required.
+
+During `mori init`:
+1. The prod database file is copied to `.mori/shadow.db`
+2. Table metadata (PKs, types) is extracted and persisted
+
+<Note>
+Since both prod and shadow are local files, this engine is ideal for development and testing workflows where the database is a single file on disk.
+</Note>
+
+### pgwire Exposure
+
+SQLite doesn't have a network protocol. Mori opens both the prod and shadow SQLite files directly and exposes them through a pgwire listener. Applications connect with a PostgreSQL client library and issue SQL normally.
+
+### Extended Query Protocol
+
+Supports the pgwire extended query protocol (Parse/Bind/Execute) for prepared statement workflows.
+
+## Example Usage
+
+```bash
+# Initialize with a SQLite file
+mori init --from "/path/to/prod.db"
+
+# Start the proxy (exposes SQLite over pgwire)
+mori start
+
+# Connect with psql or any PostgreSQL driver
+psql "postgres://localhost:5432/main"
+```
+
+## Known Limitations
+
+<Warning>
+**Transaction COMMIT discards shadow writes** -- `BEGIN; INSERT ...; COMMIT` fails with "staged deltas discarded". The pgwire proxy doesn't properly persist shadow deltas when writes happen inside explicit transaction blocks.
+
+Workaround: Use auto-commit writes (the default path) instead of explicit `BEGIN`/`COMMIT` blocks.
+</Warning>

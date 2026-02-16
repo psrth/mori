@@ -1,0 +1,43 @@
+---
+title: "Firebase / Firestore"
+description: "Connect Mori to Google Cloud Firestore via Firebase."
+sidebarTitle: "Firebase"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `firebase` |
+| Compatible Engines | Firestore |
+| SSL Default | N/A (gRPC with TLS) |
+
+## Connection
+
+Firebase connects Mori to Google Cloud Firestore. You provide a GCP project ID and optionally a service account credentials file.
+
+## Fields
+
+| Field | Description | Required |
+|-------|-------------|----------|
+| `project_id` | GCP Project ID | Yes |
+| `credentials_file` | Path to service account JSON | No (uses default credentials if omitted) |
+
+The provider generates a connection string in the format:
+```
+firestore://<project_id>?credentials=<path>
+```
+
+## Example
+
+```bash
+# With credentials file
+mori init --from "firestore://my-project?credentials=./service-account.json"
+
+# Using default application credentials (ADC)
+mori init --from "firestore://my-project"
+```
+
+<Tip>
+If you have `GOOGLE_APPLICATION_CREDENTIALS` set in your environment, you can omit the `credentials_file` field and Mori will use Application Default Credentials.
+</Tip>

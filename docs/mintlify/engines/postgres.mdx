@@ -1,0 +1,82 @@
+---
+title: "PostgreSQL"
+description: "PostgreSQL engine implementation in Mori."
+sidebarTitle: "PostgreSQL"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `postgres` |
+| Wire Protocol | pgwire (PostgreSQL v3) |
+| Default Port | 5432 |
+| Status | **Stable** |
+| Classifier | AST-based (`pg_query_go`) |
+| Shadow | Docker container (version-matched) |
+
+PostgreSQL is Mori's most mature engine. The proxy implements the full pgwire v3 protocol, including the extended query protocol (Parse/Bind/Describe/Execute), COPY operations, and SSL/TLS negotiation.
+
+## Connection Parameters
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `host` | Database host | -- |
+| `port` | Database port | `5432` |
+| `user` | Username | -- |
+| `password` | Password | -- |
+| `database` | Database name | -- |
+| `ssl_mode` | SSL mode (`disable`, `require`, `verify-ca`, `verify-full`) | `disable` |
+
+## Implementation Details
+
+### Query Classification
+
+Uses `pg_query_go` (based on PostgreSQL's actual parser) for full AST-based classification. This means every valid PostgreSQL SQL statement is correctly parsed -- including:
+
+- SELECT, INSERT, UPDATE, DELETE with full WHERE clause PK extraction
+- JOINs, subqueries, CTEs (including mutating CTEs)
+- SET operations (UNION, INTERSECT, EXCEPT)
+- DDL (CREATE, ALTER, DROP, RENAME)
+- Transaction control (BEGIN, COMMIT, ROLLBACK)
+- Aggregates and window functions
+- Extended query protocol with parameterized queries (`$1`, `$2`)
+
+### Shadow Strategy
+
+Mori spins up a Docker container running the same PostgreSQL major version as your production database. The version is auto-detected during `mori init` from the server version string.
+
+- Image: `postgres:<major>.<minor>` (matched to prod)
+- Schema is dumped from prod and replayed on the shadow
+- Sequences are offset to avoid PK collisions with prod
+- Extensions are replicated
+
+### Extended Query Protocol
+
+Full support for the Parse/Bind/Describe/Execute message flow. Parameterized queries (`$1`, `$2`, ...) are resolved against bound parameter values for accurate PK extraction and routing.
+
+### Special Features
+
+- Full transaction support (BEGIN/COMMIT/ROLLBACK)
+- DDL tracking via schema registry (CREATE TABLE, ALTER TABLE, etc.)
+- COPY protocol support
+- Write guard mode (block all writes)
+
+## Example Usage
+
+```bash
+# Initialize with a connection string
+mori init --from "postgres://user:pass@prod-host:5432/mydb?sslmode=require"
+
+# Start the proxy (listens on the same port as your engine default)
+mori start
+
+# Connect your app to the proxy
+psql "postgres://user:pass@127.0.0.1:5432/mydb"
+```
+
+## Known Limitations
+
+<Note>
+PostgreSQL has **zero known limitations**. All E2E tests pass without skips.
+</Note>

@@ -1,0 +1,29 @@
+---
+title: "Neon"
+description: "Connect Mori to Neon serverless PostgreSQL."
+sidebarTitle: "Neon"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `neon` |
+| Compatible Engines | PostgreSQL |
+| SSL Default | `require` |
+
+## Connection
+
+Neon provides serverless PostgreSQL. SSL is enforced automatically. Default database is `neondb` and default user is `neondb_owner`.
+
+```bash
+mori init --from "postgres://neondb_owner:pass@ep-cool-darkness-123456.us-east-2.aws.neon.tech:5432/neondb?sslmode=require"
+```
+
+<Tip>
+Copy the connection string directly from the Neon dashboard. Mori auto-detects Neon as the provider and configures SSL.
+</Tip>
+
+## Host Placeholder
+
+`ep-cool-darkness-123456.us-east-2.aws.neon.tech`

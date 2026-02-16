@@ -4,30 +4,39 @@ description: "Database virtualization with copy-on-write semantics."
 sidebarTitle: "Introduction"
 ---
 
-Mori is a transparent proxy that sits between your application and a production database. Your application connects to Mori using a standard database driver — same wire protocol, no code changes beyond swapping a connection string.
+Mori is a transparent proxy that sits between your application and a production database. Your application connects to Mori using a standard database driver -- same wire protocol, no code changes beyond swapping a connection string.
 
-Reads are served from the real production database. Writes are captured in a local database instance (the **Shadow**) that starts as a schema-only clone of production.
+**Reads** are served from the real production database. **Writes** are captured in a local database instance (the **Shadow**) that starts as a schema-only clone of production.
 
-The result: developers test against real production data, mutate freely, and never risk the production database. Break something, reset, start over.
+The result: developers and AI agents test against real production data, mutate freely, and never risk the production database. Break something, reset, start over.
+
+## Why Mori
+
+- **Real data, zero risk** -- Query live production data. All writes are isolated in a local shadow database.
+- **No code changes** -- Same wire protocol, same driver. Swap one connection string.
+- **9 engines** -- PostgreSQL, CockroachDB, MySQL, MariaDB, MSSQL, SQLite, DuckDB, Redis, Firestore.
+- **14 auth providers** -- AWS RDS, GCP Cloud SQL, Neon, Supabase, Azure, PlanetScale, and more.
+- **MCP server** -- Built-in Model Context Protocol server for AI agent integration.
+- **Instant reset** -- Wipe shadow state and get a clean view of production in seconds.
 
 ## Core Invariants
 
 These hold at all times, without exception.
 
 <Note>
-**Production is read-only.** Mori never issues a write to the upstream database. The Prod connection is opened in read-only mode. There is no code path that writes to Prod.
+**Production is read-only.** Mori never issues a write to the upstream database. The prod connection is opened in read-only mode. There is no code path that writes to prod.
 </Note>
 
 <Note>
-**Shadow is the mutation layer.** All writes go to the Shadow database — a local instance (same engine as Prod) holding all local mutations. It starts schema-only with zero rows.
+**Shadow is the mutation layer.** All writes go to the Shadow database -- a local instance (same engine as prod) holding all local mutations. It starts schema-only with zero rows.
 </Note>
 
 <Note>
-**The application sees one unified database.** When the app issues a SELECT, Mori transparently merges results from Prod and Shadow. Locally-modified rows come from Shadow. Untouched rows come from Prod. The app never knows the difference.
+**The application sees one unified database.** When the app issues a SELECT, Mori transparently merges results from prod and shadow. Locally-modified rows come from shadow. Untouched rows come from prod. The app never knows the difference.
 </Note>
 
 <Note>
-**Reset is instant.** Wiping the Shadow and its metadata restores a clean view of production. No migration, no rollback — just a clean slate.
+**Reset is instant.** Wiping the shadow and its metadata restores a clean view of production. No migration, no rollback -- just a clean slate.
 </Note>
 
 ## Terminology
@@ -35,11 +44,11 @@ These hold at all times, without exception.
 | Term | Definition |
 |------|-----------|
 | **Prod** | The upstream production database. Read-only from Mori's perspective. Source of truth for all unmodified data. |
-| **Shadow** | A local database instance (same engine and version as Prod) holding all local mutations. Starts schema-only with zero rows — a transparent overlay on Prod. |
+| **Shadow** | A local database instance (same engine and version as prod) holding all local mutations. Starts schema-only with zero rows -- a transparent overlay on prod. |
 | **Proxy** | The Mori process. Intercepts wire protocol traffic, classifies queries, routes them, merges results, manages state. |
-| **Delta Map** | Set of `(table, primary_key)` pairs identifying locally modified rows. When a row is delta, Shadow holds the authoritative version. |
-| **Tombstone Set** | Set of `(table, primary_key)` pairs identifying locally deleted rows. Tombstoned rows are filtered from Prod results. |
-| **Schema Registry** | Record of structural differences between Shadow and Prod schemas, introduced by local DDL. Tracks added/dropped/renamed columns and type changes per table. |
-| **Hydration** | Copying a row from Prod into Shadow so it can be mutated locally. Happens transparently on UPDATE/DELETE of rows that only exist in Prod. |
+| **Delta Map** | Set of `(table, primary_key)` pairs identifying locally modified rows. When a row is delta, shadow holds the authoritative version. |
+| **Tombstone Set** | Set of `(table, primary_key)` pairs identifying locally deleted rows. Tombstoned rows are filtered from prod results. |
+| **Schema Registry** | Record of structural differences between shadow and prod schemas, introduced by local DDL. Tracks added/dropped/renamed columns and type changes per table. |
+| **Hydration** | Copying a row from prod into shadow so it can be mutated locally. Happens transparently on UPDATE/DELETE of rows that only exist in prod. |
 | **Classification** | Parsing an incoming statement to determine operation type (READ, WRITE, DDL, TRANSACTION), affected tables, and extractable PKs. |
-| **Merged Read** | A read where results from both Prod and Shadow are combined, with delta/tombstoned rows filtered from Prod results. |
+| **Merged Read** | A read where results from both prod and shadow are combined, with delta/tombstoned rows filtered from prod results. |

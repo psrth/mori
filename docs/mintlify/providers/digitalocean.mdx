@@ -1,0 +1,31 @@
+---
+title: "DigitalOcean Managed DB"
+description: "Connect Mori to DigitalOcean Managed Databases."
+sidebarTitle: "DigitalOcean"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `digitalocean` |
+| Compatible Engines | PostgreSQL, MySQL, Redis |
+| SSL Default | `require` |
+
+## Connection
+
+DigitalOcean Managed Databases use non-standard defaults. Mori auto-applies these:
+
+| Field | Default |
+|-------|---------|
+| Port | `25060` |
+| Database | `defaultdb` |
+| User | `doadmin` |
+
+```bash
+mori init --from "postgres://doadmin:pass@db-postgresql-nyc1-12345-do-user-123456-0.b.db.ondigitalocean.com:25060/defaultdb?sslmode=require"
+```
+
+<Tip>
+Copy the connection string from the DigitalOcean dashboard under Databases > Connection Details. The non-standard port (25060) and user (doadmin) are handled automatically.
+</Tip>

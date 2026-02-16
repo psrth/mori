@@ -1,0 +1,45 @@
+---
+title: "GCP Cloud SQL"
+description: "Connect Mori to Google Cloud SQL databases."
+sidebarTitle: "GCP Cloud SQL"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `gcp-cloud-sql` |
+| Compatible Engines | PostgreSQL, MySQL, MSSQL |
+| SSL Default | `require` |
+| Auth | Password or `gcloud` IAM token |
+
+## Connection
+
+Cloud SQL instances can be reached directly (via public IP or Cloud SQL Proxy) or through IAM authentication.
+
+### With Password
+
+Provide host, user, and password as normal. SSL is enforced to `require` automatically.
+
+```bash
+mori init --from "postgres://user:pass@10.0.0.1:5432/mydb"
+```
+
+### With IAM Authentication
+
+If you omit the password, Mori obtains an access token via `gcloud auth print-access-token`. This requires:
+
+1. Google Cloud SDK installed
+2. Authenticated session (`gcloud auth login`)
+
+```bash
+mori init --from "postgres://user@10.0.0.1:5432/mydb"
+```
+
+<Tip>
+When using Cloud SQL Proxy, the host is typically `127.0.0.1`. Mori skips SSL enforcement when a tunnel is configured since the proxy already handles TLS.
+</Tip>
+
+## Host Placeholder
+
+`10.0.0.1` (private IP) or `127.0.0.1` (Cloud SQL Proxy)

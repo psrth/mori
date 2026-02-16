@@ -21,7 +21,7 @@ const clientSSL uint32 = 0x0800
 // SSL handling: the proxy listens on localhost only, so it strips CLIENT_SSL
 // from the server handshake before forwarding to the client. If the server
 // supports SSL, the proxy independently negotiates TLS with prod.
-func relayHandshake(clientConn, prodConn net.Conn) (net.Conn, error) {
+func relayHandshake(clientConn, prodConn net.Conn, prodHost string) (net.Conn, error) {
 	// 1. Read initial handshake from Prod.
 	handshake, err := readMySQLPacket(prodConn)
 	if err != nil {
@@ -40,7 +40,7 @@ func relayHandshake(clientConn, prodConn net.Conn) (net.Conn, error) {
 	// If Prod supports SSL, negotiate TLS before the client sends its response.
 	if prodSupportsSSL {
 		charset := handshakeCharset(handshake.Payload)
-		prodConn, err = negotiateMySQLSSL(prodConn, charset)
+		prodConn, err = negotiateMySQLSSL(prodConn, charset, prodHost)
 		if err != nil {
 			return prodConn, fmt.Errorf("prod SSL negotiation: %w", err)
 		}
@@ -183,7 +183,7 @@ func handshakeCharset(payload []byte) byte {
 // negotiateMySQLSSL sends a MySQL SSL Request to the server and upgrades
 // the connection to TLS. The SSL Request is a truncated Handshake Response
 // containing only capability flags, max packet size, charset, and reserved bytes.
-func negotiateMySQLSSL(prodConn net.Conn, charset byte) (net.Conn, error) {
+func negotiateMySQLSSL(prodConn net.Conn, charset byte, prodHost string) (net.Conn, error) {
 	// Build SSL Request payload (32 bytes):
 	// caps(4 LE) + max_packet(4 LE) + charset(1) + reserved(23 zeros)
 	var payload [32]byte
@@ -198,6 +198,7 @@ func negotiateMySQLSSL(prodConn net.Conn, charset byte) (net.Conn, error) {
 	}
 
 	tlsConn := tls.Client(prodConn, &tls.Config{
+		ServerName:         prodHost,
 		InsecureSkipVerify: true,
 	})
 	if err := tlsConn.Handshake(); err != nil {

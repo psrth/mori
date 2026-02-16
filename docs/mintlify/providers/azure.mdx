@@ -1,0 +1,41 @@
+---
+title: "Azure Database"
+description: "Connect Mori to Azure Database services."
+sidebarTitle: "Azure"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `azure` |
+| Compatible Engines | PostgreSQL, MySQL, MariaDB, MSSQL |
+| SSL Default | `require` |
+| Auth | Password or Azure CLI token |
+
+## Connection
+
+### With Password
+
+Provide host, user, and password. SSL is enforced automatically.
+
+```bash
+mori init --from "postgres://user:pass@myserver.postgres.database.azure.com:5432/mydb"
+```
+
+### With Azure AD Authentication
+
+If you omit the password, Mori obtains an access token via the Azure CLI:
+
+```bash
+az account get-access-token --resource-type oss-rdbms --query accessToken -o tsv
+```
+
+This requires:
+
+1. Azure CLI installed
+2. Authenticated session (`az login`)
+
+## Host Placeholder
+
+`myserver.postgres.database.azure.com`

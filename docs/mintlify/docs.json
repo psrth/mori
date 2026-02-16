@@ -47,8 +47,37 @@
             ]
           },
           {
-            "group": "Engines & Providers",
-            "pages": ["engines/overview", "engines/providers"]
+            "group": "Engines",
+            "pages": [
+              "engines/overview",
+              "engines/postgres",
+              "engines/cockroachdb",
+              "engines/mysql",
+              "engines/mariadb",
+              "engines/mssql",
+              "engines/sqlite",
+              "engines/duckdb",
+              "engines/redis",
+              "engines/firestore"
+            ]
+          },
+          {
+            "group": "Providers",
+            "pages": [
+              "providers/direct",
+              "providers/gcp-cloud-sql",
+              "providers/aws-rds",
+              "providers/neon",
+              "providers/supabase",
+              "providers/azure",
+              "providers/planetscale",
+              "providers/vercel-postgres",
+              "providers/digitalocean",
+              "providers/railway",
+              "providers/upstash",
+              "providers/cloudflare",
+              "providers/firebase"
+            ]
           },
           {
             "group": "CLI",

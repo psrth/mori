@@ -1,0 +1,94 @@
+---
+title: "Firestore"
+description: "Google Cloud Firestore engine implementation in Mori."
+sidebarTitle: "Firestore"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `firestore` |
+| Wire Protocol | gRPC (Firestore v1 API) |
+| Default Port | N/A (gRPC to `firestore.googleapis.com:443`) |
+| Status | Supported |
+| Classifier | gRPC method-name based |
+| Shadow | Firestore emulator (Docker container) |
+
+Firestore is a NoSQL document database accessed via gRPC. Mori intercepts the Firestore gRPC API, classifies operations by method name, and routes reads to the real Firestore and writes to a local Firestore emulator.
+
+## Connection Parameters
+
+| Field | Description |
+|-------|------------|
+| `project_id` | GCP project ID |
+| `credentials_file` | Path to service account credentials JSON (optional if using default credentials) |
+
+## Implementation Details
+
+### Query Classification
+
+Classifies Firestore operations by their gRPC method name on the `google.firestore.v1.Firestore` service:
+
+**Read operations:**
+- `GetDocument` -- Single document fetch
+- `ListDocuments` -- Collection listing
+- `RunQuery` -- Structured query
+- `RunAggregationQuery` -- COUNT, SUM, AVG aggregations
+- `BatchGetDocuments` -- Multi-document fetch
+- `Listen` -- Real-time listeners
+- `ListCollectionIds` -- Collection ID enumeration
+
+**Write operations:**
+- `CreateDocument`, `UpdateDocument`, `DeleteDocument` -- Single mutations
+- `Commit`, `Write`, `BatchWrite` -- Batch mutations
+
+**Transaction control:**
+- `BeginTransaction`, `Rollback`
+
+### Shadow Strategy
+
+The shadow is a Firestore emulator running in a Docker container using the Google Cloud SDK emulator image.
+
+- Image: `gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators`
+- Emulator runs `gcloud emulators firestore start` inside the container
+- Default internal port: 8080
+- Collections are auto-discovered during `mori init`
+
+### gRPC Proxy
+
+Mori acts as a gRPC server that implements the Firestore v1 service interface. The application's Firestore SDK connects to Mori as if it were the Firestore emulator. Mori then:
+
+1. Classifies the gRPC method
+2. Routes reads to the real Firestore (using service account credentials)
+3. Routes writes to the local emulator
+4. Merges results with delta/tombstone filtering
+
+### SDK Compatibility
+
+Applications connect to Mori using the standard Firestore SDK by setting the emulator environment variable:
+
+```bash
+export FIRESTORE_EMULATOR_HOST=127.0.0.1:<mori-port>
+```
+
+This tells the SDK to connect to Mori instead of the real Firestore. No code changes required.
+
+## Example Usage
+
+```bash
+# Initialize with Firestore
+mori init --from "firestore://my-project?credentials=/path/to/sa.json"
+
+# Start the proxy
+mori start
+
+# Point your application's Firestore SDK at Mori
+export FIRESTORE_EMULATOR_HOST=127.0.0.1:9010
+```
+
+## Known Limitations
+
+<Note>
+Firestore has no known limitations beyond trivial edge cases. All E2E tests pass.
+</Note>

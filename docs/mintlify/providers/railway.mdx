@@ -1,0 +1,32 @@
+---
+title: "Railway"
+description: "Connect Mori to Railway-hosted databases."
+sidebarTitle: "Railway"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Provider ID | `railway` |
+| Compatible Engines | PostgreSQL, MySQL, Redis |
+| SSL Default | `require` |
+
+## Connection
+
+Railway provides one-click database deployments. You can paste the full connection URL or provide individual fields. SSL is enforced automatically.
+
+```bash
+# Using the connection URL from Railway dashboard
+mori init --from "postgres://postgres:pass@containers-us-west-123.railway.app:5432/railway"
+```
+
+The provider also supports a `connection_url` extra field for the full URL when using the interactive wizard.
+
+<Tip>
+In the Railway dashboard, go to your database service and copy the connection string from the "Connect" tab.
+</Tip>
+
+## Host Placeholder
+
+`containers-us-west-123.railway.app`

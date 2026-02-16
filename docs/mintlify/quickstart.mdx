@@ -6,37 +6,67 @@ sidebarTitle: "Quick Start"
 
 ## Prerequisites
 
-- **Go 1.21+**
-- **Docker** (for Shadow containers — all engines except SQLite and DuckDB)
+- **Go 1.21+** (for building from source)
+- **Docker** (for shadow containers -- required for all engines except SQLite and DuckDB)
 
 ## Setup
 
 <Steps>
-  <Step title="Build">
+  <Step title="Build from source">
     ```bash
+    git clone https://github.com/mori-dev/mori.git
+    cd mori
     go build -o mori ./cmd/mori
     ```
   </Step>
-  <Step title="Initialize">
-    Connect to your production database. The interactive setup walks you through engine, provider, and credentials.
+  <Step title="Initialize a connection">
+    Point Mori at your production database. The interactive setup walks you through engine, provider, and credentials.
     ```bash
     ./mori init
     ```
+
     <Tip>
-    For non-interactive setup, use a connection string directly:
-    ```bash
+    For non-interactive setup, pass a connection string directly:
+
+    <CodeGroup>
+    ```bash PostgreSQL
     ./mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
     ```
+    ```bash MySQL
+    ./mori init --from "mysql://user:pass@host:3306/mydb"
+    ```
+    ```bash Redis
+    ./mori init --from "redis://:password@host:6379/0"
+    ```
+    ```bash SQLite
+    ./mori init --from "/path/to/database.db"
+    ```
+    </CodeGroup>
     </Tip>
+
+    On init, Mori:
+    1. Connects to your production database
+    2. Dumps the schema (tables, types, sequences)
+    3. Spins up a shadow database (Docker container or local file)
+    4. Replays the schema on shadow
+    5. Offsets sequences to prevent PK collisions
   </Step>
   <Step title="Start the proxy">
     ```bash
     ./mori start
     ```
-    On first run, Mori creates the Shadow database (a schema-only clone of Prod) and computes sequence offsets.
+    Mori listens on the same port as your database engine's default (e.g., 5432 for PostgreSQL, 3306 for MySQL, 6379 for Redis).
   </Step>
   <Step title="Point your app at Mori">
-    Swap your application's connection string to point at the Mori proxy. Same port as your engine's default — your app won't know the difference.
+    Swap your application's connection string to point at `127.0.0.1` on the proxy port. Same driver, same protocol -- your app won't know the difference.
+
+    ```bash
+    # Before (direct to prod)
+    DATABASE_URL=postgres://user:pass@prod-host:5432/mydb
+
+    # After (through Mori)
+    DATABASE_URL=postgres://user:pass@127.0.0.1:5432/mydb
+    ```
   </Step>
   <Step title="Reset when done">
     Wipe all local state and start fresh:
@@ -49,7 +79,7 @@ sidebarTitle: "Quick Start"
 ## Lifecycle
 
 ```
-mori init         Connect to Prod, dump schema, spin up Shadow, offset sequences
+mori init         Connect to prod, dump schema, spin up shadow, offset sequences
      |
 mori start        Start proxy, load state, accept connections
      |
@@ -57,5 +87,15 @@ mori start        Start proxy, load state, accept connections
      |
 mori stop         Persist state, shut down proxy
      |
-mori reset        Wipe Shadow data + metadata, clean slate
+mori reset        Wipe shadow data + metadata, clean slate
 ```
+
+## With AI Agents
+
+Start Mori with the MCP server for AI agent integration:
+
+```bash
+./mori start --mcp --mcp-port 9000
+```
+
+AI agents connect to `http://127.0.0.1:9000/mcp` and get engine-specific tools (SQL queries, Redis commands, or Firestore operations) -- all safely routed through the proxy.
