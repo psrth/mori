@@ -136,7 +136,14 @@ func TestBasicUpdate(t *testing.T) {
 	})
 
 	t.Run("update_visible_in_select", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; merged-read verification deferred to v2")
+		rows := mustQuery(t, db, "SELECT display_name FROM users WHERE id = 10")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row, got %d", len(rows))
+		}
+		name, ok := rows[0]["display_name"].(string)
+		if !ok || name != "Updated User 10" {
+			t.Errorf("expected 'Updated User 10', got %v", rows[0]["display_name"])
+		}
 	})
 
 	t.Run("prod_unchanged_after_update", func(t *testing.T) {
@@ -160,7 +167,10 @@ func TestBasicDelete(t *testing.T) {
 	})
 
 	t.Run("deleted_row_invisible", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; merged-read verification deferred to v2")
+		rows := mustQuery(t, db, "SELECT * FROM users WHERE id = 20")
+		if len(rows) != 0 {
+			t.Errorf("expected 0 rows (tombstoned), got %d", len(rows))
+		}
 	})
 
 	t.Run("prod_unchanged_after_delete", func(t *testing.T) {
@@ -173,7 +183,30 @@ func TestBasicDelete(t *testing.T) {
 }
 
 func TestMergedReads(t *testing.T) {
-	t.Skip("v1 proxy routes reads to prod; merged reads deferred to v2")
+	db := connect(t)
+
+	t.Run("count_after_insert", func(t *testing.T) {
+		// Insert additional users so that shadow inserts exceed the single
+		// delete from TestBasicDelete, making the merged count > 100.
+		mustExec(t, db,
+			"INSERT INTO users (username, email, display_name, is_active) VALUES ('e2e_merged_1', 'merged1@test.com', 'Merged 1', 1)")
+		mustExec(t, db,
+			"INSERT INTO users (username, email, display_name, is_active) VALUES ('e2e_merged_2', 'merged2@test.com', 'Merged 2', 1)")
+
+		count := queryScalar[int64](t, db, "SELECT COUNT(*) FROM users")
+		// Should be prod (100) + shadow inserts (3 total) - deletes (1) = 102.
+		if count <= 100 {
+			t.Errorf("expected more than 100 users after inserts, got %d", count)
+		}
+		t.Logf("Total users after inserts: %d", count)
+	})
+
+	t.Run("inserted_row_visible_by_value", func(t *testing.T) {
+		rows := mustQuery(t, db, "SELECT * FROM users WHERE username = 'e2e_new_user'")
+		if len(rows) != 1 {
+			t.Errorf("expected 1 row for e2e_new_user, got %d", len(rows))
+		}
+	})
 }
 
 func TestCRUDCycle(t *testing.T) {

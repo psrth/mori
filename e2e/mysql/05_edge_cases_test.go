@@ -27,7 +27,10 @@ func TestNoPKTable(t *testing.T) {
 	})
 
 	t.Run("select_settings_after_insert", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; shadow insert not visible")
+		rows := mustQuery(t, db, "SELECT * FROM settings WHERE `key` = 'e2e.edge'")
+		if len(rows) != 1 {
+			t.Errorf("expected 1 settings row, got %d", len(rows))
+		}
 	})
 
 	t.Run("update_settings_by_key", func(t *testing.T) {
@@ -53,7 +56,10 @@ func TestUUIDPK(t *testing.T) {
 	})
 
 	t.Run("select_uuid_product_after_insert", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; shadow insert not visible")
+		rows := mustQuery(t, db, "SELECT * FROM products WHERE slug = 'edge-uuid-product'")
+		if len(rows) != 1 {
+			t.Errorf("expected 1 product, got %d", len(rows))
+		}
 	})
 
 	t.Run("update_uuid_product", func(t *testing.T) {
@@ -82,7 +88,10 @@ func TestCompositePK(t *testing.T) {
 	})
 
 	t.Run("select_composite_pk_after_insert", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; shadow insert not visible")
+		rows := mustQuery(t, db, "SELECT * FROM user_roles WHERE user_id = 99 AND role_id = 10")
+		if len(rows) != 1 {
+			t.Errorf("expected 1 user_role row, got %d", len(rows))
+		}
 	})
 
 	t.Run("delete_composite_pk", func(t *testing.T) {
@@ -99,7 +108,10 @@ func TestNullHandling(t *testing.T) {
 	})
 
 	t.Run("select_where_null", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; shadow insert not visible")
+		rows := mustQuery(t, db, "SELECT * FROM users WHERE username = 'e2e_null_user'")
+		if len(rows) != 1 {
+			t.Errorf("expected 1 row for null user, got %d", len(rows))
+		}
 	})
 
 	t.Run("update_set_to_null", func(t *testing.T) {
@@ -121,7 +133,21 @@ func TestLargeText(t *testing.T) {
 	})
 
 	t.Run("read_10kb_text_roundtrip", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; shadow insert not visible")
+		rows := mustQuery(t, db, "SELECT value FROM settings WHERE `key` = 'e2e.bigtext'")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row, got %d", len(rows))
+		}
+		val, ok := rows[0]["value"].(string)
+		if !ok {
+			val2, ok2 := rows[0]["value"].([]byte)
+			if !ok2 {
+				t.Fatalf("unexpected type for value: %T", rows[0]["value"])
+			}
+			val = string(val2)
+		}
+		if len(val) != 10*1024 {
+			t.Errorf("expected 10240 bytes, got %d", len(val))
+		}
 	})
 }
 

@@ -86,17 +86,6 @@ func buildCOMQuery(seq byte, sql string) []byte {
 	return buildMySQLPacket(seq, payload)
 }
 
-// buildCOMQuit constructs a COM_QUIT packet.
-func buildCOMQuit(seq byte) []byte {
-	return buildMySQLPacket(seq, []byte{comQuit})
-}
-
-// buildCOMInitDB constructs a COM_INIT_DB packet.
-func buildCOMInitDB(seq byte, dbName string) []byte {
-	payload := append([]byte{comInitDB}, []byte(dbName)...)
-	return buildMySQLPacket(seq, payload)
-}
-
 // buildCOMPing constructs a COM_PING packet.
 func buildCOMPing(seq byte) []byte {
 	return buildMySQLPacket(seq, []byte{comPing})

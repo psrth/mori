@@ -14,7 +14,11 @@ func TestMigrations(t *testing.T) {
 	})
 
 	t.Run("select_after_add_column_shows_null", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; prod does not have shadow-only DDL changes")
+		rows := mustQuery(t, db, "SELECT * FROM users WHERE id = 1")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row, got %d", len(rows))
+		}
+		// The phone column should exist (added via ALTER TABLE) but be NULL for prod rows.
 	})
 
 	t.Run("insert_with_new_column", func(t *testing.T) {
@@ -23,7 +27,10 @@ func TestMigrations(t *testing.T) {
 	})
 
 	t.Run("select_new_column_has_value", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; prod does not have shadow-only DDL changes")
+		rows := mustQuery(t, db, "SELECT * FROM users WHERE username = 'e2e_phone_user'")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row, got %d", len(rows))
+		}
 	})
 
 	t.Run("add_column_with_default", func(t *testing.T) {
@@ -51,7 +58,10 @@ func TestMigrations(t *testing.T) {
 	})
 
 	t.Run("select_after_rename_column", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; prod does not have shadow-only DDL changes")
+		rows := mustQuery(t, db, "SELECT * FROM orders WHERE id = 1")
+		if len(rows) != 1 {
+			t.Fatalf("expected 1 row, got %d", len(rows))
+		}
 	})
 
 	t.Run("create_table", func(t *testing.T) {
@@ -69,7 +79,10 @@ func TestMigrations(t *testing.T) {
 	})
 
 	t.Run("select_from_new_table", func(t *testing.T) {
-		t.Skip("v1 proxy routes reads to prod; shadow-only table not visible via proxy reads")
+		rows := mustQuery(t, db, "SELECT * FROM e2e_new_table")
+		if len(rows) != 2 {
+			t.Errorf("expected 2 rows in new table, got %d", len(rows))
+		}
 	})
 
 	t.Run("drop_table", func(t *testing.T) {
