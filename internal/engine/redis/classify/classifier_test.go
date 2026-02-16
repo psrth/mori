@@ -73,6 +73,17 @@ func TestClassify(t *testing.T) {
 		// SORT with STORE
 		{"SORT read", "SORT mylist LIMIT 0 10", core.OpRead, core.SubSelect, []string{"mylist"}},
 		{"SORT write", "SORT mylist STORE result:sorted", core.OpWrite, core.SubInsert, []string{"mylist"}},
+
+		// Pub/Sub
+		{"SUBSCRIBE", "SUBSCRIBE channel1", core.OpOther, core.SubOther, nil},
+		{"PSUBSCRIBE", "PSUBSCRIBE chan:*", core.OpOther, core.SubOther, nil},
+		{"PUBLISH", "PUBLISH channel1 hello", core.OpWrite, core.SubInsert, nil},
+
+		// Lua scripting
+		{"EVAL", `EVAL "return 1" 2 user:1 session:2 arg1`, core.OpWrite, core.SubInsert, []string{"user", "session"}},
+		{"EVALSHA", "EVALSHA abc123 1 counter:hits arg1", core.OpWrite, core.SubInsert, []string{"counter"}},
+		{"EVAL no keys", `EVAL "return 1" 0`, core.OpWrite, core.SubInsert, nil},
+		{"SCRIPT", "SCRIPT LOAD return 1", core.OpOther, core.SubOther, nil},
 	}
 
 	for _, tt := range tests {
@@ -118,7 +129,7 @@ func TestKeyPrefix(t *testing.T) {
 }
 
 func TestIsWriteCommand(t *testing.T) {
-	writes := []string{"SET", "DEL", "HSET", "LPUSH", "SADD", "ZADD", "FLUSHDB", "set", "del"}
+	writes := []string{"SET", "DEL", "HSET", "LPUSH", "SADD", "ZADD", "FLUSHDB", "set", "del", "EVAL", "EVALSHA"}
 	for _, cmd := range writes {
 		if !IsWriteCommand(cmd) {
 			t.Errorf("IsWriteCommand(%q) = false, want true", cmd)
@@ -129,5 +140,79 @@ func TestIsWriteCommand(t *testing.T) {
 		if IsWriteCommand(cmd) {
 			t.Errorf("IsWriteCommand(%q) = true, want false", cmd)
 		}
+	}
+}
+
+func TestIsPubSubSubscribe(t *testing.T) {
+	subs := []string{"SUBSCRIBE", "PSUBSCRIBE", "subscribe", "psubscribe"}
+	for _, cmd := range subs {
+		if !IsPubSubSubscribe(cmd) {
+			t.Errorf("IsPubSubSubscribe(%q) = false, want true", cmd)
+		}
+	}
+	nonSubs := []string{"UNSUBSCRIBE", "PUBLISH", "GET", "SET"}
+	for _, cmd := range nonSubs {
+		if IsPubSubSubscribe(cmd) {
+			t.Errorf("IsPubSubSubscribe(%q) = true, want false", cmd)
+		}
+	}
+}
+
+func TestIsPubSubUnsubscribe(t *testing.T) {
+	unsubs := []string{"UNSUBSCRIBE", "PUNSUBSCRIBE", "unsubscribe"}
+	for _, cmd := range unsubs {
+		if !IsPubSubUnsubscribe(cmd) {
+			t.Errorf("IsPubSubUnsubscribe(%q) = false, want true", cmd)
+		}
+	}
+	nonUnsubs := []string{"SUBSCRIBE", "PUBLISH", "GET"}
+	for _, cmd := range nonUnsubs {
+		if IsPubSubUnsubscribe(cmd) {
+			t.Errorf("IsPubSubUnsubscribe(%q) = true, want false", cmd)
+		}
+	}
+}
+
+func TestIsEvalCommand(t *testing.T) {
+	evals := []string{"EVAL", "EVALSHA", "eval", "evalsha"}
+	for _, cmd := range evals {
+		if !IsEvalCommand(cmd) {
+			t.Errorf("IsEvalCommand(%q) = false, want true", cmd)
+		}
+	}
+	nonEvals := []string{"GET", "SET", "SCRIPT", "EVALRO"}
+	for _, cmd := range nonEvals {
+		if IsEvalCommand(cmd) {
+			t.Errorf("IsEvalCommand(%q) = true, want false", cmd)
+		}
+	}
+}
+
+func TestExtractEvalKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"two keys", []string{"return 1", "2", "user:1", "session:2", "arg1"}, []string{"user:1", "session:2"}},
+		{"one key", []string{"return 1", "1", "counter:hits", "arg1"}, []string{"counter:hits"}},
+		{"zero keys", []string{"return 1", "0"}, nil},
+		{"no numkeys", []string{"return 1"}, nil},
+		{"empty args", []string{}, nil},
+		{"invalid numkeys", []string{"return 1", "abc"}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ExtractEvalKeys(tt.args)
+			if len(got) != len(tt.want) {
+				t.Errorf("ExtractEvalKeys() = %v, want %v", got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("ExtractEvalKeys()[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
@@ -56,8 +57,8 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	shortVersion := extractShortVersion(versionStr)
 	fmt.Printf("  MSSQL %s detected\n", shortVersion)
 
-	// 4. Docker image — always use mssql/server:2022-latest for Shadow.
-	imageName := "mcr.microsoft.com/mssql/server:2022-latest"
+	// 4. Docker image — match Prod version for Shadow.
+	imageName := versionToImage(versionStr)
 
 	// 5. Set up Docker container.
 	fmt.Printf("Pulling Docker image %s...\n", imageName)
@@ -168,6 +169,26 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 			Tables:    tables,
 		},
 	}, nil
+}
+
+// versionToImage maps the @@VERSION output to the appropriate Docker image tag.
+// Supported versions: 2017, 2019, 2022. Falls back to 2022-latest.
+func versionToImage(versionStr string) string {
+	const baseImage = "mcr.microsoft.com/mssql/server"
+
+	upper := strings.ToUpper(versionStr)
+
+	switch {
+	case strings.Contains(upper, "2017"):
+		return baseImage + ":2017-latest"
+	case strings.Contains(upper, "2019"):
+		return baseImage + ":2019-latest"
+	case strings.Contains(upper, "2022"):
+		return baseImage + ":2022-latest"
+	default:
+		// Default to 2022 for unknown versions.
+		return baseImage + ":2022-latest"
+	}
 }
 
 // extractShortVersion extracts a concise version string from @@VERSION output.

@@ -19,7 +19,7 @@ These hold at all times, without exception.
 - **The application sees one unified database.** SELECTs transparently merge results from Prod and Shadow. Locally-modified rows come from Shadow, untouched rows from Prod.
 - **Reset is instant.** Wiping Shadow and its metadata restores a clean view of production. No migration, no rollback.
 
-**Prerequisites:** Go 1.21+, Docker (for Shadow containers — all engines except SQLite).
+**Prerequisites:** Go 1.21+, Docker (for Shadow containers — all engines except SQLite and DuckDB).
 
 ## Key Concepts
 
@@ -43,8 +43,8 @@ These hold at all times, without exception.
 | MySQL | MySQL wire | Docker container |
 | MariaDB | MySQL wire | Docker container |
 | MS SQL Server | TDS | Docker container |
-| Oracle | Oracle Net8 | Docker container |
-| SQLite | File-based | Local file (no Docker) |
+| SQLite | pgwire (embedded) | Local file (no Docker) |
+| DuckDB | pgwire (embedded) | Local file (no Docker) |
 | Redis | RESP | Docker container |
 | Firestore | gRPC | Emulator container |
 
@@ -108,6 +108,7 @@ Add a database connection to `mori.yaml`.
 |------|---------|-------------|
 | `--from, -f` | — | Connection string (non-interactive mode) |
 | `--name` | — | Connection name (used with `--from`) |
+| `--image` | — | Custom Docker image for the Shadow container (persisted in `mori.yaml`) |
 
 ### `mori start [name]`
 
@@ -224,13 +225,24 @@ Mori includes an MCP (Model Context Protocol) server for AI agent integration. S
 ./mori start my-db --mcp --mcp-port 9000
 ```
 
-The MCP server exposes a single tool:
+The MCP server registers engine-specific tools based on your database type:
 
-**`db_query`** — Execute a SQL query against the database through Mori.
+**SQL engines** (PostgreSQL, CockroachDB, MySQL, MariaDB, MSSQL, SQLite, DuckDB):
+- **`db_query`** — Execute a SQL query. Parameter: `query` (string, required).
+
+**Redis**:
+- **`redis_command`** — Execute any Redis command (free-form).
+- **`redis_get`** — Get the value of a key.
+- **`redis_hgetall`** — Get all fields and values of a hash.
+- **`redis_keys`** — Find keys matching a pattern.
+
+**Firestore**:
+- **`firestore_get`** — Retrieve a document by collection and document ID.
+- **`firestore_list`** — List documents in a collection (default 25, max 100).
+- **`firestore_query`** — Query with field filters (==, !=, <, <=, >, >=, in, array-contains).
 
 - **Endpoint:** `http://127.0.0.1:9000/mcp`
-- **Parameter:** `query` (string, required) — SQL query to execute
-- **Behavior:** Queries go through the proxy's full routing/merge logic, same as application connections. Reads from Prod, writes to Shadow.
+- **Behavior:** All tools go through the proxy's full routing/merge logic, same as application connections. Reads from Prod, writes to Shadow.
 
 ### MCP Client Configuration
 

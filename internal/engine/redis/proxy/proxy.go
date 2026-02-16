@@ -262,10 +262,44 @@ func (p *Proxy) routeLoop(
 		}
 
 		// Handle QUIT.
-		cmd, _, _ := ParseCommand(cmdVal)
+		cmd, args, _ := ParseCommand(cmdVal)
 		if cmd == "QUIT" {
 			WriteRESPValue(clientConn, BuildSimpleString("OK"))
 			return
+		}
+
+		// Handle Pub/Sub SUBSCRIBE/PSUBSCRIBE: fan-in from both backends.
+		if classify.IsPubSubSubscribe(cmd) {
+			p.handlePubSubSubscribe(clientConn, clientReader, cmdVal, rawProdConn, prodReader, shadowConn, shadowReader, connID)
+			return // after pub/sub mode exits, close the connection
+		}
+
+		// Handle Pub/Sub UNSUBSCRIBE: forward to both.
+		if classify.IsPubSubUnsubscribe(cmd) {
+			cmdBytes := cmdVal.Bytes()
+			shadowConn.Write(cmdBytes)
+			ReadRESPValue(shadowReader)
+			rawProdConn.Write(cmdBytes)
+			resp, err := ReadRESPValue(prodReader)
+			if err != nil {
+				log.Printf("[conn %d] prod read error on unsubscribe: %v", connID, err)
+				return
+			}
+			clientConn.Write(resp.Bytes())
+			continue
+		}
+
+		// Handle EVAL/EVALSHA: hydrate keys then execute on shadow.
+		if classify.IsEvalCommand(cmd) {
+			p.handleEval(clientConn, cmdVal, args, rawProdConn, prodReader, shadowConn, shadowReader, connID)
+			continue
+		}
+
+		// Handle SCAN: merge results from both backends when deltas exist.
+		if cmd == "SCAN" {
+			resp := p.executeMergedScan(cmdVal, args, rawProdConn, prodReader, shadowConn, shadowReader, connID)
+			clientConn.Write(resp)
+			continue
 		}
 
 		// Classify the command.
@@ -654,4 +688,316 @@ func truncateCmd(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// ---------------------------------------------------------------------------
+// Pub/Sub: fan-in multiplexer
+// ---------------------------------------------------------------------------
+
+// handlePubSubSubscribe forwards SUBSCRIBE/PSUBSCRIBE to both Prod and Shadow,
+// then multiplexes messages from both backends to the client. The connection
+// stays in pub/sub mode until all channels are unsubscribed or the client disconnects.
+func (p *Proxy) handlePubSubSubscribe(
+	clientConn net.Conn,
+	clientReader *bufio.Reader,
+	cmdVal *RESPValue,
+	prodConn net.Conn, prodReader *bufio.Reader,
+	shadowConn net.Conn, shadowReader *bufio.Reader,
+	connID int64,
+) {
+	cmdBytes := cmdVal.Bytes()
+
+	// Send SUBSCRIBE to both backends.
+	prodConn.Write(cmdBytes)
+	shadowConn.Write(cmdBytes)
+
+	// Read the initial subscription confirmation from prod (return to client).
+	resp, err := ReadRESPValue(prodReader)
+	if err != nil {
+		log.Printf("[conn %d] pub/sub prod subscribe error: %v", connID, err)
+		return
+	}
+	clientConn.Write(resp.Bytes())
+
+	// Consume shadow's subscription confirmation (discard — client already got prod's).
+	ReadRESPValue(shadowReader)
+
+	if p.verbose {
+		log.Printf("[conn %d] entered pub/sub mode (fan-in from both backends)", connID)
+	}
+
+	// Fan-in: forward messages from either backend to client.
+	// Use a channel to merge messages from both sources.
+	msgCh := make(chan []byte, 64)
+	done := make(chan struct{})
+
+	// Goroutine: read from prod.
+	go func() {
+		for {
+			val, err := ReadRESPValue(prodReader)
+			if err != nil {
+				close(done)
+				return
+			}
+			select {
+			case msgCh <- val.Bytes():
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Goroutine: read from shadow.
+	go func() {
+		for {
+			val, err := ReadRESPValue(shadowReader)
+			if err != nil {
+				return
+			}
+			select {
+			case msgCh <- val.Bytes():
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Goroutine: read client commands (for UNSUBSCRIBE).
+	clientCh := make(chan *RESPValue, 8)
+	go func() {
+		for {
+			val, err := ReadRESPValue(clientReader)
+			if err != nil {
+				close(done)
+				return
+			}
+			select {
+			case clientCh <- val:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// Main loop: forward messages and handle unsubscribe.
+	for {
+		select {
+		case msg, ok := <-msgCh:
+			if !ok {
+				return
+			}
+			if _, err := clientConn.Write(msg); err != nil {
+				return
+			}
+		case val, ok := <-clientCh:
+			if !ok {
+				return
+			}
+			cmd, _, _ := ParseCommand(val)
+			unsub := cmdVal.Bytes()
+			if classify.IsPubSubUnsubscribe(cmd) {
+				unsub = val.Bytes()
+			}
+			// Forward unsubscribe to both backends.
+			prodConn.Write(unsub)
+			shadowConn.Write(unsub)
+			// If it's a full unsubscribe or QUIT, exit pub/sub mode.
+			if classify.IsPubSubUnsubscribe(cmd) || cmd == "QUIT" {
+				return
+			}
+		case <-done:
+			return
+		case <-p.shutdownCh:
+			return
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// EVAL/EVALSHA: hydrate keys, execute on shadow, track deltas
+// ---------------------------------------------------------------------------
+
+// handleEval processes EVAL/EVALSHA commands by hydrating declared keys from
+// prod to shadow before execution, then tracking all keys in the delta map.
+func (p *Proxy) handleEval(
+	clientConn net.Conn,
+	cmdVal *RESPValue,
+	args []string,
+	prodConn net.Conn, prodReader *bufio.Reader,
+	shadowConn net.Conn, shadowReader *bufio.Reader,
+	connID int64,
+) {
+	// Extract KEYS from the command.
+	evalKeys := classify.ExtractEvalKeys(args)
+
+	// Hydrate each key from prod to shadow if not already present.
+	for _, key := range evalKeys {
+		prefix := classify.KeyPrefix(key)
+		if p.deltaMap != nil && p.deltaMap.IsDelta(prefix, key) {
+			continue
+		}
+
+		// DUMP from prod.
+		dumpCmd := BuildCommandArray("DUMP", key)
+		prodConn.Write(dumpCmd.Bytes())
+		dumpResp, err := ReadRESPValue(prodReader)
+		if err != nil || dumpResp.IsNull {
+			continue
+		}
+
+		// Get TTL from prod.
+		pttlCmd := BuildCommandArray("PTTL", key)
+		prodConn.Write(pttlCmd.Bytes())
+		pttlResp, err := ReadRESPValue(prodReader)
+		if err != nil {
+			continue
+		}
+		ttl := "0"
+		if pttlResp.Type == ':' && pttlResp.Int > 0 {
+			ttl = fmt.Sprintf("%d", pttlResp.Int)
+		}
+
+		// RESTORE to shadow.
+		restoreCmd := BuildCommandArray("RESTORE", key, ttl, dumpResp.Str, "REPLACE")
+		shadowConn.Write(restoreCmd.Bytes())
+		ReadRESPValue(shadowReader)
+
+		if p.verbose {
+			log.Printf("[conn %d] EVAL hydrated key %q to shadow", connID, key)
+		}
+	}
+
+	// Execute EVAL on shadow.
+	cmdBytes := cmdVal.Bytes()
+	if _, err := shadowConn.Write(cmdBytes); err != nil {
+		log.Printf("[conn %d] shadow EVAL write error: %v", connID, err)
+		clientConn.Write(BuildErrorReply("ERR shadow EVAL failed").Bytes())
+		return
+	}
+	resp, err := ReadRESPValue(shadowReader)
+	if err != nil {
+		log.Printf("[conn %d] shadow EVAL read error: %v", connID, err)
+		clientConn.Write(BuildErrorReply("ERR shadow EVAL failed").Bytes())
+		return
+	}
+	clientConn.Write(resp.Bytes())
+
+	// Track all EVAL keys in delta map.
+	for _, key := range evalKeys {
+		prefix := classify.KeyPrefix(key)
+		if p.deltaMap != nil {
+			p.deltaMap.Add(prefix, key)
+		}
+	}
+	if len(evalKeys) > 0 && p.deltaMap != nil {
+		if err := delta.WriteDeltaMap(p.moriDir, p.deltaMap); err != nil {
+			if p.verbose {
+				log.Printf("[conn %d] failed to persist delta map after EVAL: %v", connID, err)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SCAN consistency: merge results from prod and shadow
+// ---------------------------------------------------------------------------
+
+// executeMergedScan runs SCAN on both backends when shadow has deltas,
+// merges the results, deduplicates, and filters tombstoned keys.
+func (p *Proxy) executeMergedScan(
+	cmdVal *RESPValue,
+	args []string,
+	prodConn net.Conn, prodReader *bufio.Reader,
+	shadowConn net.Conn, shadowReader *bufio.Reader,
+	connID int64,
+) []byte {
+	// If no deltas exist, just forward to prod.
+	if p.deltaMap == nil || !p.deltaMap.HasAnyDelta() {
+		cmdBytes := cmdVal.Bytes()
+		prodConn.Write(cmdBytes)
+		resp, err := ReadRESPValue(prodReader)
+		if err != nil {
+			return BuildErrorReply("ERR prod SCAN failed").Bytes()
+		}
+		return resp.Bytes()
+	}
+
+	cmdBytes := cmdVal.Bytes()
+
+	// Run SCAN on prod.
+	prodConn.Write(cmdBytes)
+	prodResp, err := ReadRESPValue(prodReader)
+	if err != nil {
+		return BuildErrorReply("ERR prod SCAN failed").Bytes()
+	}
+
+	// Run SCAN on shadow.
+	shadowConn.Write(cmdBytes)
+	shadowResp, err := ReadRESPValue(shadowReader)
+	if err != nil {
+		return BuildErrorReply("ERR shadow SCAN failed").Bytes()
+	}
+
+	// Parse SCAN responses: *2 [$cursor, *N [key1, key2, ...]]
+	prodCursor, prodKeys := parseScanResponse(prodResp)
+	shadowCursor, shadowKeys := parseScanResponse(shadowResp)
+
+	// Merge and deduplicate keys.
+	seen := make(map[string]bool)
+	var merged []string
+	for _, key := range prodKeys {
+		prefix := classify.KeyPrefix(key)
+		// Skip tombstoned keys.
+		if p.tombstones != nil && p.tombstones.IsTombstoned(prefix, key) {
+			continue
+		}
+		if !seen[key] {
+			seen[key] = true
+			merged = append(merged, key)
+		}
+	}
+	for _, key := range shadowKeys {
+		if !seen[key] {
+			seen[key] = true
+			merged = append(merged, key)
+		}
+	}
+
+	// Use the cursor from prod as the return cursor. When both cursors are "0",
+	// the scan is complete. Otherwise, prefer the non-zero cursor.
+	cursor := prodCursor
+	if cursor == "0" && shadowCursor != "0" {
+		cursor = shadowCursor
+	}
+
+	// Build response: *2 [$cursor, *N [keys...]]
+	keyValues := make([]RESPValue, len(merged))
+	for i, k := range merged {
+		keyValues[i] = RESPValue{Type: '$', Str: k}
+	}
+
+	return (&RESPValue{
+		Type: '*',
+		Array: []RESPValue{
+			{Type: '$', Str: cursor},
+			{Type: '*', Array: keyValues},
+		},
+	}).Bytes()
+}
+
+// parseScanResponse extracts cursor and keys from a SCAN response.
+func parseScanResponse(resp *RESPValue) (string, []string) {
+	if resp == nil || resp.Type != '*' || len(resp.Array) < 2 {
+		return "0", nil
+	}
+	cursor := resp.Array[0].Str
+	keysArray := resp.Array[1]
+	if keysArray.Type != '*' {
+		return cursor, nil
+	}
+	keys := make([]string, len(keysArray.Array))
+	for i, v := range keysArray.Array {
+		keys[i] = v.Str
+	}
+	return cursor, keys
 }

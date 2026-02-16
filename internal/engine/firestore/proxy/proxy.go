@@ -23,6 +23,8 @@ import (
 
 // Proxy is a gRPC reverse proxy that intercepts Firestore API calls
 // and routes reads to prod, writes to shadow (emulator).
+// It uses SDK-based clients for merged reads and delta-tracked writes
+// when available, falling back to raw byte forwarding otherwise.
 type Proxy struct {
 	prodAddr        string
 	shadowAddr      string
@@ -40,9 +42,13 @@ type Proxy struct {
 	moriDir        string
 	logger         *logging.Logger
 
+	// Raw gRPC connections (for fallback byte forwarding).
 	prodConn   *grpc.ClientConn
 	shadowConn *grpc.ClientConn
 	grpcServer *grpc.Server
+
+	// SDK clients for merged reads and delta-tracked writes.
+	sdk *sdkClients
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -83,14 +89,14 @@ func New(
 
 // ListenAndServe establishes backend connections and starts the gRPC proxy server.
 func (p *Proxy) ListenAndServe(ctx context.Context) error {
-	// Connect to prod backend.
+	// Connect to prod backend (raw gRPC for fallback forwarding).
 	var err error
 	p.prodConn, err = p.dialProd(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to connect to prod Firestore: %w", err)
 	}
 
-	// Connect to shadow backend (emulator).
+	// Connect to shadow backend (emulator) for raw forwarding.
 	if p.shadowAddr != "" {
 		p.shadowConn, err = grpc.DialContext(ctx, p.shadowAddr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -98,6 +104,18 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 		)
 		if err != nil {
 			return fmt.Errorf("failed to connect to shadow emulator: %w", err)
+		}
+	}
+
+	// Initialize SDK clients for merged reads and delta-tracked writes.
+	if p.shadowAddr != "" {
+		sdkC, sdkErr := newSDKClients(ctx, p.prodAddr, p.shadowAddr, p.credentialsFile, p.projectID)
+		if sdkErr != nil {
+			log.Printf("Warning: failed to create SDK clients (merged reads unavailable): %v", sdkErr)
+			// Non-fatal — fall back to raw forwarding.
+		} else {
+			p.sdk = sdkC
+			log.Println("Firestore SDK clients initialized — merged reads and delta tracking enabled")
 		}
 	}
 
@@ -117,8 +135,12 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 	p.listenerMu.Unlock()
 
 	if p.shadowConn != nil {
-		log.Printf("Mori Firestore proxy listening on %s (gRPC) → prod=%s shadow=%s",
-			ln.Addr().String(), p.prodAddr, p.shadowAddr)
+		mode := "raw-proxy"
+		if p.sdk != nil {
+			mode = "sdk-merged"
+		}
+		log.Printf("Mori Firestore proxy listening on %s (gRPC, %s) → prod=%s shadow=%s",
+			ln.Addr().String(), mode, p.prodAddr, p.shadowAddr)
 	} else {
 		log.Printf("Mori Firestore proxy listening on %s (gRPC) → %s (pass-through)",
 			ln.Addr().String(), p.prodAddr)
@@ -152,6 +174,9 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 
 	if p.grpcServer != nil {
 		p.grpcServer.GracefulStop()
+	}
+	if p.sdk != nil {
+		p.sdk.close()
 	}
 	if p.prodConn != nil {
 		p.prodConn.Close()

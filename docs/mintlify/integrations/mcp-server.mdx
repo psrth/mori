@@ -6,17 +6,57 @@ sidebarTitle: "MCP Server"
 
 ## Overview
 
-Mori includes an MCP (Model Context Protocol) server that enables AI coding agents to interact with databases through Mori's safe proxy layer.
+Mori includes an MCP (Model Context Protocol) server that enables AI coding agents to interact with databases through Mori's safe proxy layer. The MCP server supports **all 9 engines** with engine-specific tools.
 
-The MCP server exposes a `db_query` tool over HTTP. AI agents connect to this endpoint, issue database queries, and receive results as JSON — all routed through Mori's copy-on-write proxy.
+The MCP server registers appropriate tools based on the configured engine and exposes them over HTTP. AI agents connect to this endpoint, issue queries or commands, and receive results as JSON — all routed through Mori's copy-on-write proxy.
 
 ## How It Works
 
 1. The MCP server starts alongside the Mori proxy
-2. AI agents connect to the MCP HTTP endpoint
-3. The server forwards queries to Mori as a standard database client
-4. Mori routes reads to Prod, captures writes in Shadow
-5. Results are returned as JSON to the agent
+2. Engine-specific tools are registered based on your database type
+3. AI agents connect to the MCP HTTP endpoint
+4. The server forwards queries/commands to Mori as a standard database client
+5. Mori routes reads to Prod, captures writes in Shadow
+6. Results are returned as JSON to the agent
+
+## Tools by Engine
+
+### SQL Engines — `db_query`
+
+All SQL engines share the same `db_query` tool interface:
+
+| Engine | Wire Protocol | Driver |
+|--------|--------------|--------|
+| PostgreSQL | pgwire | pgx |
+| CockroachDB | pgwire | pgx |
+| SQLite | pgwire | pgx |
+| DuckDB | pgwire | pgx |
+| MySQL | MySQL wire | go-sql-driver/mysql |
+| MariaDB | MySQL wire | go-sql-driver/mysql |
+| MSSQL | TDS | go-mssqldb |
+
+**Parameters:** `query` (string, required) — SQL query to execute.
+
+### Redis — 4 tools
+
+| Tool | Description |
+|------|-------------|
+| `redis_command` | Execute any Redis command (free-form, quote-aware parser) |
+| `redis_get` | Get the value of a key |
+| `redis_hgetall` | Get all fields and values of a hash |
+| `redis_keys` | Find keys matching a pattern |
+
+Uses raw RESP protocol client with AUTH support when password is configured.
+
+### Firestore — 3 tools
+
+| Tool | Description |
+|------|-------------|
+| `firestore_get` | Retrieve a single document by collection and document ID |
+| `firestore_list` | List documents in a collection (default 25, max 100) |
+| `firestore_query` | Query with field filters (==, !=, <, <=, >, >=, in, array-contains) |
+
+Connects to the Mori proxy as a Firestore emulator via gRPC.
 
 ## Use Cases
 
@@ -40,10 +80,10 @@ The MCP server exposes a `db_query` tool over HTTP. AI agents connect to this en
 The MCP server port is configurable. The endpoint is available at `/mcp` on the configured port.
 
 ```bash
-# Start Mori with MCP server
-mori start
+# Start Mori with MCP server (works with any engine)
+mori start --mcp --mcp-port 9000
 ```
 
 <Info>
-The MCP server connects to Mori's proxy as a standard PostgreSQL client. From the MCP server's perspective, Mori is just a database — it doesn't need to know about the Prod/Shadow split.
+The MCP server connects to Mori's proxy using the appropriate database driver for your engine. From the MCP server's perspective, Mori is just a database — it doesn't need to know about the Prod/Shadow split.
 </Info>

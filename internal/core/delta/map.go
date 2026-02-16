@@ -83,6 +83,16 @@ func (m *Map) LoadInsertedTables(tables []string) {
 	}
 }
 
+// HasAnyDelta reports whether any delta entries or inserts exist at all.
+func (m *Map) HasAnyDelta() bool {
+	if len(m.s.tables()) > 0 {
+		return true
+	}
+	m.insertMu.RLock()
+	defer m.insertMu.RUnlock()
+	return len(m.insertedTables) > 0
+}
+
 // AnyTableDelta reports whether any of the given tables have delta entries or inserts.
 func (m *Map) AnyTableDelta(tables []string) bool {
 	for _, t := range tables {

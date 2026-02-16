@@ -106,7 +106,11 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	// 7. Apply schema to Shadow
 	shadowConnStr := connstr.ShadowDSN(containerInfo.HostPort, dsn.DBName)
 	fmt.Println("Applying schema to Shadow...")
-	if err := schema.ApplyToShadow(ctx, shadowConnStr, dumpResult); err != nil {
+	extOpts := &schema.ExtInstallOptions{
+		ContainerID: containerInfo.ContainerID,
+		PGMajor:     version.Major,
+	}
+	if err := schema.ApplyToShadow(ctx, shadowConnStr, dumpResult, extOpts); err != nil {
 		initErr = err
 		return nil, fmt.Errorf("failed to apply schema to Shadow: %w", err)
 	}

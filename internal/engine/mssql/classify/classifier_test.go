@@ -373,3 +373,199 @@ func TestClassifyWithParams(t *testing.T) {
 		t.Errorf("PK = %q, want %q", cl.PKs[0].PK, "42")
 	}
 }
+
+// -- Enhanced T-SQL classifier tests --
+
+func TestClassify_WindowFunctions(t *testing.T) {
+	c := New(nil)
+	tests := []struct {
+		name string
+		sql  string
+	}{
+		{"row_number", "SELECT ROW_NUMBER() OVER (ORDER BY id) AS rn, name FROM users"},
+		{"rank", "SELECT RANK() OVER (PARTITION BY dept ORDER BY salary DESC) FROM employees"},
+		{"dense_rank", "SELECT DENSE_RANK() OVER (ORDER BY score) FROM scores"},
+		{"lag", "SELECT LAG(salary, 1) OVER (ORDER BY hire_date) FROM employees"},
+		{"lead", "SELECT LEAD(salary) OVER (ORDER BY id) FROM employees"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl, err := c.Classify(tt.sql)
+			if err != nil {
+				t.Fatalf("Classify error: %v", err)
+			}
+			if cl.OpType != core.OpRead {
+				t.Errorf("OpType = %v, want OpRead", cl.OpType)
+			}
+			if !cl.IsComplexRead {
+				t.Error("IsComplexRead should be true for window function")
+			}
+		})
+	}
+}
+
+func TestClassify_Pivot(t *testing.T) {
+	c := New(nil)
+
+	t.Run("pivot", func(t *testing.T) {
+		sql := "SELECT * FROM (SELECT dept, amount FROM sales) AS src PIVOT (SUM(amount) FOR dept IN ([A], [B])) AS pvt"
+		cl, err := c.Classify(sql)
+		if err != nil {
+			t.Fatalf("Classify error: %v", err)
+		}
+		if cl.OpType != core.OpRead {
+			t.Errorf("OpType = %v, want OpRead", cl.OpType)
+		}
+		if !cl.IsComplexRead {
+			t.Error("IsComplexRead should be true for PIVOT")
+		}
+	})
+
+	t.Run("unpivot", func(t *testing.T) {
+		sql := "SELECT * FROM sales UNPIVOT (amount FOR quarter IN ([Q1], [Q2])) AS unpvt"
+		cl, _ := c.Classify(sql)
+		if !cl.IsComplexRead {
+			t.Error("IsComplexRead should be true for UNPIVOT")
+		}
+	})
+}
+
+func TestClassify_CrossApply(t *testing.T) {
+	c := New(nil)
+
+	t.Run("cross apply", func(t *testing.T) {
+		sql := "SELECT u.name, a.addr FROM users u CROSS APPLY (SELECT TOP 1 addr FROM addresses WHERE user_id = u.id) a"
+		cl, _ := c.Classify(sql)
+		if !cl.IsComplexRead {
+			t.Error("IsComplexRead should be true for CROSS APPLY")
+		}
+		if !cl.IsJoin {
+			t.Error("IsJoin should be true for CROSS APPLY")
+		}
+	})
+
+	t.Run("outer apply", func(t *testing.T) {
+		sql := "SELECT * FROM orders o OUTER APPLY (SELECT TOP 1 * FROM details WHERE order_id = o.id) d"
+		cl, _ := c.Classify(sql)
+		if !cl.IsComplexRead {
+			t.Error("IsComplexRead should be true for OUTER APPLY")
+		}
+	})
+}
+
+func TestClassify_PermissionStatements(t *testing.T) {
+	c := New(nil)
+
+	for _, sql := range []string{
+		"GRANT SELECT ON users TO app_role",
+		"REVOKE INSERT ON orders FROM app_role",
+		"DENY DELETE ON logs TO readonly_role",
+	} {
+		cl, err := c.Classify(sql)
+		if err != nil {
+			t.Fatalf("Classify(%q) error: %v", sql, err)
+		}
+		if cl.OpType != core.OpOther {
+			t.Errorf("Classify(%q): OpType = %v, want OpOther", sql, cl.OpType)
+		}
+	}
+}
+
+func TestClassify_ConditionalStatements(t *testing.T) {
+	c := New(nil)
+
+	t.Run("if with insert", func(t *testing.T) {
+		sql := "IF NOT EXISTS (SELECT 1 FROM users WHERE id = 1) INSERT INTO users (id) VALUES (1)"
+		cl, _ := c.Classify(sql)
+		if cl.OpType != core.OpWrite {
+			t.Errorf("OpType = %v, want OpWrite", cl.OpType)
+		}
+	})
+
+	t.Run("if with select only", func(t *testing.T) {
+		sql := "IF 1=1 PRINT 'hello'"
+		cl, _ := c.Classify(sql)
+		if cl.OpType != core.OpOther {
+			t.Errorf("OpType = %v, want OpOther", cl.OpType)
+		}
+	})
+}
+
+func TestClassify_SchemaQualifiedTables(t *testing.T) {
+	c := New(nil)
+
+	t.Run("dbo.users", func(t *testing.T) {
+		cl, _ := c.Classify("SELECT * FROM dbo.users")
+		if len(cl.Tables) == 0 {
+			t.Fatal("expected at least 1 table")
+		}
+		if cl.Tables[0] != "users" {
+			t.Errorf("table = %q, want %q", cl.Tables[0], "users")
+		}
+	})
+
+	t.Run("bracket schema", func(t *testing.T) {
+		cl, _ := c.Classify("SELECT * FROM [dbo].[users]")
+		if len(cl.Tables) == 0 {
+			t.Fatal("expected at least 1 table")
+		}
+		if cl.Tables[0] != "users" {
+			t.Errorf("table = %q, want %q", cl.Tables[0], "users")
+		}
+	})
+}
+
+func TestClassify_AdditionalAggregates(t *testing.T) {
+	c := New(nil)
+
+	tests := []struct {
+		name string
+		sql  string
+	}{
+		{"stdev", "SELECT STDEV(salary) FROM employees"},
+		{"count_big", "SELECT COUNT_BIG(*) FROM logs"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl, _ := c.Classify(tt.sql)
+			if !cl.HasAggregate {
+				t.Errorf("HasAggregate should be true for %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestClassify_MergeTableExtraction(t *testing.T) {
+	c := New(nil)
+
+	t.Run("merge with distinct tables", func(t *testing.T) {
+		sql := "MERGE INTO users AS target USING staging_data AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET name = source.name"
+		cl, err := c.Classify(sql)
+		if err != nil {
+			t.Fatalf("Classify error: %v", err)
+		}
+		if cl.OpType != core.OpWrite {
+			t.Errorf("OpType = %v, want OpWrite", cl.OpType)
+		}
+		if len(cl.Tables) < 2 {
+			t.Errorf("expected at least 2 tables for MERGE, got %v", cl.Tables)
+		}
+	})
+
+	t.Run("merge with schema-qualified tables", func(t *testing.T) {
+		// Schema-qualified same table name collapses to one entry (expected).
+		sql := "MERGE INTO [dbo].[users] AS target USING [staging].[users] AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET name = source.name"
+		cl, err := c.Classify(sql)
+		if err != nil {
+			t.Fatalf("Classify error: %v", err)
+		}
+		if cl.OpType != core.OpWrite {
+			t.Errorf("OpType = %v, want OpWrite", cl.OpType)
+		}
+		if len(cl.Tables) < 1 {
+			t.Errorf("expected at least 1 table for MERGE, got %v", cl.Tables)
+		}
+	})
+}

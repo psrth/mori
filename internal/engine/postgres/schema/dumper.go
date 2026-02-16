@@ -102,8 +102,16 @@ func StripPsqlMeta(schemaSQL string) string {
 	return psqlMetaRegex.ReplaceAllString(schemaSQL, "")
 }
 
+// ExtInstallOptions provides container context for auto-installing extensions.
+type ExtInstallOptions struct {
+	ContainerID string // Docker container ID or name for docker exec
+	PGMajor     int    // PostgreSQL major version (e.g. 16) for apt package names
+}
+
 // InstallExtensions connects to Shadow and installs each extension.
-func InstallExtensions(ctx context.Context, shadowConnStr string, exts []Extension) error {
+// If CREATE EXTENSION fails and container info is provided, it attempts to
+// auto-install the extension package via apt-get inside the container.
+func InstallExtensions(ctx context.Context, shadowConnStr string, exts []Extension, opts *ExtInstallOptions) error {
 	if len(exts) == 0 {
 		return nil
 	}
@@ -117,8 +125,38 @@ func InstallExtensions(ctx context.Context, shadowConnStr string, exts []Extensi
 	for _, ext := range exts {
 		_, err := conn.Exec(ctx, fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q", ext.Name))
 		if err != nil {
+			if opts != nil && opts.ContainerID != "" {
+				fmt.Printf("  Extension %q not available, attempting auto-install...\n", ext.Name)
+				if installErr := aptInstallExtension(ctx, opts.ContainerID, opts.PGMajor, ext.Name); installErr != nil {
+					return fmt.Errorf("extension %q: CREATE EXTENSION failed and auto-install failed — re-run with --image <image-with-extension>: %w (install error: %v)", ext.Name, err, installErr)
+				}
+				// Retry CREATE EXTENSION after apt install.
+				_, retryErr := conn.Exec(ctx, fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %q", ext.Name))
+				if retryErr != nil {
+					return fmt.Errorf("extension %q: installed package but CREATE EXTENSION still failed — re-run with --image <image-with-extension>: %w", ext.Name, retryErr)
+				}
+				fmt.Printf("  Extension %q installed successfully\n", ext.Name)
+				continue
+			}
 			return fmt.Errorf("Prod uses extension %q but Shadow image doesn't have it — re-run with --image <image-with-extension>: %w", ext.Name, err)
 		}
+	}
+	return nil
+}
+
+// aptInstallExtension runs apt-get inside the Shadow container to install a
+// PostgreSQL extension package. Official Postgres Docker images ship with PGDG
+// apt repos pre-configured, so packages like postgresql-16-pgvector are available.
+func aptInstallExtension(ctx context.Context, containerID string, pgMajor int, extName string) error {
+	// The standard PGDG package naming convention is postgresql-<major>-<extension>.
+	pkgName := fmt.Sprintf("postgresql-%d-%s", pgMajor, extName)
+
+	// Run apt-get update + install inside the container.
+	cmd := exec.CommandContext(ctx, "docker", "exec", containerID,
+		"sh", "-c", fmt.Sprintf("apt-get update -qq && apt-get install -y -qq %s", pkgName))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("apt-get install %s failed: %s", pkgName, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
@@ -390,8 +428,10 @@ func FullDump(ctx context.Context, conn *pgx.Conn, dsn *connstr.ProdDSN, image s
 }
 
 // ApplyToShadow takes a DumpResult and applies it to the Shadow database.
-func ApplyToShadow(ctx context.Context, shadowConnStr string, result *DumpResult) error {
-	if err := InstallExtensions(ctx, shadowConnStr, result.Extensions); err != nil {
+// If extOpts is provided, extensions that fail to install will be auto-installed
+// via apt-get inside the container.
+func ApplyToShadow(ctx context.Context, shadowConnStr string, result *DumpResult, extOpts *ExtInstallOptions) error {
+	if err := InstallExtensions(ctx, shadowConnStr, result.Extensions, extOpts); err != nil {
 		return err
 	}
 	if err := ApplySchema(ctx, shadowConnStr, result.SchemaSQL); err != nil {

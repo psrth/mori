@@ -29,6 +29,7 @@ For scripting, use --from with a connection string:
 func init() {
 	initCmd.Flags().StringP("from", "f", "", "Connection string (non-interactive)")
 	initCmd.Flags().String("name", "", "Connection name (used with --from)")
+	initCmd.Flags().String("image", "", "Docker image for Shadow container (overrides auto-detected version)")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -48,19 +49,20 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	from, _ := cmd.Flags().GetString("from")
 	name, _ := cmd.Flags().GetString("name")
+	image, _ := cmd.Flags().GetString("image")
 
 	// Non-interactive mode: --from flag provided.
 	if from != "" {
-		return runNonInteractiveInit(projectRoot, existing, from, name)
+		return runNonInteractiveInit(projectRoot, existing, from, name, image)
 	}
 
 	// Interactive mode (default).
-	return runInteractiveInit(projectRoot, existing)
+	return runInteractiveInit(projectRoot, existing, image)
 }
 
 // runNonInteractiveInit parses a connection string and saves it to mori.yaml.
 // Requires --name when used non-interactively.
-func runNonInteractiveInit(projectRoot string, existing *config.ProjectConfig, connStr, name string) error {
+func runNonInteractiveInit(projectRoot string, existing *config.ProjectConfig, connStr, name, image string) error {
 	if name == "" {
 		return fmt.Errorf("--name is required when using --from")
 	}
@@ -93,6 +95,9 @@ func runNonInteractiveInit(projectRoot string, existing *config.ProjectConfig, c
 		Password: connInfo.Password,
 		Database: connInfo.DBName,
 		SSLMode:  connInfo.SSLMode,
+	}
+	if image != "" {
+		conn.Extra = map[string]string{"image": image}
 	}
 
 	if existing == nil {

@@ -138,8 +138,6 @@ func (c *Connection) ToConnString() string {
 		return c.toMSSQLConnString()
 	case "mysql", "mariadb":
 		return c.toMySQLConnString()
-	case "oracle":
-		return c.toOracleConnString()
 	case "sqlite":
 		return c.toSQLiteConnString()
 	case "firestore":
@@ -208,28 +206,6 @@ func (c *Connection) toMySQLConnString() string {
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s",
 		url.PathEscape(c.User), url.PathEscape(c.Password),
 		host, port, c.Database)
-}
-
-func (c *Connection) toOracleConnString() string {
-	host := c.Host
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	port := c.Port
-	if port == 0 {
-		port = 1521
-	}
-	svcName := c.Extra["service_name"]
-	if svcName == "" {
-		svcName = c.Database
-	}
-	u := &url.URL{
-		Scheme: "oracle",
-		User:   url.UserPassword(c.User, c.Password),
-		Host:   fmt.Sprintf("%s:%d", host, port),
-		Path:   svcName,
-	}
-	return u.String()
 }
 
 func (c *Connection) toSQLiteConnString() string {

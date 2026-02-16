@@ -49,8 +49,8 @@ These hold at all times, without exception.
 | `mysql` | MySQL | SQL / MySQL | 3306 | Supported |
 | `mariadb` | MariaDB | SQL / MySQL | 3306 | Supported |
 | `mssql` | MS SQL Server | SQL / TDS | 1433 | Supported |
-| `oracle` | Oracle | SQL / Net8 | 1521 | Supported |
 | `sqlite` | SQLite | SQL / Embedded | N/A | Supported |
+| `duckdb` | DuckDB | SQL / Embedded | N/A | Supported |
 | `redis` | Redis | NoSQL | 6379 | Supported |
 | `firestore` | Firestore | NoSQL | N/A | Supported |
 | `mongodb` | MongoDB | NoSQL | 27017 | Planned |
@@ -66,7 +66,7 @@ These hold at all times, without exception.
 |----------|-------------------|-------------|
 | **Direct / Self-Hosted** | All | Engine default |
 | **GCP Cloud SQL** | Postgres, MySQL, MSSQL | require |
-| **AWS RDS / Aurora** | Postgres, MySQL, MariaDB, MSSQL, Oracle | require |
+| **AWS RDS / Aurora** | Postgres, MySQL, MariaDB, MSSQL | require |
 | **Neon** | Postgres | require |
 | **Supabase** | Postgres | require |
 | **Azure Database** | Postgres, MySQL, MariaDB, MSSQL | require |
@@ -89,9 +89,9 @@ Each engine requires specific connection parameters:
 
 **MS SQL Server**: host, port, user, password, database, encrypt, trust_server_cert
 
-**Oracle**: host, port, user, password, service_name
-
 **SQLite**: file_path
+
+**DuckDB**: file_path (also supports URI format `duckdb:///path/to/db.duckdb` and `:memory:`)
 
 **Redis**: host, port, password, db_number, ssl
 
@@ -293,7 +293,7 @@ Sequence offset formula: `max(prod_max * 10, prod_max + 10,000,000)`
 ### 5.1 Prerequisites
 
 - Go 1.21+
-- Docker (for Shadow containers — all engines except SQLite)
+- Docker (for Shadow containers — all engines except SQLite and DuckDB)
 
 ### 5.2 Quick Start
 
@@ -320,6 +320,7 @@ go build -o mori ./cmd/mori
 |---------|------------|
 | `mori init` | Interactive setup: select engine, provider, enter credentials |
 | `mori init --from <conn_string>` | Non-interactive init with connection string |
+| `mori init --image <image>` | Use a custom Docker image for the Shadow container |
 | `mori start [connection-name]` | Start proxy (first run creates Shadow) |
 | `mori start --port <port>` | Start on a specific port |
 | `mori start --verbose` | Log all queries and routing decisions |
@@ -368,7 +369,12 @@ Mori stores state in a `.mori/` directory at the project root:
 
 ### 5.6 MCP Server
 
-Mori includes an MCP (Model Context Protocol) server for AI agent integration. AI coding agents can programmatically manage Mori instances — init, start, reset, inspect state — as part of their test-verify loop.
+Mori includes an MCP (Model Context Protocol) server for AI agent integration that supports all 9 engines. AI coding agents can programmatically query databases — reads from Prod, writes to Shadow — as part of their test-verify loop.
+
+Tools by engine type:
+- **SQL engines** (PostgreSQL, CockroachDB, MySQL, MariaDB, MSSQL, SQLite, DuckDB): `db_query` tool
+- **Redis**: `redis_command`, `redis_get`, `redis_hgetall`, `redis_keys`
+- **Firestore**: `firestore_get`, `firestore_list`, `firestore_query`
 
 ---
 
@@ -413,12 +419,19 @@ Classify at template parse time (tables, operation type); resolve PK values at p
 
 ### 7.1 Current State (v1)
 
-- PostgreSQL core: full CRUD, merged reads (single table + JOINs), transactions, DDL, schema adaptation
-- 9 engine implementations (Postgres, CockroachDB, MySQL, MariaDB, MSSQL, Oracle, SQLite, Redis, Firestore)
+- All SQL engines at parity: merged reads, write hydration, transactions (TxnHandler), extended query protocol (ExtHandler), DDL tracking, schema adaptation
+- 9 engine implementations (PostgreSQL, CockroachDB, MySQL, MariaDB, MSSQL, SQLite, DuckDB, Redis, Firestore)
+- MySQL/MariaDB: vitess AST classifier, COM_STMT_PREPARE support, version-matched shadow images
+- MSSQL: TDS RPC support (sp_executesql/sp_prepare), enhanced T-SQL classifier, version-matched shadow images
+- SQLite: all handlers implemented (Read, Write, DDL, Txn, Ext), FK stripping, RENAME COLUMN support
+- DuckDB: new embedded OLAP engine, file-based shadow, pgwire protocol, full handler parity with SQLite
+- Redis: Pub/Sub fan-in, EVAL/EVALSHA support, merged SCAN, version-matched shadow images
+- Firestore: SDK-based architecture, document-level merged reads, delta/tombstone tracking, seed cap removed
+- PostgreSQL: extension auto-install via apt-get, `--image` flag for custom Docker images
+- Multi-engine MCP server (SQL db_query, Redis tools, Firestore tools)
 - 14 auth providers
 - 202+ E2E tests (PostgreSQL)
 - TUI dashboard
-- MCP server for AI agent integration
 
 ### 7.2 v1.1 — Fast Follows
 
@@ -440,7 +453,7 @@ Classify at template parse time (tables, operation type); resolve PK values at p
 
 ### 7.4 Future Engines
 
-MongoDB, Elasticsearch, DynamoDB, Cassandra, ClickHouse, Neo4j — all registered in the engine catalog, not yet implemented.
+MongoDB, Elasticsearch, DynamoDB, Cassandra, ClickHouse, Neo4j — registered in the engine catalog, not yet implemented.
 
 ---
 
@@ -475,8 +488,8 @@ internal/
       connstr/, classify/, proxy/, schema/, shadow/
     mysql/                       # MySQL + MariaDB
     mssql/                       # MS SQL Server
-    oracle/                      # Oracle Database
     sqlite/                      # SQLite (file-based)
+    duckdb/                      # DuckDB (file-based, embedded OLAP)
     redis/                       # Redis
     firestore/                   # Google Firestore
 
@@ -495,7 +508,7 @@ internal/
 e2e/                             # End-to-end test suite
   e2e_test.go, helpers_test.go, seed.sql
   01-06_*_test.go                # PostgreSQL tests
-  redis/, firestore/, sqlite/, mssql/, oracle/
+  redis/, firestore/, sqlite/, mssql/, duckdb/
 ```
 
 ### 8.2 Engine Interface

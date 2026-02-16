@@ -100,7 +100,13 @@ func runReset(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("schema dump failed: %w", err)
 		}
 
-		if err := schema.ApplyToShadow(ctx, shadowConnStr, dumpResult); err != nil {
+		extOpts := &schema.ExtInstallOptions{
+			ContainerID: cfg.ShadowContainer,
+		}
+		if v, parseErr := schema.ParseVersion(cfg.EngineVersion); parseErr == nil {
+			extOpts.PGMajor = v.Major
+		}
+		if err := schema.ApplyToShadow(ctx, shadowConnStr, dumpResult, extOpts); err != nil {
 			return fmt.Errorf("failed to apply schema to Shadow: %w", err)
 		}
 

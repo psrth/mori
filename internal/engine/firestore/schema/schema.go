@@ -32,12 +32,13 @@ func DetectCollections(ctx context.Context, client *firestore.Client) (map[strin
 	return collections, nil
 }
 
+// DefaultSeedLimit is the default number of documents to seed per collection
+// when no explicit limit is provided. Set to 0 for unlimited.
+const DefaultSeedLimit = 0
+
 // SeedShadow copies documents from prod collections into the shadow emulator.
-// It reads up to maxDocs documents per collection to keep init time reasonable.
+// If maxDocs <= 0, all documents are seeded (no limit).
 func SeedShadow(ctx context.Context, prodClient, shadowClient *firestore.Client, collections map[string]CollectionMeta, maxDocs int) error {
-	if maxDocs <= 0 {
-		maxDocs = 100
-	}
 
 	for collID := range collections {
 		if err := seedCollection(ctx, prodClient, shadowClient, collID, maxDocs); err != nil {
@@ -48,7 +49,11 @@ func SeedShadow(ctx context.Context, prodClient, shadowClient *firestore.Client,
 }
 
 func seedCollection(ctx context.Context, prodClient, shadowClient *firestore.Client, collID string, maxDocs int) error {
-	docs := prodClient.Collection(collID).Limit(maxDocs).Documents(ctx)
+	query := prodClient.Collection(collID).Query
+	if maxDocs > 0 {
+		query = query.Limit(maxDocs)
+	}
+	docs := query.Documents(ctx)
 	defer docs.Stop()
 
 	batch := shadowClient.Batch()
