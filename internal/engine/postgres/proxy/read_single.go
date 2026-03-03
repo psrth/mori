@@ -164,9 +164,12 @@ func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) 
 }
 
 // aggregateReadCore handles aggregate queries on affected tables by converting
-// to a row-level merged read and re-aggregating. For simple COUNT(*) without
-// GROUP BY, it runs the base SELECT pk query through merged read and counts rows.
-// Complex aggregates (GROUP BY, SUM, etc.) fall back to Prod-only execution.
+// to a row-level merged read and re-aggregating.
+//
+// Strategy order:
+//  1. Simple COUNT(*) without GROUP BY → base SELECT pk, merge, count rows.
+//  2. GROUP BY with supported aggregates → base SELECT cols, merge, re-aggregate in Go.
+//  3. Fall back to Prod-only execution (when no schema diffs) or Shadow-only (with schema diffs).
 func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL string) (
 	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
 ) {
@@ -175,31 +178,34 @@ func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL strin
 	}
 	table := cl.Tables[0]
 
-	// Try to build a base query for row-level counting.
+	// Strategy 1: Simple COUNT(*) without GROUP BY.
 	baseSQL := rh.buildAggregateBaseQuery(querySQL, table)
-	if baseSQL == "" {
-		// Complex aggregate (GROUP BY, etc.) — fall back to Prod-only.
-		prodResult, err := execQuery(rh.prodConn, querySQL)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("prod aggregate query: %w", err)
-		}
-		if prodResult.Error != "" {
-			return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
-		}
-		return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
+	if baseSQL != "" {
+		return rh.executeSimpleCountAggregate(cl, baseSQL, querySQL)
 	}
 
-	// Create a non-aggregate classification for the base query.
+	// Strategy 2: GROUP BY with supported aggregates (COUNT, SUM, AVG, MIN, MAX).
+	spec := rh.buildGroupBySpec(querySQL, table)
+	if spec != nil {
+		return rh.executeGroupByAggregate(cl, spec)
+	}
+
+	// Strategy 3: Fall back to Prod or Shadow.
+	return rh.aggregateFallback(cl, querySQL)
+}
+
+// executeSimpleCountAggregate handles COUNT(*) without GROUP BY through the merge pipeline.
+func (rh *ReadHandler) executeSimpleCountAggregate(cl *core.Classification, baseSQL, querySQL string) (
+	[]ColumnInfo, [][]string, [][]bool, error,
+) {
 	baseCl := *cl
 	baseCl.HasAggregate = false
 	baseCl.HasLimit = false
 	baseCl.Limit = 0
 	baseCl.OrderBy = ""
 
-	// Execute the base query through normal merged read pipeline.
 	_, baseValues, _, mergeErr := rh.mergedReadCore(&baseCl, baseSQL)
 	if mergeErr != nil {
-		// If merged read fails, fall back to Prod-only.
 		if _, ok := mergeErr.(*relayError); ok {
 			prodResult, pErr := execQuery(rh.prodConn, querySQL)
 			if pErr != nil {
@@ -213,14 +219,118 @@ func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL strin
 		return nil, nil, nil, mergeErr
 	}
 
-	// Re-aggregate: count the merged rows.
 	count := len(baseValues)
 	countStr := fmt.Sprintf("%d", count)
-
 	return []ColumnInfo{{Name: "count", OID: 20}},
 		[][]string{{countStr}},
 		[][]bool{{false}},
 		nil
+}
+
+// executeGroupByAggregate handles GROUP BY queries by fetching row-level data
+// through the merge pipeline and re-aggregating in Go.
+func (rh *ReadHandler) executeGroupByAggregate(cl *core.Classification, spec *groupBySpec) (
+	[]ColumnInfo, [][]string, [][]bool, error,
+) {
+	baseCl := *cl
+	baseCl.HasAggregate = false
+	baseCl.HasLimit = false
+	baseCl.Limit = 0
+	baseCl.OrderBy = ""
+
+	baseCols, baseValues, baseNulls, err := rh.mergedReadCore(&baseCl, spec.BaseSQL)
+	if err != nil {
+		// If merge fails, try Shadow-only as last resort.
+		shadowResult, sErr := execQuery(rh.shadowConn, cl.RawSQL)
+		if sErr != nil || shadowResult.Error != "" {
+			return nil, nil, nil, fmt.Errorf("group by merge failed: %w", err)
+		}
+		return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+	}
+
+	// Re-aggregate the merged rows.
+	resultCols, resultValues, resultNulls := reAggregateRows(spec, baseCols, baseValues, baseNulls)
+
+	// Apply HAVING filter.
+	if spec.HavingAST != nil {
+		var filtered [][]string
+		var filteredNulls [][]bool
+		for i, row := range resultValues {
+			rowMap := make(map[string]string)
+			for j, col := range resultCols {
+				if j < len(row) {
+					rowMap[col.Name] = row[j]
+				}
+			}
+			if evaluateHaving(spec.HavingAST, rowMap) {
+				filtered = append(filtered, row)
+				filteredNulls = append(filteredNulls, resultNulls[i])
+			}
+		}
+		resultValues = filtered
+		resultNulls = filteredNulls
+	}
+
+	// Apply ORDER BY.
+	if cl.OrderBy != "" {
+		sortMerged(resultCols, resultValues, resultNulls, cl.OrderBy)
+	}
+
+	// Apply LIMIT.
+	if cl.HasLimit && cl.Limit > 0 && len(resultValues) > cl.Limit {
+		resultValues = resultValues[:cl.Limit]
+		resultNulls = resultNulls[:cl.Limit]
+	}
+
+	return resultCols, resultValues, resultNulls, nil
+}
+
+// aggregateFallback handles aggregate queries that can't be decomposed into
+// row-level merge + re-aggregation. If the table has schema diffs, it tries
+// Prod with rewritten SQL; otherwise falls back to Prod-only execution.
+func (rh *ReadHandler) aggregateFallback(cl *core.Classification, querySQL string) (
+	[]ColumnInfo, [][]string, [][]bool, error,
+) {
+	hasSchemaChange := false
+	if rh.schemaRegistry != nil {
+		for _, t := range cl.Tables {
+			if rh.schemaRegistry.HasDiff(t) {
+				hasSchemaChange = true
+				break
+			}
+		}
+	}
+
+	if hasSchemaChange {
+		// Try rewriting the query for Prod compatibility.
+		rewritten, skipProd := rewriteSQLForProd(querySQL, rh.schemaRegistry, cl.Tables)
+		if !skipProd {
+			prodResult, err := execQuery(rh.prodConn, rewritten)
+			if err == nil && prodResult.Error == "" {
+				return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
+			}
+		}
+
+		// Prod failed or was skipped — try Shadow-only as last resort.
+		shadowResult, err := execQuery(rh.shadowConn, querySQL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("shadow aggregate fallback: %w", err)
+		}
+		if shadowResult.Error != "" {
+			return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
+		}
+		return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+	}
+
+	// No schema diffs — safe to run on Prod directly.
+	prodResult, err := execQuery(rh.prodConn, querySQL)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("prod aggregate query: %w", err)
+	}
+	if prodResult.Error != "" {
+		return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
+	}
+	return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
 }
 
 // buildAggregateBaseQuery converts a COUNT(*) query to SELECT pk FROM table [WHERE ...].
@@ -385,58 +495,17 @@ func (rh *ReadHandler) rewriteForProd(sql, table string) (string, bool) {
 		return sql, true // Shadow-only table.
 	}
 
-	result := sql
-
-	// Handle added columns: strip them from the SELECT list.
-	// If it's SELECT *, no rewriting needed (Prod returns its columns, adaptation adds NULLs).
-	upper := strings.ToUpper(strings.TrimSpace(result))
-	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
-	isSelectStar := false
-	if selectIdx >= 0 && fromIdx > selectIdx {
-		selectPart := strings.TrimSpace(upper[selectIdx+6 : fromIdx])
-		isSelectStar = selectPart == "*" || strings.HasPrefix(selectPart, "DISTINCT *")
-	}
-
-	if !isSelectStar && selectIdx >= 0 && fromIdx > selectIdx {
-		// Strip added columns from the SELECT list.
-		addedSet := make(map[string]bool)
-		for _, col := range diff.Added {
-			addedSet[strings.ToLower(col.Name)] = true
-		}
-
-		selectList := result[selectIdx+6 : selectIdx+(fromIdx-selectIdx)]
-		parts := strings.Split(selectList, ",")
-		var kept []string
-		for _, part := range parts {
-			colName := strings.TrimSpace(part)
-			// Strip alias: "col AS alias"
-			checkName := colName
-			if asIdx := strings.Index(strings.ToUpper(checkName), " AS "); asIdx >= 0 {
-				checkName = strings.TrimSpace(checkName[:asIdx])
-			}
-			// Strip table prefix: "t.col"
-			if dotIdx := strings.LastIndex(checkName, "."); dotIdx >= 0 {
-				checkName = checkName[dotIdx+1:]
-			}
-			checkName = strings.Trim(checkName, `"`)
-			if !addedSet[strings.ToLower(checkName)] {
-				kept = append(kept, part)
-			}
-		}
-
-		if len(kept) == 0 {
-			// All columns were added — use SELECT * (Prod has its own columns).
-			result = result[:selectIdx+6] + " *" + result[selectIdx+(fromIdx-selectIdx):]
-		} else {
-			result = result[:selectIdx+6] + strings.Join(kept, ",") + result[selectIdx+(fromIdx-selectIdx):]
-		}
+	// Use AST-based rewriting for WHERE, ORDER BY, GROUP BY, and SELECT list.
+	// This handles shadow-only column references in all clauses correctly
+	// (e.g., WHERE added_col IS NULL becomes a no-op for Prod).
+	tables := []string{table}
+	result, skipProd := rewriteSQLForProd(sql, rh.schemaRegistry, tables)
+	if skipProd {
+		return sql, true
 	}
 
 	// Handle renamed columns: replace new name with old name.
-	// Build reverse map: new_name -> old_name.
 	for oldName, newName := range diff.Renamed {
-		// Case-insensitive replacement in the SQL.
 		result = replaceColumnName(result, newName, oldName)
 	}
 

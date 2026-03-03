@@ -39,6 +39,9 @@ func (w *WriteHandler) handleUpdate(
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
 
+	// Hydrate any cross-table references (subqueries in SET/WHERE) from Prod.
+	w.hydrateReferencedTables(cl.RawSQL, cl.Tables[0])
+
 	// Point update: hydrate missing rows, then execute.
 	for _, pk := range cl.PKs {
 		if w.deltaMap.IsDelta(pk.Table, pk.PK) {
@@ -99,8 +102,23 @@ func (w *WriteHandler) handleBulkUpdate(
 		if w.verbose {
 			log.Printf("[conn %d] bulk UPDATE: failed to build hydration query: %v", w.connID, err)
 		}
-		// Fallback: forward to Shadow without hydration.
-		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
+		// Fallback: forward to Shadow without hydration, then track delta PKs.
+		return w.shadowOnlyUpdateWithDeltaTracking(clientConn, rawMsg, cl.RawSQL, table, pkCol)
+	}
+
+	// Rewrite the hydration SELECT for Prod compatibility (strip shadow-only columns
+	// from WHERE so Prod doesn't reject the query).
+	if w.schemaRegistry != nil {
+		rewritten, skipProd := rewriteSQLForProd(selectSQL, w.schemaRegistry, cl.Tables)
+		if skipProd {
+			// The entire WHERE is on shadow-only columns — no Prod rows can match.
+			// Execute UPDATE on Shadow only and track delta PKs from Shadow.
+			if w.verbose {
+				log.Printf("[conn %d] bulk UPDATE: hydration query irrelevant for Prod, Shadow-only", w.connID)
+			}
+			return w.shadowOnlyUpdateWithDeltaTracking(clientConn, rawMsg, cl.RawSQL, table, pkCol)
+		}
+		selectSQL = rewritten
 	}
 
 	if w.verbose {
@@ -113,13 +131,13 @@ func (w *WriteHandler) handleBulkUpdate(
 		if w.verbose {
 			log.Printf("[conn %d] bulk UPDATE: Prod query failed: %v", w.connID, err)
 		}
-		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
+		return w.shadowOnlyUpdateWithDeltaTracking(clientConn, rawMsg, cl.RawSQL, table, pkCol)
 	}
 	if result.Error != "" {
 		if w.verbose {
 			log.Printf("[conn %d] bulk UPDATE: Prod query error: %s", w.connID, result.Error)
 		}
-		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
+		return w.shadowOnlyUpdateWithDeltaTracking(clientConn, rawMsg, cl.RawSQL, table, pkCol)
 	}
 
 	// 3. Find PK column index in results.
@@ -169,7 +187,10 @@ func (w *WriteHandler) handleBulkUpdate(
 		log.Printf("[conn %d] bulk UPDATE: hydrated %d rows (%d total matched)", w.connID, hydratedCount, len(affectedPKs))
 	}
 
-	// 5. Execute the original UPDATE on Shadow.
+	// 5. Hydrate cross-table references (subqueries in SET/WHERE) from Prod.
+	w.hydrateReferencedTables(cl.RawSQL, table)
+
+	// 6. Execute the original UPDATE on Shadow.
 	if err := forwardAndRelay(rawMsg, w.shadowConn, clientConn); err != nil {
 		return err
 	}
@@ -190,6 +211,110 @@ func (w *WriteHandler) handleBulkUpdate(
 				log.Printf("[conn %d] failed to persist delta map: %v", w.connID, err)
 			}
 		}
+	}
+
+	return nil
+}
+
+// shadowOnlyUpdateWithDeltaTracking executes an UPDATE on Shadow without Prod
+// hydration, then queries Shadow for the affected PKs and adds them to the
+// delta map. This is used when the hydration query cannot run on Prod (e.g.,
+// WHERE clause references shadow-only columns).
+func (w *WriteHandler) shadowOnlyUpdateWithDeltaTracking(
+	clientConn net.Conn,
+	rawMsg []byte,
+	rawSQL string,
+	table string,
+	pkCol string,
+) error {
+	// Execute the UPDATE on Shadow and relay to client.
+	if err := forwardAndRelay(rawMsg, w.shadowConn, clientConn); err != nil {
+		return err
+	}
+
+	// Discover affected PKs by querying Shadow with a SELECT using the same
+	// WHERE clause as the original UPDATE. We build this by selecting just the
+	// PK column from the table with the original WHERE.
+	pkSelectSQL := fmt.Sprintf("SELECT %s FROM %s", quoteIdent(pkCol), quoteIdent(table))
+
+	// Extract the WHERE clause from the original UPDATE by parsing it.
+	parseResult, parseErr := pg_query.Parse(rawSQL)
+	if parseErr == nil {
+		stmts := parseResult.GetStmts()
+		if len(stmts) > 0 {
+			if upd := stmts[0].GetStmt().GetUpdateStmt(); upd != nil && upd.GetWhereClause() != nil {
+				// Rebuild as a SELECT <pk> FROM <table> WHERE <original where>
+				sel := &pg_query.SelectStmt{
+					TargetList: []*pg_query.Node{
+						{Node: &pg_query.Node_ResTarget{ResTarget: &pg_query.ResTarget{
+							Val: &pg_query.Node{Node: &pg_query.Node_ColumnRef{ColumnRef: &pg_query.ColumnRef{
+								Fields: []*pg_query.Node{{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: pkCol}}}},
+							}}},
+						}}},
+					},
+					FromClause: []*pg_query.Node{
+						{Node: &pg_query.Node_RangeVar{RangeVar: upd.GetRelation()}},
+					},
+					WhereClause: upd.GetWhereClause(),
+				}
+				deparsed, dErr := pg_query.Deparse(&pg_query.ParseResult{
+					Stmts: []*pg_query.RawStmt{{Stmt: &pg_query.Node{
+						Node: &pg_query.Node_SelectStmt{SelectStmt: sel},
+					}}},
+				})
+				if dErr == nil {
+					pkSelectSQL = deparsed
+				}
+			}
+		}
+	}
+
+	// Execute on Shadow to discover affected PKs.
+	result, err := execQuery(w.shadowConn, pkSelectSQL)
+	if err != nil || result.Error != "" {
+		if w.verbose {
+			log.Printf("[conn %d] bulk UPDATE: shadow-only, PK discovery failed", w.connID)
+		}
+		return nil // Non-fatal: UPDATE already executed.
+	}
+
+	// Find PK column index.
+	pkIdx := -1
+	for i, col := range result.Columns {
+		if col.Name == pkCol {
+			pkIdx = i
+			break
+		}
+	}
+	if pkIdx == -1 {
+		return nil
+	}
+
+	// Track delta PKs.
+	tracked := 0
+	for i, row := range result.RowValues {
+		if result.RowNulls[i][pkIdx] {
+			continue
+		}
+		pk := row[pkIdx]
+		if w.inTxn() {
+			w.deltaMap.Stage(table, pk)
+		} else {
+			w.deltaMap.Add(table, pk)
+		}
+		tracked++
+	}
+
+	if !w.inTxn() {
+		if err := delta.WriteDeltaMap(w.moriDir, w.deltaMap); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] failed to persist delta map: %v", w.connID, err)
+			}
+		}
+	}
+
+	if w.verbose {
+		log.Printf("[conn %d] bulk UPDATE: shadow-only, tracked %d delta PKs", w.connID, tracked)
 	}
 
 	return nil
@@ -315,4 +440,176 @@ func (w *WriteHandler) hydrateRow(table, pk string) error {
 	}
 
 	return nil
+}
+
+// hydrateReferencedTables detects cross-table references in an UPDATE
+// statement (subqueries in SET/WHERE clauses) and copies those tables'
+// data from Prod into Shadow so the subqueries can resolve correctly.
+func (w *WriteHandler) hydrateReferencedTables(rawSQL string, targetTable string) {
+	refTables := extractSubqueryTables(rawSQL, targetTable)
+	if len(refTables) == 0 {
+		return
+	}
+
+	for _, refTable := range refTables {
+		// Skip if we have no metadata for the table (might be a CTE or function).
+		if _, ok := w.tables[refTable]; !ok {
+			continue
+		}
+		// Skip if the table already has deltas (has been tainted — data exists in Shadow).
+		if w.deltaMap.CountForTable(refTable) > 0 {
+			continue
+		}
+
+		if w.verbose {
+			log.Printf("[conn %d] cross-table hydration: copying %s from Prod to Shadow", w.connID, refTable)
+		}
+
+		selectSQL := fmt.Sprintf("SELECT * FROM %s", quoteIdent(refTable))
+		result, err := execQuery(w.prodConn, selectSQL)
+		if err != nil || result.Error != "" {
+			if w.verbose {
+				log.Printf("[conn %d] cross-table hydration: failed to read %s from Prod", w.connID, refTable)
+			}
+			continue
+		}
+
+		inserted := 0
+		for i, row := range result.RowValues {
+			insertSQL := buildInsertSQL(refTable, result.Columns, row, result.RowNulls[i])
+			shadowResult, err := execQuery(w.shadowConn, insertSQL)
+			if err != nil {
+				continue
+			}
+			if shadowResult.Error == "" {
+				inserted++
+			}
+		}
+
+		if w.verbose {
+			log.Printf("[conn %d] cross-table hydration: inserted %d/%d rows into %s",
+				w.connID, inserted, len(result.RowValues), refTable)
+		}
+	}
+}
+
+// extractSubqueryTables parses an UPDATE statement and returns all table names
+// referenced in subqueries (SubLink nodes) within SET and WHERE clauses,
+// excluding the target table.
+func extractSubqueryTables(rawSQL string, targetTable string) []string {
+	parseResult, err := pg_query.Parse(rawSQL)
+	if err != nil {
+		return nil
+	}
+	stmts := parseResult.GetStmts()
+	if len(stmts) == 0 {
+		return nil
+	}
+	upd := stmts[0].GetStmt().GetUpdateStmt()
+	if upd == nil {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+
+	// Walk SET clause target values.
+	for _, target := range upd.GetTargetList() {
+		if rt := target.GetResTarget(); rt != nil {
+			collectRangeVarsFromNode(rt.GetVal(), seen)
+		}
+	}
+
+	// Walk WHERE clause.
+	collectRangeVarsFromNode(upd.GetWhereClause(), seen)
+
+	// Walk FROM clause (additional tables in UPDATE ... FROM ...).
+	for _, from := range upd.GetFromClause() {
+		collectRangeVarsFromNode(from, seen)
+	}
+
+	// Remove target table.
+	delete(seen, targetTable)
+
+	var tables []string
+	for t := range seen {
+		tables = append(tables, t)
+	}
+	return tables
+}
+
+// collectRangeVarsFromNode recursively finds RangeVar (table reference) nodes
+// in the AST and adds their names to the seen map.
+func collectRangeVarsFromNode(node *pg_query.Node, seen map[string]bool) {
+	if node == nil {
+		return
+	}
+
+	// RangeVar: direct table reference.
+	if rv := node.GetRangeVar(); rv != nil {
+		name := rv.GetRelname()
+		if name != "" {
+			seen[name] = true
+		}
+		return
+	}
+
+	// SubLink: subquery (EXISTS, IN, scalar subquery, etc.)
+	if sl := node.GetSubLink(); sl != nil {
+		collectRangeVarsFromNode(sl.GetTestexpr(), seen)
+		if subSel := sl.GetSubselect(); subSel != nil {
+			collectRangeVarsFromSelectStmt(subSel.GetSelectStmt(), seen)
+		}
+		return
+	}
+
+	// BoolExpr: AND/OR/NOT
+	if be := node.GetBoolExpr(); be != nil {
+		for _, arg := range be.GetArgs() {
+			collectRangeVarsFromNode(arg, seen)
+		}
+		return
+	}
+
+	// A_Expr: comparisons
+	if ae := node.GetAExpr(); ae != nil {
+		collectRangeVarsFromNode(ae.GetLexpr(), seen)
+		collectRangeVarsFromNode(ae.GetRexpr(), seen)
+		return
+	}
+
+	// ResTarget: in SET clause
+	if rt := node.GetResTarget(); rt != nil {
+		collectRangeVarsFromNode(rt.GetVal(), seen)
+		return
+	}
+
+	// FuncCall: function arguments
+	if fc := node.GetFuncCall(); fc != nil {
+		for _, arg := range fc.GetArgs() {
+			collectRangeVarsFromNode(arg, seen)
+		}
+		return
+	}
+}
+
+// collectRangeVarsFromSelectStmt extracts table references from a SELECT statement.
+func collectRangeVarsFromSelectStmt(sel *pg_query.SelectStmt, seen map[string]bool) {
+	if sel == nil {
+		return
+	}
+	for _, from := range sel.GetFromClause() {
+		if rv := from.GetRangeVar(); rv != nil {
+			name := rv.GetRelname()
+			if name != "" {
+				seen[name] = true
+			}
+		}
+		// JoinExpr
+		if je := from.GetJoinExpr(); je != nil {
+			collectRangeVarsFromNode(je.GetLarg(), seen)
+			collectRangeVarsFromNode(je.GetRarg(), seen)
+		}
+	}
+	// Recurse into WHERE for nested subqueries.
+	collectRangeVarsFromNode(sel.GetWhereClause(), seen)
 }

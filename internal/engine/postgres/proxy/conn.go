@@ -278,15 +278,16 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	var wh *WriteHandler
 	if p.deltaMap != nil && p.tombstones != nil {
 		wh = &WriteHandler{
-			prodConn:   prodConn,
-			shadowConn: shadowConn,
-			deltaMap:   p.deltaMap,
-			tombstones: p.tombstones,
-			tables:     p.tables,
-			moriDir:    p.moriDir,
-			connID:     connID,
-			verbose:    p.verbose,
-			logger:     p.logger,
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
 		}
 	}
 

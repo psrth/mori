@@ -6,6 +6,7 @@ import (
 
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/mori-dev/mori/internal/logging"
 )
@@ -13,16 +14,17 @@ import (
 // WriteHandler encapsulates write path logic for a single connection.
 // It holds references to the backend connections and shared state.
 type WriteHandler struct {
-	prodConn   net.Conn
-	shadowConn net.Conn
-	deltaMap   *delta.Map
-	tombstones *delta.TombstoneSet
-	tables     map[string]schema.TableMeta
-	moriDir    string
-	connID     int64
-	verbose    bool
-	logger     *logging.Logger
-	txnHandler *TxnHandler // nil when no TxnHandler; used to check inTxn state
+	prodConn       net.Conn
+	shadowConn     net.Conn
+	deltaMap       *delta.Map
+	tombstones     *delta.TombstoneSet
+	tables         map[string]schema.TableMeta
+	schemaRegistry *coreSchema.Registry
+	moriDir        string
+	connID         int64
+	verbose        bool
+	logger         *logging.Logger
+	txnHandler     *TxnHandler // nil when no TxnHandler; used to check inTxn state
 }
 
 // inTxn reports whether this connection is inside an explicit transaction.
