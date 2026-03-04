@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 
@@ -24,6 +25,16 @@ func (w *WriteHandler) handleUpdate(
 	rawMsg []byte,
 	cl *core.Classification,
 ) error {
+	// Enforce FK constraints on the SET values before executing the UPDATE.
+	if w.fkEnforcer != nil && len(cl.Tables) == 1 {
+		if err := w.fkEnforcer.EnforceUpdate(cl.Tables[0], cl.RawSQL); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] FK violation on UPDATE: %v", w.connID, err)
+			}
+			return sendFKError(clientConn, err.Error())
+		}
+	}
+
 	if len(cl.PKs) == 0 {
 		// Attempt bulk hydration for single-table UPDATEs with PK metadata.
 		if !cl.IsJoin && len(cl.Tables) == 1 {
@@ -445,11 +456,20 @@ func (w *WriteHandler) hydrateRow(table, pk string) error {
 // hydrateReferencedTables detects cross-table references in an UPDATE
 // statement (subqueries in SET/WHERE clauses) and copies those tables'
 // data from Prod into Shadow so the subqueries can resolve correctly.
+//
+// For each referenced table, it tries to extract a subquery predicate to
+// hydrate only matching rows. If the subquery is correlated (references
+// the outer/target table) or too complex to extract, it falls back to
+// full table hydration. A maxRowsHydrate cap is applied to limit the
+// number of rows hydrated.
 func (w *WriteHandler) hydrateReferencedTables(rawSQL string, targetTable string) {
 	refTables := extractSubqueryTables(rawSQL, targetTable)
 	if len(refTables) == 0 {
 		return
 	}
+
+	// Extract subquery predicates for each referenced table.
+	predicates := extractSubqueryPredicates(rawSQL, targetTable)
 
 	for _, refTable := range refTables {
 		// Skip if we have no metadata for the table (might be a CTE or function).
@@ -461,11 +481,26 @@ func (w *WriteHandler) hydrateReferencedTables(rawSQL string, targetTable string
 			continue
 		}
 
-		if w.verbose {
-			log.Printf("[conn %d] cross-table hydration: copying %s from Prod to Shadow", w.connID, refTable)
+		// Try predicate-based hydration first.
+		selectSQL := ""
+		if pred, ok := predicates[refTable]; ok && pred != "" {
+			selectSQL = fmt.Sprintf("SELECT * FROM %s WHERE %s", quoteIdent(refTable), pred)
+			if w.verbose {
+				log.Printf("[conn %d] cross-table hydration: predicate-based for %s: %s", w.connID, refTable, selectSQL)
+			}
+		} else {
+			// Fallback: full table hydration.
+			selectSQL = fmt.Sprintf("SELECT * FROM %s", quoteIdent(refTable))
+			if w.verbose {
+				log.Printf("[conn %d] cross-table hydration: full table for %s", w.connID, refTable)
+			}
 		}
 
-		selectSQL := fmt.Sprintf("SELECT * FROM %s", quoteIdent(refTable))
+		// Apply max rows cap.
+		if w.maxRowsHydrate > 0 {
+			selectSQL += fmt.Sprintf(" LIMIT %d", w.maxRowsHydrate)
+		}
+
 		result, err := execQuery(w.prodConn, selectSQL)
 		if err != nil || result.Error != "" {
 			if w.verbose {
@@ -491,6 +526,236 @@ func (w *WriteHandler) hydrateReferencedTables(rawSQL string, targetTable string
 				w.connID, inserted, len(result.RowValues), refTable)
 		}
 	}
+}
+
+// extractSubqueryPredicates parses an UPDATE statement and attempts to extract
+// WHERE predicates from subqueries for each referenced table. Returns a map
+// of table name → predicate SQL string. If a subquery is correlated (references
+// the target/outer table) or too complex, the table is omitted from the map,
+// causing the caller to fall back to full table hydration.
+func extractSubqueryPredicates(rawSQL string, targetTable string) map[string]string {
+	parseResult, err := pg_query.Parse(rawSQL)
+	if err != nil {
+		return nil
+	}
+	stmts := parseResult.GetStmts()
+	if len(stmts) == 0 {
+		return nil
+	}
+	upd := stmts[0].GetStmt().GetUpdateStmt()
+	if upd == nil {
+		return nil
+	}
+
+	predicates := make(map[string]string)
+
+	// Walk SET clause target values to find SubLinks.
+	for _, target := range upd.GetTargetList() {
+		if rt := target.GetResTarget(); rt != nil {
+			extractPredicatesFromNode(rt.GetVal(), targetTable, predicates)
+		}
+	}
+
+	// Walk WHERE clause.
+	extractPredicatesFromNode(upd.GetWhereClause(), targetTable, predicates)
+
+	return predicates
+}
+
+// extractPredicatesFromNode recursively walks AST nodes looking for SubLink
+// (subquery) nodes. For each subquery, it extracts the table and WHERE predicate
+// if the subquery is simple and non-correlated.
+func extractPredicatesFromNode(node *pg_query.Node, targetTable string, predicates map[string]string) {
+	if node == nil {
+		return
+	}
+
+	// SubLink: subquery (EXISTS, IN, scalar subquery, etc.)
+	if sl := node.GetSubLink(); sl != nil {
+		extractPredicatesFromNode(sl.GetTestexpr(), targetTable, predicates)
+		if subSel := sl.GetSubselect(); subSel != nil {
+			if sel := subSel.GetSelectStmt(); sel != nil {
+				extractPredicateFromSelect(sel, targetTable, predicates)
+			}
+		}
+		return
+	}
+
+	// BoolExpr: AND/OR/NOT
+	if be := node.GetBoolExpr(); be != nil {
+		for _, arg := range be.GetArgs() {
+			extractPredicatesFromNode(arg, targetTable, predicates)
+		}
+		return
+	}
+
+	// A_Expr: comparisons
+	if ae := node.GetAExpr(); ae != nil {
+		extractPredicatesFromNode(ae.GetLexpr(), targetTable, predicates)
+		extractPredicatesFromNode(ae.GetRexpr(), targetTable, predicates)
+		return
+	}
+
+	// ResTarget: in SET clause
+	if rt := node.GetResTarget(); rt != nil {
+		extractPredicatesFromNode(rt.GetVal(), targetTable, predicates)
+		return
+	}
+
+	// FuncCall: function arguments
+	if fc := node.GetFuncCall(); fc != nil {
+		for _, arg := range fc.GetArgs() {
+			extractPredicatesFromNode(arg, targetTable, predicates)
+		}
+		return
+	}
+}
+
+// extractPredicateFromSelect extracts a table name and WHERE predicate from a
+// simple SELECT subquery. If the subquery is correlated (its WHERE references
+// the outer/target table), or if it has no WHERE, the entry is skipped.
+func extractPredicateFromSelect(sel *pg_query.SelectStmt, targetTable string, predicates map[string]string) {
+	if sel == nil {
+		return
+	}
+
+	// Find the table(s) in the FROM clause.
+	for _, from := range sel.GetFromClause() {
+		rv := from.GetRangeVar()
+		if rv == nil {
+			continue
+		}
+		refTable := rv.GetRelname()
+		if refTable == "" || refTable == targetTable {
+			continue
+		}
+
+		// Check if there's a WHERE clause we can extract.
+		where := sel.GetWhereClause()
+		if where == nil {
+			// No predicate — caller will fall back to full hydration.
+			continue
+		}
+
+		// Check if the WHERE clause is correlated (references the target table).
+		if isCorrelatedPredicate(where, targetTable) {
+			// Correlated subquery — fall back to full hydration.
+			continue
+		}
+
+		// Try to deparse the WHERE clause into SQL.
+		predSQL, err := deparseWhereClause(where, refTable)
+		if err != nil {
+			continue
+		}
+
+		// Only set if we haven't already set a predicate for this table,
+		// or if this one is more specific.
+		if _, exists := predicates[refTable]; !exists {
+			predicates[refTable] = predSQL
+		}
+	}
+
+	// Recurse into WHERE for nested subqueries.
+	extractPredicatesFromNode(sel.GetWhereClause(), targetTable, predicates)
+}
+
+// isCorrelatedPredicate checks if a WHERE clause node references the target
+// (outer) table by looking for qualified column references like "target_table.col".
+func isCorrelatedPredicate(node *pg_query.Node, targetTable string) bool {
+	if node == nil {
+		return false
+	}
+
+	// Check ColumnRef for qualified references like "target_table"."col"
+	if cr := node.GetColumnRef(); cr != nil {
+		fields := cr.GetFields()
+		if len(fields) >= 2 {
+			if s := fields[0].GetString_(); s != nil {
+				if s.GetSval() == targetTable {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// BoolExpr
+	if be := node.GetBoolExpr(); be != nil {
+		for _, arg := range be.GetArgs() {
+			if isCorrelatedPredicate(arg, targetTable) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A_Expr
+	if ae := node.GetAExpr(); ae != nil {
+		return isCorrelatedPredicate(ae.GetLexpr(), targetTable) ||
+			isCorrelatedPredicate(ae.GetRexpr(), targetTable)
+	}
+
+	// NullTest
+	if nt := node.GetNullTest(); nt != nil {
+		return isCorrelatedPredicate(nt.GetArg(), targetTable)
+	}
+
+	// SubLink
+	if sl := node.GetSubLink(); sl != nil {
+		return isCorrelatedPredicate(sl.GetTestexpr(), targetTable)
+	}
+
+	// FuncCall args
+	if fc := node.GetFuncCall(); fc != nil {
+		for _, arg := range fc.GetArgs() {
+			if isCorrelatedPredicate(arg, targetTable) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// deparseWhereClause converts a WHERE clause AST node back to SQL by wrapping
+// it in a minimal SELECT statement and deparsing, then extracting the WHERE part.
+func deparseWhereClause(where *pg_query.Node, tableName string) (string, error) {
+	// Build a dummy SELECT 1 FROM table WHERE <clause> and deparse it.
+	sel := &pg_query.SelectStmt{
+		TargetList: []*pg_query.Node{
+			{Node: &pg_query.Node_ResTarget{ResTarget: &pg_query.ResTarget{
+				Val: &pg_query.Node{Node: &pg_query.Node_AConst{AConst: &pg_query.A_Const{
+					Val: &pg_query.A_Const_Ival{Ival: &pg_query.Integer{Ival: 1}},
+				}}},
+			}}},
+		},
+		FromClause: []*pg_query.Node{
+			{Node: &pg_query.Node_RangeVar{RangeVar: &pg_query.RangeVar{
+				Relname: tableName,
+				Inh:     true,
+			}}},
+		},
+		WhereClause: where,
+	}
+
+	deparsed, err := pg_query.Deparse(&pg_query.ParseResult{
+		Stmts: []*pg_query.RawStmt{{Stmt: &pg_query.Node{
+			Node: &pg_query.Node_SelectStmt{SelectStmt: sel},
+		}}},
+	})
+	if err != nil {
+		return "", fmt.Errorf("deparse: %w", err)
+	}
+
+	// Extract just the WHERE clause from "SELECT 1 FROM table WHERE ..."
+	upper := strings.ToUpper(deparsed)
+	whereIdx := strings.Index(upper, "WHERE ")
+	if whereIdx < 0 {
+		return "", fmt.Errorf("no WHERE in deparsed output")
+	}
+
+	return strings.TrimSpace(deparsed[whereIdx+len("WHERE "):]), nil
 }
 
 // extractSubqueryTables parses an UPDATE statement and returns all table names
