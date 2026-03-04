@@ -172,3 +172,38 @@ func (m *Map) Snapshot() map[string][]string { return m.s.snapshot() }
 
 // Load populates the map from a deserialized representation.
 func (m *Map) Load(data map[string][]string) { m.s.load(data) }
+
+// SnapshotAll returns a merged snapshot of committed + staged PK entries.
+// Used by savepoint support to capture the full in-flight delta state.
+func (m *Map) SnapshotAll() map[string][]string { return m.s.snapshotAll() }
+
+// RestoreAll replaces committed + staged PK entries with the given snapshot.
+// Staged is cleared since the snapshot already includes everything up to the savepoint.
+func (m *Map) RestoreAll(snap map[string][]string) { m.s.restoreAll(snap) }
+
+// SnapshotInsertedTables returns a merged copy of insertedTables + stagedInserts.
+// Used by savepoint support to capture the full in-flight insert count state.
+func (m *Map) SnapshotInsertedTables() map[string]int {
+	m.insertMu.RLock()
+	defer m.insertMu.RUnlock()
+	out := make(map[string]int, len(m.insertedTables))
+	for t, c := range m.insertedTables {
+		out[t] = c
+	}
+	for t, c := range m.stagedInserts {
+		out[t] += c
+	}
+	return out
+}
+
+// RestoreInsertedTables replaces insertedTables with the given snapshot and clears stagedInserts.
+// Used by savepoint support to restore insert count state on ROLLBACK TO.
+func (m *Map) RestoreInsertedTables(snap map[string]int) {
+	m.insertMu.Lock()
+	defer m.insertMu.Unlock()
+	m.insertedTables = make(map[string]int, len(snap))
+	for t, c := range snap {
+		m.insertedTables[t] = c
+	}
+	m.stagedInserts = nil
+}

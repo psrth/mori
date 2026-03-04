@@ -37,6 +37,7 @@ type Config struct {
 	Extensions       []string  `json:"extensions"`
 	InitializedAt    time.Time `json:"initialized_at"`
 	ActiveConnection string    `json:"active_connection,omitempty"` // name from mori.yaml
+	MaxRowsHydrate   int       `json:"max_rows_hydrate,omitempty"` // cap on rows hydrated from Prod (0 = unlimited)
 }
 
 // ──────────────────────────────────────────────────────────────────
