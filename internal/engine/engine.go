@@ -48,18 +48,19 @@ type InitResult struct {
 
 // ProxyDeps bundles all dependencies needed to create a proxy.
 type ProxyDeps struct {
-	ProdAddr   string
-	ShadowAddr string
-	DBName     string
-	ListenPort int
-	Verbose    bool
-	Classifier core.Classifier
-	Router     *core.Router
-	DeltaMap   *delta.Map
-	Tombstones *delta.TombstoneSet
-	SchemaReg  *coreSchema.Registry
-	MoriDir    string
-	Logger     *logging.Logger
+	ProdAddr       string
+	ShadowAddr     string
+	DBName         string
+	ListenPort     int
+	Verbose        bool
+	Classifier     core.Classifier
+	Router         *core.Router
+	DeltaMap       *delta.Map
+	Tombstones     *delta.TombstoneSet
+	SchemaReg      *coreSchema.Registry
+	MoriDir        string
+	Logger         *logging.Logger
+	MaxRowsHydrate int // cap on rows hydrated from Prod during materialization; 0 = unlimited
 }
 
 // Engine defines the contract for a database engine implementation.

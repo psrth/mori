@@ -34,6 +34,7 @@ type Proxy struct {
 	schemaRegistry  *coreSchema.Registry
 	moriDir         string
 	logger          *logging.Logger
+	maxRowsHydrate  int // cap on rows hydrated from Prod during materialization; 0 = unlimited
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -54,6 +55,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	tables map[string]schema.TableMeta, moriDir string,
 	schemaRegistry *coreSchema.Registry,
 	logger *logging.Logger,
+	maxRowsHydrate int,
 ) *Proxy {
 	return &Proxy{
 		prodAddr:       prodAddr,
@@ -69,6 +71,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		schemaRegistry: schemaRegistry,
 		moriDir:        moriDir,
 		logger:         logger,
+		maxRowsHydrate: maxRowsHydrate,
 		shutdownCh:     make(chan struct{}),
 	}
 }
