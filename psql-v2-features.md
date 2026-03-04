@@ -247,6 +247,8 @@ Unified inject-dedup-strip pattern. For tables with no PK, inject `ctid` into th
 
 # 4. Not Supported
 
+1. async notification response not relayed on notify/listen -> need to figure this out
+
 All items below must be identified by the classifier and return a clear error message to the client. They must never silently fail or pass through.
 
 ## 4.1 COPY (Bulk Import/Export)
