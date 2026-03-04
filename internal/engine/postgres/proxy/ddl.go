@@ -35,6 +35,12 @@ func (dh *DDLHandler) HandleDDL(
 	rawMsg []byte,
 	cl *core.Classification,
 ) error {
+	// Extract and store FK metadata BEFORE stripping — we need to remember
+	// the FK definitions for proxy-layer enforcement.
+	if dh.schemaRegistry != nil {
+		dh.extractAndStoreFKs(cl.RawSQL)
+	}
+
 	// Strip FK constraints before sending to Shadow — Shadow can't validate
 	// foreign keys against Prod rows.
 	ddlMsg := rawMsg
@@ -316,4 +322,177 @@ func stripFKConstraints(sql string) (string, []string) {
 	}
 
 	return deparsed, refTables
+}
+
+// extractAndStoreFKs parses a DDL statement and extracts FK constraint metadata,
+// storing it in the schema registry. This is called BEFORE stripFKConstraints
+// so the original FK definitions are preserved for proxy-layer enforcement.
+func (dh *DDLHandler) extractAndStoreFKs(sql string) {
+	result, err := pg_query.Parse(sql)
+	if err != nil {
+		return
+	}
+	stmts := result.GetStmts()
+	if len(stmts) == 0 {
+		return
+	}
+
+	node := stmts[0].GetStmt()
+	if node == nil {
+		return
+	}
+
+	// CREATE TABLE: walk TableElts for inline REFERENCES and table-level FOREIGN KEY.
+	if create := node.GetCreateStmt(); create != nil {
+		childTable := rangeVarName(create.GetRelation())
+		if childTable == "" {
+			return
+		}
+
+		for _, elt := range create.GetTableElts() {
+			// Column definition with inline REFERENCES.
+			if colDef := elt.GetColumnDef(); colDef != nil {
+				colName := colDef.GetColname()
+				for _, c := range colDef.GetConstraints() {
+					con := c.GetConstraint()
+					if con == nil || con.GetContype() != pg_query.ConstrType_CONSTR_FOREIGN {
+						continue
+					}
+					fk := dh.buildFKFromConstraint(con, childTable, []string{colName})
+					dh.schemaRegistry.RecordForeignKey(childTable, fk)
+					if dh.verbose {
+						log.Printf("[conn %d] schema registry: FK %s(%s) -> %s(%s)",
+							dh.connID, childTable, strings.Join(fk.ChildColumns, ", "),
+							fk.ParentTable, strings.Join(fk.ParentColumns, ", "))
+					}
+					dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("FK %s(%s) -> %s(%s)",
+						childTable, strings.Join(fk.ChildColumns, ", "),
+						fk.ParentTable, strings.Join(fk.ParentColumns, ", ")))
+				}
+				continue
+			}
+
+			// Table-level FOREIGN KEY constraint.
+			if con := elt.GetConstraint(); con != nil && con.GetContype() == pg_query.ConstrType_CONSTR_FOREIGN {
+				childCols := extractFKColumnNames(con.GetFkAttrs())
+				fk := dh.buildFKFromConstraint(con, childTable, childCols)
+				dh.schemaRegistry.RecordForeignKey(childTable, fk)
+				if dh.verbose {
+					log.Printf("[conn %d] schema registry: FK %s(%s) -> %s(%s)",
+						dh.connID, childTable, strings.Join(fk.ChildColumns, ", "),
+						fk.ParentTable, strings.Join(fk.ParentColumns, ", "))
+				}
+				dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("FK %s(%s) -> %s(%s)",
+					childTable, strings.Join(fk.ChildColumns, ", "),
+					fk.ParentTable, strings.Join(fk.ParentColumns, ", ")))
+			}
+		}
+	}
+
+	// ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY / ADD COLUMN ... REFERENCES.
+	if alt := node.GetAlterTableStmt(); alt != nil {
+		childTable := rangeVarName(alt.GetRelation())
+		if childTable == "" {
+			return
+		}
+
+		for _, cmdNode := range alt.GetCmds() {
+			cmd := cmdNode.GetAlterTableCmd()
+			if cmd == nil {
+				continue
+			}
+
+			switch cmd.GetSubtype() {
+			case pg_query.AlterTableType_AT_AddColumn:
+				if def := cmd.GetDef(); def != nil {
+					if colDef := def.GetColumnDef(); colDef != nil {
+						colName := colDef.GetColname()
+						for _, c := range colDef.GetConstraints() {
+							con := c.GetConstraint()
+							if con == nil || con.GetContype() != pg_query.ConstrType_CONSTR_FOREIGN {
+								continue
+							}
+							fk := dh.buildFKFromConstraint(con, childTable, []string{colName})
+							dh.schemaRegistry.RecordForeignKey(childTable, fk)
+							if dh.verbose {
+								log.Printf("[conn %d] schema registry: FK %s(%s) -> %s(%s)",
+									dh.connID, childTable, strings.Join(fk.ChildColumns, ", "),
+									fk.ParentTable, strings.Join(fk.ParentColumns, ", "))
+							}
+						}
+					}
+				}
+
+			case pg_query.AlterTableType_AT_AddConstraint:
+				if def := cmd.GetDef(); def != nil {
+					if con := def.GetConstraint(); con != nil && con.GetContype() == pg_query.ConstrType_CONSTR_FOREIGN {
+						childCols := extractFKColumnNames(con.GetFkAttrs())
+						fk := dh.buildFKFromConstraint(con, childTable, childCols)
+						dh.schemaRegistry.RecordForeignKey(childTable, fk)
+						if dh.verbose {
+							log.Printf("[conn %d] schema registry: FK %s(%s) -> %s(%s)",
+								dh.connID, childTable, strings.Join(fk.ChildColumns, ", "),
+								fk.ParentTable, strings.Join(fk.ParentColumns, ", "))
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// buildFKFromConstraint builds a ForeignKey struct from a pg_query Constraint node.
+func (dh *DDLHandler) buildFKFromConstraint(con *pg_query.Constraint, childTable string, childCols []string) coreSchema.ForeignKey {
+	fk := coreSchema.ForeignKey{
+		ConstraintName: con.GetConname(),
+		ChildTable:     childTable,
+		ChildColumns:   childCols,
+		OnDelete:       "NO ACTION",
+		OnUpdate:       "NO ACTION",
+	}
+
+	if pktable := con.GetPktable(); pktable != nil {
+		fk.ParentTable = rangeVarName(pktable)
+	}
+
+	// Extract parent columns from pk_attrs.
+	fk.ParentColumns = extractFKColumnNames(con.GetPkAttrs())
+
+	// Map referential actions.
+	fk.OnDelete = fkActionToString(con.GetFkDelAction())
+	fk.OnUpdate = fkActionToString(con.GetFkUpdAction())
+
+	return fk
+}
+
+// extractFKColumnNames extracts column names from a list of pg_query Nodes
+// (used for fk_attrs and pk_attrs in Constraint).
+func extractFKColumnNames(nodes []*pg_query.Node) []string {
+	var cols []string
+	for _, n := range nodes {
+		if s := n.GetString_(); s != nil {
+			cols = append(cols, s.GetSval())
+		}
+	}
+	return cols
+}
+
+// fkActionToString converts a pg_query FK action character to a SQL action string.
+// PostgreSQL uses single characters: 'a' = NO ACTION, 'r' = RESTRICT,
+// 'c' = CASCADE, 'n' = SET NULL, 'd' = SET DEFAULT.
+func fkActionToString(action string) string {
+	switch action {
+	case "c":
+		return "CASCADE"
+	case "r":
+		return "RESTRICT"
+	case "n":
+		return "SET NULL"
+	case "d":
+		return "SET DEFAULT"
+	case "a", "":
+		return "NO ACTION"
+	default:
+		return "NO ACTION"
+	}
 }

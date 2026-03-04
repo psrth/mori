@@ -200,6 +200,168 @@ func TestReadRegistryMissingFile(t *testing.T) {
 	}
 }
 
+func TestRecordForeignKey(t *testing.T) {
+	r := NewRegistry()
+	fk := ForeignKey{
+		ConstraintName: "fk_orders_user",
+		ChildTable:     "orders",
+		ChildColumns:   []string{"user_id"},
+		ParentTable:    "users",
+		ParentColumns:  []string{"id"},
+		OnDelete:       "CASCADE",
+		OnUpdate:       "NO ACTION",
+	}
+	r.RecordForeignKey("orders", fk)
+
+	fks := r.GetForeignKeys("orders")
+	if len(fks) != 1 {
+		t.Fatalf("GetForeignKeys(orders) len = %d, want 1", len(fks))
+	}
+	if fks[0].ConstraintName != "fk_orders_user" {
+		t.Errorf("FK name = %q, want fk_orders_user", fks[0].ConstraintName)
+	}
+	if fks[0].ParentTable != "users" {
+		t.Errorf("FK parent = %q, want users", fks[0].ParentTable)
+	}
+	if fks[0].OnDelete != "CASCADE" {
+		t.Errorf("FK OnDelete = %q, want CASCADE", fks[0].OnDelete)
+	}
+}
+
+func TestRecordForeignKeyReplaceDuplicate(t *testing.T) {
+	r := NewRegistry()
+	fk1 := ForeignKey{
+		ConstraintName: "fk_orders_user",
+		ChildTable:     "orders",
+		ChildColumns:   []string{"user_id"},
+		ParentTable:    "users",
+		ParentColumns:  []string{"id"},
+		OnDelete:       "NO ACTION",
+		OnUpdate:       "NO ACTION",
+	}
+	r.RecordForeignKey("orders", fk1)
+
+	fk2 := ForeignKey{
+		ConstraintName: "fk_orders_user",
+		ChildTable:     "orders",
+		ChildColumns:   []string{"user_id"},
+		ParentTable:    "users",
+		ParentColumns:  []string{"id"},
+		OnDelete:       "CASCADE",
+		OnUpdate:       "CASCADE",
+	}
+	r.RecordForeignKey("orders", fk2)
+
+	fks := r.GetForeignKeys("orders")
+	if len(fks) != 1 {
+		t.Fatalf("GetForeignKeys(orders) len = %d, want 1 (deduped)", len(fks))
+	}
+	if fks[0].OnDelete != "CASCADE" {
+		t.Errorf("FK OnDelete = %q, want CASCADE (updated)", fks[0].OnDelete)
+	}
+}
+
+func TestGetForeignKeysNone(t *testing.T) {
+	r := NewRegistry()
+	fks := r.GetForeignKeys("orders")
+	if fks != nil {
+		t.Errorf("GetForeignKeys(orders) = %v, want nil", fks)
+	}
+}
+
+func TestGetReferencingFKs(t *testing.T) {
+	r := NewRegistry()
+	fk := ForeignKey{
+		ConstraintName: "fk_orders_user",
+		ChildTable:     "orders",
+		ChildColumns:   []string{"user_id"},
+		ParentTable:    "users",
+		ParentColumns:  []string{"id"},
+		OnDelete:       "CASCADE",
+		OnUpdate:       "NO ACTION",
+	}
+	r.RecordForeignKey("orders", fk)
+
+	// Query by parent table name.
+	refs := r.GetReferencingFKs("users")
+	if len(refs) != 1 {
+		t.Fatalf("GetReferencingFKs(users) len = %d, want 1", len(refs))
+	}
+	if refs[0].ChildTable != "orders" {
+		t.Errorf("FK child = %q, want orders", refs[0].ChildTable)
+	}
+
+	// No referencing FKs for a table that is not a parent.
+	refs2 := r.GetReferencingFKs("orders")
+	if len(refs2) != 0 {
+		t.Errorf("GetReferencingFKs(orders) len = %d, want 0", len(refs2))
+	}
+}
+
+func TestForeignKeyPersistence(t *testing.T) {
+	dir := t.TempDir()
+	r := NewRegistry()
+	fk := ForeignKey{
+		ConstraintName: "fk_orders_user",
+		ChildTable:     "orders",
+		ChildColumns:   []string{"user_id"},
+		ParentTable:    "users",
+		ParentColumns:  []string{"id"},
+		OnDelete:       "CASCADE",
+		OnUpdate:       "SET NULL",
+	}
+	r.RecordForeignKey("orders", fk)
+
+	if err := WriteRegistry(dir, r); err != nil {
+		t.Fatalf("WriteRegistry() error: %v", err)
+	}
+
+	loaded, err := ReadRegistry(dir)
+	if err != nil {
+		t.Fatalf("ReadRegistry() error: %v", err)
+	}
+
+	fks := loaded.GetForeignKeys("orders")
+	if len(fks) != 1 {
+		t.Fatalf("loaded FK count = %d, want 1", len(fks))
+	}
+	if fks[0].ConstraintName != "fk_orders_user" {
+		t.Errorf("loaded FK name = %q, want fk_orders_user", fks[0].ConstraintName)
+	}
+	if fks[0].OnDelete != "CASCADE" {
+		t.Errorf("loaded FK OnDelete = %q, want CASCADE", fks[0].OnDelete)
+	}
+	if fks[0].OnUpdate != "SET NULL" {
+		t.Errorf("loaded FK OnUpdate = %q, want SET NULL", fks[0].OnUpdate)
+	}
+}
+
+func TestGetDiffCopiesForeignKeys(t *testing.T) {
+	r := NewRegistry()
+	fk := ForeignKey{
+		ConstraintName: "fk_test",
+		ChildTable:     "orders",
+		ChildColumns:   []string{"user_id"},
+		ParentTable:    "users",
+		ParentColumns:  []string{"id"},
+		OnDelete:       "NO ACTION",
+		OnUpdate:       "NO ACTION",
+	}
+	r.RecordForeignKey("orders", fk)
+
+	d := r.GetDiff("orders")
+	if len(d.ForeignKeys) != 1 {
+		t.Fatalf("ForeignKeys len = %d, want 1", len(d.ForeignKeys))
+	}
+
+	// Mutate the copy — original should be unchanged.
+	d.ForeignKeys = append(d.ForeignKeys, ForeignKey{ConstraintName: "injected"})
+	d2 := r.GetDiff("orders")
+	if len(d2.ForeignKeys) != 1 {
+		t.Errorf("GetDiff returned mutable FK reference: len = %d, want 1", len(d2.ForeignKeys))
+	}
+}
+
 func TestRegistryConcurrentAccess(t *testing.T) {
 	r := NewRegistry()
 	var wg sync.WaitGroup

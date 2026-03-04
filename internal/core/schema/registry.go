@@ -21,13 +21,26 @@ type Column struct {
 	Default *string `json:"default"`
 }
 
+// ForeignKey describes a foreign key constraint.
+type ForeignKey struct {
+	ConstraintName string   `json:"constraint_name"`
+	ChildTable     string   `json:"child_table"`
+	ChildColumns   []string `json:"child_columns"`
+	ParentTable    string   `json:"parent_table"`
+	ParentColumns  []string `json:"parent_columns"`
+	OnDelete       string   `json:"on_delete"` // CASCADE, SET NULL, SET DEFAULT, RESTRICT, NO ACTION
+	OnUpdate       string   `json:"on_update"`
+}
+
 // TableDiff tracks schema differences between Prod and Shadow for a single table.
 type TableDiff struct {
-	Added       []Column            `json:"added"`
-	Dropped     []string            `json:"dropped"`
-	Renamed     map[string]string   `json:"renamed"`      // old_name -> new_name
-	TypeChanged map[string][2]string `json:"type_changed"` // column -> [old_type, new_type]
-	IsNewTable  bool                `json:"is_new_table"`  // true if table only exists in Shadow
+	Added           []Column            `json:"added"`
+	Dropped         []string            `json:"dropped"`
+	Renamed         map[string]string   `json:"renamed"`          // old_name -> new_name
+	TypeChanged     map[string][2]string `json:"type_changed"`    // column -> [old_type, new_type]
+	IsNewTable      bool                `json:"is_new_table"`     // true if table only exists in Shadow
+	IsFullyShadowed bool                `json:"is_fully_shadowed"` // true after TRUNCATE — skip Prod reads
+	ForeignKeys     []ForeignKey        `json:"foreign_keys,omitempty"` // FK constraints where this table is the child
 }
 
 // Registry tracks schema diffs for all modified tables.
@@ -112,11 +125,12 @@ func (r *Registry) GetDiff(table string) *TableDiff {
 	}
 	// Return a deep copy to avoid data races on the returned value.
 	cp := &TableDiff{
-		Added:       make([]Column, len(d.Added)),
-		Dropped:     make([]string, len(d.Dropped)),
-		Renamed:     make(map[string]string, len(d.Renamed)),
-		TypeChanged: make(map[string][2]string, len(d.TypeChanged)),
-		IsNewTable:  d.IsNewTable,
+		Added:           make([]Column, len(d.Added)),
+		Dropped:         make([]string, len(d.Dropped)),
+		Renamed:         make(map[string]string, len(d.Renamed)),
+		TypeChanged:     make(map[string][2]string, len(d.TypeChanged)),
+		IsNewTable:      d.IsNewTable,
+		IsFullyShadowed: d.IsFullyShadowed,
 	}
 	copy(cp.Added, d.Added)
 	copy(cp.Dropped, d.Dropped)
@@ -126,7 +140,78 @@ func (r *Registry) GetDiff(table string) *TableDiff {
 	for k, v := range d.TypeChanged {
 		cp.TypeChanged[k] = v
 	}
+	if len(d.ForeignKeys) > 0 {
+		cp.ForeignKeys = make([]ForeignKey, len(d.ForeignKeys))
+		copy(cp.ForeignKeys, d.ForeignKeys)
+	}
 	return cp
+}
+
+// MarkFullyShadowed marks a table as fully shadowed (e.g., after TRUNCATE).
+// All future reads for this table will skip Prod and query Shadow only.
+func (r *Registry) MarkFullyShadowed(table string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	d := r.getOrCreateDiff(table)
+	d.IsFullyShadowed = true
+}
+
+// RecordForeignKey stores a foreign key constraint in the child table's diff.
+// If an FK with the same constraint name already exists, it is replaced.
+func (r *Registry) RecordForeignKey(childTable string, fk ForeignKey) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	d := r.getOrCreateDiff(childTable)
+	// Replace if constraint name already recorded.
+	for i, existing := range d.ForeignKeys {
+		if existing.ConstraintName != "" && existing.ConstraintName == fk.ConstraintName {
+			d.ForeignKeys[i] = fk
+			return
+		}
+	}
+	d.ForeignKeys = append(d.ForeignKeys, fk)
+}
+
+// GetForeignKeys returns FKs where the given table is the child (i.e., the table
+// that has the REFERENCES clause). Returns nil if no FKs are recorded.
+func (r *Registry) GetForeignKeys(table string) []ForeignKey {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	d, ok := r.diffs[table]
+	if !ok || len(d.ForeignKeys) == 0 {
+		return nil
+	}
+	cp := make([]ForeignKey, len(d.ForeignKeys))
+	copy(cp, d.ForeignKeys)
+	return cp
+}
+
+// GetReferencingFKs returns all FKs where the given table is the parent
+// (i.e., some other table references it). This is needed for cascade/restrict
+// checks on DELETE/UPDATE of parent rows.
+func (r *Registry) GetReferencingFKs(table string) []ForeignKey {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var result []ForeignKey
+	for _, d := range r.diffs {
+		for _, fk := range d.ForeignKeys {
+			if fk.ParentTable == table {
+				result = append(result, fk)
+			}
+		}
+	}
+	return result
+}
+
+// IsFullyShadowed reports whether the table is fully shadowed (skip Prod reads).
+func (r *Registry) IsFullyShadowed(table string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	d, ok := r.diffs[table]
+	if !ok {
+		return false
+	}
+	return d.IsFullyShadowed
 }
 
 // HasDiff reports whether the table has any schema divergence.
