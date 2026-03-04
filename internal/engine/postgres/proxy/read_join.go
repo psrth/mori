@@ -34,6 +34,10 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 	deltaTables := rh.identifyDeltaTables(cl.Tables)
 	if len(deltaTables) == 0 {
 		// No delta tables — execute directly on Prod and return result.
+		// Still need to check for schema diffs (e.g., added columns but no row changes).
+		if rh.anyTableSchemaModified(cl.Tables) {
+			return rh.joinPatchWithSchemaDiffs(cl, querySQL, nil)
+		}
 		prodResult, err := execQuery(rh.prodConn, querySQL)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("prod JOIN query: %w", err)
@@ -49,8 +53,56 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 	var injectedPKs map[string]string
 	effectiveSQL, injectedPKs = rh.injectJoinPKs(querySQL, deltaTables)
 
-	// Step 1: Execute JOIN on Prod.
-	prodResult, err := execQuery(rh.prodConn, effectiveSQL)
+	// Check if any table is fully shadowed — must use Shadow only.
+	if rh.schemaRegistry != nil {
+		for _, t := range cl.Tables {
+			if rh.schemaRegistry.IsFullyShadowed(t) {
+				// Shadow-only execution.
+				shadowResult, err := execQuery(rh.shadowConn, querySQL)
+				if err != nil {
+					return nil, nil, nil, fmt.Errorf("shadow JOIN query (fully shadowed): %w", err)
+				}
+				if shadowResult.Error != "" {
+					return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
+				}
+				return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+			}
+		}
+	}
+
+	// Rewrite Prod SQL for schema diffs (added/renamed/dropped columns).
+	prodSQL := effectiveSQL
+	skipProd := false
+	if rh.schemaRegistry != nil {
+		for _, t := range cl.Tables {
+			if rh.schemaRegistry.HasDiff(t) {
+				// Use rewriteSQLForProd to strip shadow-only columns from the entire query.
+				rewritten, shouldSkip := rewriteSQLForProd(prodSQL, rh.schemaRegistry, cl.Tables)
+				if shouldSkip {
+					skipProd = true
+				} else {
+					prodSQL = rewritten
+				}
+				break // Only need to rewrite once for all tables
+			}
+		}
+	}
+
+	// If skipProd is true, the query cannot be meaningfully executed on Prod
+	// (e.g., JOIN condition references a shadow-only column). Use Shadow only.
+	if skipProd {
+		shadowResult, err := execQuery(rh.shadowConn, querySQL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("shadow JOIN query (skip prod): %w", err)
+		}
+		if shadowResult.Error != "" {
+			return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
+		}
+		return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+	}
+
+	// Step 1: Execute JOIN on Prod (use rewritten SQL if schema diffs exist).
+	prodResult, err := execQuery(rh.prodConn, prodSQL)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("prod JOIN query: %w", err)
 	}
@@ -58,29 +110,42 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 		return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
 	}
 
+	// Adapt Prod columns and rows for schema diffs.
+	adaptedProdColumns := prodResult.Columns
+	adaptedProdValues := prodResult.RowValues
+	adaptedProdNulls := prodResult.RowNulls
+	if rh.schemaRegistry != nil {
+		for _, t := range cl.Tables {
+			if rh.schemaRegistry.HasDiff(t) {
+				adaptedProdColumns = rh.adaptColumns(t, adaptedProdColumns)
+				adaptedProdValues, adaptedProdNulls = rh.adaptRows(t, prodResult.Columns, adaptedProdValues, adaptedProdNulls)
+			}
+		}
+	}
+
 	// Step 2: Find PK column indices (including injected PKs).
-	pkIndices := rh.findPKIndicesForJoin(deltaTables, prodResult.Columns, injectedPKs)
+	pkIndices := rh.findPKIndicesForJoin(deltaTables, adaptedProdColumns, injectedPKs)
 
 	// Steps 3-4: Classify each Prod row (clean / delta / dead) and patch delta rows.
 	var patchedValues [][]string
 	var patchedNulls [][]bool
 	var deltaRowIndices []int // Indices of patched (delta) rows in patchedValues.
 
-	for i, row := range prodResult.RowValues {
+	for i, row := range adaptedProdValues {
 		action := rh.classifyJoinRow(deltaTables, pkIndices, row)
 		switch action {
 		case joinRowClean:
 			patchedValues = append(patchedValues, row)
-			patchedNulls = append(patchedNulls, prodResult.RowNulls[i])
+			patchedNulls = append(patchedNulls, adaptedProdNulls[i])
 
 		case joinRowDelta:
 			patched, patchedN, err := rh.patchDeltaRow(
-				deltaTables, pkIndices, prodResult.Columns, row, prodResult.RowNulls[i],
+				deltaTables, pkIndices, adaptedProdColumns, row, adaptedProdNulls[i],
 			)
 			if err != nil {
 				rh.logf("JOIN patch error, keeping Prod row: %v", err)
 				patchedValues = append(patchedValues, row)
-				patchedNulls = append(patchedNulls, prodResult.RowNulls[i])
+				patchedNulls = append(patchedNulls, adaptedProdNulls[i])
 				continue
 			}
 			if patched != nil {
@@ -101,7 +166,7 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 		whereAST := extractWhereAST(querySQL)
 		if whereAST != nil {
 			patchedValues, patchedNulls = filterByWhere(
-				whereAST, prodResult.Columns, patchedValues, patchedNulls, deltaRowIndices)
+				whereAST, adaptedProdColumns, patchedValues, patchedNulls, deltaRowIndices)
 		}
 	}
 
@@ -112,7 +177,7 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 	}
 
 	// Step 6: Merge Shadow + patched Prod. Shadow rows first (priority).
-	resultColumns := prodResult.Columns
+	resultColumns := adaptedProdColumns
 	if len(shadowResult.Columns) > 0 && shadowResult.Error == "" {
 		resultColumns = shadowResult.Columns
 	}
@@ -149,6 +214,127 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 	}
 
 	return resultColumns, mergedValues, mergedNulls, nil
+}
+
+// joinPatchWithSchemaDiffs handles JOINs where tables have schema diffs but
+// no delta rows. It rewrites the Prod SQL, adapts columns, and merges with Shadow.
+func (rh *ReadHandler) joinPatchWithSchemaDiffs(cl *core.Classification, querySQL string, injectedPKs map[string]string) (
+	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
+) {
+	// Check if any table is fully shadowed — must use Shadow only.
+	if rh.schemaRegistry != nil {
+		for _, t := range cl.Tables {
+			if rh.schemaRegistry.IsFullyShadowed(t) {
+				shadowResult, err := execQuery(rh.shadowConn, querySQL)
+				if err != nil {
+					return nil, nil, nil, fmt.Errorf("shadow JOIN query (fully shadowed): %w", err)
+				}
+				if shadowResult.Error != "" {
+					return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
+				}
+				return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+			}
+		}
+	}
+
+	// Rewrite Prod SQL for schema diffs.
+	prodSQL := querySQL
+	if rh.schemaRegistry != nil {
+		rewritten, shouldSkip := rewriteSQLForProd(querySQL, rh.schemaRegistry, cl.Tables)
+		if shouldSkip {
+			// Shadow-only execution.
+			shadowResult, err := execQuery(rh.shadowConn, querySQL)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("shadow JOIN query (skip prod): %w", err)
+			}
+			if shadowResult.Error != "" {
+				return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
+			}
+			return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+		}
+		prodSQL = rewritten
+	}
+
+	// Execute on Prod with rewritten SQL.
+	prodResult, err := execQuery(rh.prodConn, prodSQL)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("prod JOIN query: %w", err)
+	}
+	if prodResult.Error != "" {
+		// If Prod query fails due to schema mismatch, fall back to Shadow-only.
+		shadowResult, err := execQuery(rh.shadowConn, querySQL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("shadow JOIN query (prod error fallback): %w", err)
+		}
+		if shadowResult.Error != "" {
+			return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
+		}
+		return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+	}
+
+	// Adapt Prod columns and rows for schema diffs.
+	adaptedColumns := prodResult.Columns
+	adaptedValues := prodResult.RowValues
+	adaptedNulls := prodResult.RowNulls
+	if rh.schemaRegistry != nil {
+		for _, t := range cl.Tables {
+			if rh.schemaRegistry.HasDiff(t) {
+				adaptedColumns = rh.adaptColumns(t, adaptedColumns)
+				adaptedValues, adaptedNulls = rh.adaptRows(t, prodResult.Columns, adaptedValues, adaptedNulls)
+			}
+		}
+	}
+
+	// Execute on Shadow to get the canonical column set and any Shadow-only rows.
+	shadowResult, err := execQuery(rh.shadowConn, querySQL)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("shadow JOIN query: %w", err)
+	}
+
+	// Merge Shadow + adapted Prod. Shadow rows first (priority).
+	resultColumns := adaptedColumns
+	if len(shadowResult.Columns) > 0 && shadowResult.Error == "" {
+		resultColumns = shadowResult.Columns
+	}
+
+	var mergedValues [][]string
+	var mergedNulls [][]bool
+
+	if shadowResult.Error == "" {
+		mergedValues = append(mergedValues, shadowResult.RowValues...)
+		mergedNulls = append(mergedNulls, shadowResult.RowNulls...)
+	}
+	mergedValues = append(mergedValues, adaptedValues...)
+	mergedNulls = append(mergedNulls, adaptedNulls...)
+
+	// Deduplicate by composite key.
+	allPKIndices := rh.findPKIndicesForJoin(cl.Tables, resultColumns, injectedPKs)
+	mergedValues, mergedNulls = rh.dedupJoin(cl.Tables, allPKIndices, resultColumns, mergedValues, mergedNulls)
+
+	// Re-sort by ORDER BY.
+	if cl.OrderBy != "" {
+		sortMerged(resultColumns, mergedValues, mergedNulls, cl.OrderBy)
+	}
+
+	// Apply LIMIT.
+	if cl.HasLimit && cl.Limit > 0 && len(mergedValues) > cl.Limit {
+		mergedValues = mergedValues[:cl.Limit]
+		mergedNulls = mergedNulls[:cl.Limit]
+	}
+
+	return resultColumns, mergedValues, mergedNulls, nil
+}
+
+// anyTableSchemaModified reports whether any of the given tables have schema diffs.
+func (rh *ReadHandler) anyTableSchemaModified(tables []string) bool {
+	if rh.schemaRegistry != nil {
+		for _, t := range tables {
+			if rh.schemaRegistry.HasDiff(t) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // injectJoinPKs injects PK columns for delta tables into the SELECT list of a JOIN query.
@@ -207,7 +393,8 @@ func (rh *ReadHandler) injectJoinPKs(sql string, deltaTables []string) (string, 
 	return result, injected
 }
 
-// findPKIndicesForJoin extends findPKIndicesForTables with injected PK columns.
+// findPKIndicesForJoin extends findPKIndicesForTables with injected PK columns
+// and handles renamed PK columns via schema diffs.
 func (rh *ReadHandler) findPKIndicesForJoin(
 	tables []string, columns []ColumnInfo, injectedPKs map[string]string,
 ) map[string]int {
@@ -221,6 +408,35 @@ func (rh *ReadHandler) findPKIndicesForJoin(
 			if col.Name == alias {
 				result[table] = i
 				break
+			}
+		}
+	}
+
+	// Also check renamed columns when looking for PK.
+	if rh.schemaRegistry != nil {
+		for _, table := range tables {
+			if _, found := result[table]; found {
+				continue // Already resolved.
+			}
+			meta, ok := rh.tables[table]
+			if !ok || len(meta.PKColumns) == 0 {
+				continue
+			}
+			pkCol := meta.PKColumns[0]
+			diff := rh.schemaRegistry.GetDiff(table)
+			if diff == nil {
+				continue
+			}
+			for oldName, newName := range diff.Renamed {
+				if newName == pkCol {
+					// PK was renamed — look for old name in Prod results.
+					for i, col := range columns {
+						if col.Name == oldName {
+							result[table] = i
+							break
+						}
+					}
+				}
 			}
 		}
 	}
