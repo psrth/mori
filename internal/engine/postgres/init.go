@@ -7,10 +7,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/mori-dev/mori/internal/core/config"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
-	"github.com/mori-dev/mori/internal/ui"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/shadow"
+	"github.com/mori-dev/mori/internal/ui"
 )
 
 // InitOptions holds the options for initializing a Mori project.
@@ -152,6 +153,20 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	if err := schema.WriteTables(moriDir, dumpResult.Tables); err != nil {
 		initErr = err
 		return nil, fmt.Errorf("failed to write tables: %w", err)
+	}
+
+	// Populate schema registry with FK metadata from the initial dump so
+	// that the proxy-layer FK enforcer can validate referential integrity
+	// from the very first session.
+	if len(dumpResult.ForeignKeys) > 0 {
+		reg := coreSchema.NewRegistry()
+		for _, fk := range dumpResult.ForeignKeys {
+			reg.RecordForeignKey(fk.ChildTable, fk)
+		}
+		if err := coreSchema.WriteRegistry(moriDir, reg); err != nil {
+			initErr = err
+			return nil, fmt.Errorf("failed to write schema registry: %w", err)
+		}
 	}
 
 	return &InitResult{
