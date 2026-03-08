@@ -4,25 +4,36 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
 	"github.com/mori-dev/mori/internal/logging"
 )
 
+// savepointSnapshot captures the delta/tombstone/insert state at the time
+// a SAVEPOINT is created, so it can be restored on ROLLBACK TO.
+type savepointSnapshot struct {
+	name       string
+	deltaSnap  map[string][]string
+	tombSnap   map[string][]string
+	insertSnap map[string]int
+}
+
 // TxnHandler manages transaction state for a single connection.
 // It coordinates BEGIN/COMMIT/ROLLBACK across both Prod and Shadow backends
 // and controls delta/tombstone staging.
 type TxnHandler struct {
-	prodConn   net.Conn
-	shadowConn net.Conn
-	deltaMap   *delta.Map
-	tombstones *delta.TombstoneSet
-	moriDir    string
-	connID     int64
-	verbose    bool
-	logger     *logging.Logger
-	inTxn      bool
+	prodConn       net.Conn
+	shadowConn     net.Conn
+	deltaMap       *delta.Map
+	tombstones     *delta.TombstoneSet
+	moriDir        string
+	connID         int64
+	verbose        bool
+	logger         *logging.Logger
+	inTxn          bool
+	savepointStack []savepointSnapshot
 }
 
 // InTxn reports whether this connection is inside an explicit transaction.
@@ -42,9 +53,17 @@ func (th *TxnHandler) HandleTxn(
 	case core.SubCommit:
 		return th.handleCommit(clientConn, rawMsg)
 	case core.SubRollback:
+		// Distinguish full ROLLBACK from ROLLBACK TO SAVEPOINT.
+		if isRollbackToSavepoint(cl.RawSQL) {
+			return th.handleRollbackTo(clientConn, rawMsg, cl.RawSQL)
+		}
 		return th.handleRollback(clientConn, rawMsg)
+	case core.SubSavepoint:
+		return th.handleSavepoint(clientConn, rawMsg, cl.RawSQL)
+	case core.SubRelease:
+		return th.handleRelease(clientConn, rawMsg, cl.RawSQL)
 	default:
-		// SAVEPOINT, RELEASE, etc. — forward to both backends without state change.
+		// Forward to both backends without state change.
 		return th.forwardToBoth(clientConn, rawMsg)
 	}
 }
@@ -101,6 +120,7 @@ func (th *TxnHandler) handleCommit(clientConn net.Conn, rawMsg []byte) error {
 	}
 
 	th.inTxn = false
+	th.savepointStack = nil // Clear savepoint stack on commit.
 
 	// Only promote staged deltas if both backends committed successfully.
 	if !shadowHadError && !prodHadError {
@@ -152,6 +172,7 @@ func (th *TxnHandler) handleRollback(clientConn net.Conn, rawMsg []byte) error {
 	}
 
 	th.inTxn = false
+	th.savepointStack = nil // Clear savepoint stack on full rollback.
 
 	// Discard staged entries.
 	th.deltaMap.Rollback()
@@ -176,6 +197,134 @@ func (th *TxnHandler) forwardToBoth(clientConn net.Conn, rawMsg []byte) error {
 		}
 	}
 	return forwardAndRelay(rawMsg, th.prodConn, clientConn)
+}
+
+// handleSavepoint pushes a snapshot of the current delta/tombstone/insert state
+// onto the savepoint stack, then forwards SAVEPOINT to both backends.
+func (th *TxnHandler) handleSavepoint(clientConn net.Conn, rawMsg []byte, rawSQL string) error {
+	name := parseSavepointName(rawSQL)
+	snap := savepointSnapshot{
+		name:       name,
+		deltaSnap:  th.deltaMap.SnapshotAll(),
+		tombSnap:   th.tombstones.SnapshotAll(),
+		insertSnap: th.deltaMap.SnapshotInsertedTables(),
+	}
+	th.savepointStack = append(th.savepointStack, snap)
+
+	if th.verbose {
+		log.Printf("[conn %d] SAVEPOINT %s: snapshot pushed (stack depth=%d)",
+			th.connID, name, len(th.savepointStack))
+	}
+	th.logger.Event(th.connID, "txn", fmt.Sprintf("SAVEPOINT %s", name))
+
+	return th.forwardToBoth(clientConn, rawMsg)
+}
+
+// handleRelease pops the matching savepoint snapshot from the stack (discards it),
+// then forwards RELEASE to both backends.
+func (th *TxnHandler) handleRelease(clientConn net.Conn, rawMsg []byte, rawSQL string) error {
+	name := parseReleaseName(rawSQL)
+
+	// Pop the matching snapshot and everything above it.
+	if idx := th.findSavepoint(name); idx >= 0 {
+		th.savepointStack = th.savepointStack[:idx]
+	}
+
+	if th.verbose {
+		log.Printf("[conn %d] RELEASE SAVEPOINT %s: snapshot popped (stack depth=%d)",
+			th.connID, name, len(th.savepointStack))
+	}
+	th.logger.Event(th.connID, "txn", fmt.Sprintf("RELEASE SAVEPOINT %s", name))
+
+	return th.forwardToBoth(clientConn, rawMsg)
+}
+
+// handleRollbackTo restores delta/tombstone/insert state from the matching savepoint
+// snapshot, then forwards ROLLBACK TO to both backends.
+// The snapshot is kept on the stack (PostgreSQL allows repeated ROLLBACK TO).
+func (th *TxnHandler) handleRollbackTo(clientConn net.Conn, rawMsg []byte, rawSQL string) error {
+	name := parseRollbackToName(rawSQL)
+	idx := th.findSavepoint(name)
+
+	if idx >= 0 {
+		snap := th.savepointStack[idx]
+		// Restore state to the savepoint.
+		th.deltaMap.RestoreAll(snap.deltaSnap)
+		th.tombstones.RestoreAll(snap.tombSnap)
+		th.deltaMap.RestoreInsertedTables(snap.insertSnap)
+		// Trim the stack: keep up to and including the matched savepoint,
+		// discard anything pushed after it.
+		th.savepointStack = th.savepointStack[:idx+1]
+
+		if th.verbose {
+			log.Printf("[conn %d] ROLLBACK TO SAVEPOINT %s: state restored (stack depth=%d)",
+				th.connID, name, len(th.savepointStack))
+		}
+		th.logger.Event(th.connID, "txn", fmt.Sprintf("ROLLBACK TO SAVEPOINT %s: restored", name))
+	} else {
+		// Savepoint not found in our stack — just forward to both backends.
+		if th.verbose {
+			log.Printf("[conn %d] ROLLBACK TO SAVEPOINT %s: not found in stack, forwarding only",
+				th.connID, name)
+		}
+		th.logger.Event(th.connID, "txn", fmt.Sprintf("ROLLBACK TO SAVEPOINT %s: not in stack", name))
+	}
+
+	return th.forwardToBoth(clientConn, rawMsg)
+}
+
+// findSavepoint returns the index of the named savepoint in the stack, or -1 if not found.
+// Searches from the top of the stack (most recent) to the bottom.
+func (th *TxnHandler) findSavepoint(name string) int {
+	for i := len(th.savepointStack) - 1; i >= 0; i-- {
+		if strings.EqualFold(th.savepointStack[i].name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// isRollbackToSavepoint checks if a ROLLBACK statement is actually ROLLBACK TO SAVEPOINT.
+func isRollbackToSavepoint(rawSQL string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(rawSQL))
+	return strings.Contains(upper, " TO ")
+}
+
+// parseSavepointName extracts the savepoint name from "SAVEPOINT <name>".
+func parseSavepointName(rawSQL string) string {
+	fields := strings.Fields(rawSQL)
+	if len(fields) >= 2 {
+		return fields[1]
+	}
+	return ""
+}
+
+// parseReleaseName extracts the savepoint name from "RELEASE [SAVEPOINT] <name>".
+func parseReleaseName(rawSQL string) string {
+	fields := strings.Fields(rawSQL)
+	// "RELEASE SAVEPOINT sp1" → fields[2]
+	// "RELEASE sp1" → fields[1]
+	if len(fields) >= 3 && strings.EqualFold(fields[1], "SAVEPOINT") {
+		return fields[2]
+	}
+	if len(fields) >= 2 {
+		return fields[1]
+	}
+	return ""
+}
+
+// parseRollbackToName extracts the savepoint name from "ROLLBACK TO [SAVEPOINT] <name>".
+func parseRollbackToName(rawSQL string) string {
+	fields := strings.Fields(rawSQL)
+	// "ROLLBACK TO SAVEPOINT sp1" → fields[3]
+	// "ROLLBACK TO sp1" → fields[2]
+	if len(fields) >= 4 && strings.EqualFold(fields[2], "SAVEPOINT") {
+		return fields[3]
+	}
+	if len(fields) >= 3 {
+		return fields[2]
+	}
+	return ""
 }
 
 // drainWithErrorCheck sends a message to a backend and reads until ReadyForQuery.

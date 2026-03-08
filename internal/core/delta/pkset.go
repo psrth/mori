@@ -163,3 +163,55 @@ func (s *pkSet) load(data map[string][]string) {
 		s.entries[table] = m
 	}
 }
+
+// snapshotAll returns a merged snapshot of both committed entries and staged entries,
+// suitable for savepoint snapshots where we need to capture the full in-flight state.
+func (s *pkSet) snapshotAll() map[string][]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Merge entries + staged into a single map.
+	merged := make(map[string]map[string]bool, len(s.entries))
+	for table, pks := range s.entries {
+		m := make(map[string]bool, len(pks))
+		for pk := range pks {
+			m[pk] = true
+		}
+		merged[table] = m
+	}
+	for table, pks := range s.staged {
+		if merged[table] == nil {
+			merged[table] = make(map[string]bool, len(pks))
+		}
+		for pk := range pks {
+			merged[table][pk] = true
+		}
+	}
+
+	out := make(map[string][]string, len(merged))
+	for table, pks := range merged {
+		keys := make([]string, 0, len(pks))
+		for pk := range pks {
+			keys = append(keys, pk)
+		}
+		slices.Sort(keys)
+		out[table] = keys
+	}
+	return out
+}
+
+// restoreAll replaces both committed entries and staged with the given snapshot.
+// Staged is cleared because the snapshot already includes everything up to the savepoint.
+func (s *pkSet) restoreAll(snap map[string][]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.entries = make(map[string]map[string]bool, len(snap))
+	for table, pks := range snap {
+		m := make(map[string]bool, len(pks))
+		for _, pk := range pks {
+			m[pk] = true
+		}
+		s.entries[table] = m
+	}
+	s.staged = nil
+}

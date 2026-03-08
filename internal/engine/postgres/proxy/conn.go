@@ -7,10 +7,15 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
+	pg_query "github.com/pganalyze/pg_query_go/v6"
+
 	"github.com/mori-dev/mori/internal/core"
+	"github.com/mori-dev/mori/internal/core/delta"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 )
 
 // handleConn manages a single client connection's lifecycle.
@@ -278,15 +283,17 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	var wh *WriteHandler
 	if p.deltaMap != nil && p.tombstones != nil {
 		wh = &WriteHandler{
-			prodConn:   prodConn,
-			shadowConn: shadowConn,
-			deltaMap:   p.deltaMap,
-			tombstones: p.tombstones,
-			tables:     p.tables,
-			moriDir:    p.moriDir,
-			connID:     connID,
-			verbose:    p.verbose,
-			logger:     p.logger,
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+			maxRowsHydrate: p.maxRowsHydrate,
 		}
 	}
 
@@ -303,6 +310,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			connID:         connID,
 			verbose:        p.verbose,
 			logger:         p.logger,
+			maxRowsHydrate: p.maxRowsHydrate,
 		}
 	}
 
@@ -341,6 +349,21 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		wh.txnHandler = txh
 	}
 
+	// Create FKEnforcer and link to WriteHandler for FK constraint enforcement.
+	if wh != nil && p.schemaRegistry != nil {
+		wh.fkEnforcer = &FKEnforcer{
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+		}
+	}
+
 	// Create an ExtHandler for extended query protocol (Parse/Bind/Execute/...).
 	var eh *ExtHandler
 	if p.classifier != nil && p.router != nil {
@@ -364,6 +387,9 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			shadowOnlyStmts: make(map[string]bool),
 		}
 	}
+
+	// SQL-level PREPARE cache: maps statement name → original SQL.
+	prepareCache := make(map[string]string)
 
 	for {
 		msg, err := readMsg(clientConn)
@@ -399,6 +425,132 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 		}
 
 		decision := p.classifyAndRoute(msg, connID)
+
+		// SQL-level PREPARE: cache the SQL and forward to Shadow.
+		if decision.classification != nil && decision.classification.SubType == core.SubPrepare {
+			name, innerSQL := parsePrepareStmt(decision.classification.RawSQL)
+			if name != "" && innerSQL != "" {
+				prepareCache[name] = innerSQL
+				if p.verbose {
+					log.Printf("[conn %d] PREPARE %s: cached SQL (%d chars)", connID, name, len(innerSQL))
+				}
+				p.logger.Event(connID, "prepare", fmt.Sprintf("PREPARE %s", name))
+			}
+			// Forward to Shadow and relay response.
+			if err := forwardAndRelay(msg.Raw, shadowConn, clientConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] shadow relay error (prepare): %v", connID, err)
+				}
+				return
+			}
+			continue
+		}
+
+		// SQL-level EXECUTE: look up cached SQL, substitute params, reclassify, re-route.
+		if decision.classification != nil && decision.classification.SubType == core.SubExecute {
+			name, params := parseExecuteStmt(decision.classification.RawSQL)
+			cachedSQL, ok := prepareCache[name]
+			if !ok {
+				// Not in our cache — might have been prepared before proxy started.
+				// Fall through to Prod (best effort).
+				if p.verbose {
+					log.Printf("[conn %d] EXECUTE %s: not in cache, forwarding to prod", connID, name)
+				}
+				if err := forwardAndRelay(msg.Raw, prodConn, clientConn); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] prod relay error (execute): %v", connID, err)
+					}
+					return
+				}
+				continue
+			}
+
+			// Substitute parameters into the SQL.
+			fullSQL := substituteExecuteParams(cachedSQL, params)
+			if p.verbose {
+				log.Printf("[conn %d] EXECUTE %s: resolved to: %s", connID, name, truncateSQL(fullSQL, 100))
+			}
+
+			// Reclassify with the actual SQL.
+			cl, err := p.classifier.Classify(fullSQL)
+			if err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] EXECUTE %s: reclassify error, forwarding to shadow: %v", connID, name, err)
+				}
+				if err := forwardAndRelay(msg.Raw, shadowConn, clientConn); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] shadow relay error (execute reclassify): %v", connID, err)
+					}
+					return
+				}
+				continue
+			}
+
+			// Re-route based on the actual query.
+			strategy := p.router.Route(cl)
+
+			// Build a query message with the full SQL for execution.
+			fullMsg := buildQueryMsg(fullSQL)
+
+			p.logger.Query(connID, fullSQL, cl, strategy, 0)
+
+			// Dispatch based on strategy — same as normal routing.
+			// For reads, use the read handler. For writes, use the write handler.
+			handled := false
+			if wh != nil {
+				switch strategy {
+				case core.StrategyShadowWrite, core.StrategyHydrateAndWrite, core.StrategyShadowDelete:
+					if err := wh.HandleWrite(clientConn, fullMsg, cl, strategy); err != nil {
+						if p.verbose {
+							log.Printf("[conn %d] write handler error (execute): %v", connID, err)
+						}
+						return
+					}
+					handled = true
+				}
+			}
+			if !handled && rh != nil {
+				switch strategy {
+				case core.StrategyMergedRead, core.StrategyJoinPatch:
+					if err := rh.HandleRead(clientConn, fullMsg, cl, strategy); err != nil {
+						if p.verbose {
+							log.Printf("[conn %d] read handler error (execute): %v", connID, err)
+						}
+						return
+					}
+					handled = true
+				}
+			}
+			if !handled {
+				// Default: forward the original EXECUTE to Shadow (where the PREPARE exists).
+				if err := forwardAndRelay(msg.Raw, shadowConn, clientConn); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] shadow relay error (execute default): %v", connID, err)
+					}
+					return
+				}
+			}
+			continue
+		}
+
+		// SQL-level DEALLOCATE: remove from cache and forward to shadow only
+		// (PREPARE was only sent to shadow, so Prod doesn't know the statement).
+		if decision.classification != nil && decision.classification.SubType == core.SubDeallocate {
+			name := parseDeallocateStmt(decision.classification.RawSQL)
+			if name != "" {
+				delete(prepareCache, name)
+				if p.verbose {
+					log.Printf("[conn %d] DEALLOCATE %s: removed from cache", connID, name)
+				}
+			}
+			if err := forwardAndRelay(msg.Raw, shadowConn, clientConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] DEALLOCATE forward error: %v", connID, err)
+				}
+				return
+			}
+			continue
+		}
 
 		// Dispatch write strategies to WriteHandler when available.
 		if wh != nil && decision.classification != nil {
@@ -450,6 +602,99 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 				}
 				return
 			}
+			continue
+		}
+
+		// Handle not-supported features.
+		if decision.classification != nil && decision.strategy == core.StrategyNotSupported {
+			errMsg := "mori: this operation is not supported through the proxy"
+			if decision.classification.NotSupportedMsg != "" {
+				errMsg = decision.classification.NotSupportedMsg
+			} else if decision.classification.SubType == core.SubExplain {
+				errMsg = "EXPLAIN is not supported on tables with pending changes"
+			}
+			errResp := buildGuardErrorResponse(errMsg)
+			clientConn.Write(errResp)
+			continue
+		}
+
+		// Handle SET/DEALLOCATE — forward to both backends.
+		if decision.classification != nil && decision.strategy == core.StrategyForwardBoth {
+			// Send to Shadow first, drain response.
+			shadowConn.Write(msg.Raw)
+			if err := drainUntilReady(shadowConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] shadow drain error (forward both): %v", connID, err)
+				}
+			}
+			// Forward to Prod and relay response to client.
+			if err := forwardAndRelay(msg.Raw, prodConn, clientConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] prod relay error (forward both): %v", connID, err)
+				}
+				return
+			}
+			continue
+		}
+
+		// Handle LISTEN/UNLISTEN — forward to Prod only.
+		if decision.classification != nil && decision.strategy == core.StrategyListenOnly {
+			if err := forwardAndRelay(msg.Raw, prodConn, clientConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] prod relay error (listen): %v", connID, err)
+				}
+				return
+			}
+			continue
+		}
+
+		// Handle TRUNCATE — forward to Shadow, mark fully shadowed.
+		if decision.classification != nil && decision.strategy == core.StrategyTruncate {
+			if err := forwardAndRelay(msg.Raw, shadowConn, clientConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] shadow relay error (truncate): %v", connID, err)
+				}
+				return
+			}
+			// Mark all truncated tables as fully shadowed.
+			if p.schemaRegistry != nil {
+				// Detect CASCADE behavior from the TRUNCATE AST.
+				isCascade := false
+				if result, err := pg_query.Parse(decision.classification.RawSQL); err == nil {
+					for _, stmt := range result.GetStmts() {
+						if ts := stmt.GetStmt().GetTruncateStmt(); ts != nil {
+							if ts.GetBehavior() == pg_query.DropBehavior_DROP_CASCADE {
+								isCascade = true
+							}
+							break
+						}
+					}
+				}
+
+				if isCascade {
+					// CASCADE: mark explicit tables and all FK-referenced children.
+					markCascadedTablesFullyShadowed(decision.classification.Tables, p.schemaRegistry, p.tombstones)
+					if p.verbose {
+						log.Printf("[conn %d] TRUNCATE CASCADE: marked tables and FK children as fully shadowed", connID)
+					}
+				} else {
+					// Non-CASCADE: mark only the explicit tables.
+					for _, table := range decision.classification.Tables {
+						p.schemaRegistry.MarkFullyShadowed(table)
+						if p.verbose {
+							log.Printf("[conn %d] TRUNCATE: marked %s as fully shadowed", connID, table)
+						}
+					}
+					if p.tombstones != nil {
+						for _, table := range decision.classification.Tables {
+							p.tombstones.ClearTable(table)
+						}
+					}
+				}
+				// Persist registry.
+				coreSchema.WriteRegistry(p.moriDir, p.schemaRegistry)
+			}
+			p.logger.Event(connID, "truncate", fmt.Sprintf("tables=%v", decision.classification.Tables))
 			continue
 		}
 
@@ -568,6 +813,18 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 			strategy:       strategy,
 		}
 
+	case core.StrategyNotSupported:
+		return routeDecision{target: targetProd, classification: classification, strategy: strategy}
+
+	case core.StrategyForwardBoth:
+		return routeDecision{target: targetBoth, classification: classification, strategy: strategy}
+
+	case core.StrategyListenOnly:
+		return routeDecision{target: targetProd, classification: classification, strategy: strategy}
+
+	case core.StrategyTruncate:
+		return routeDecision{target: targetShadow, classification: classification, strategy: strategy}
+
 	default:
 		// ProdDirect, Other
 		return routeDecision{target: targetProd, strategy: strategy}
@@ -663,4 +920,140 @@ func truncateSQL(sql string, maxLen int) string {
 		return sql
 	}
 	return sql[:maxLen] + "..."
+}
+
+// parsePrepareStmt extracts the name and SQL from "PREPARE name [(types)] AS sql".
+func parsePrepareStmt(rawSQL string) (name, innerSQL string) {
+	// Use pg_query to parse robustly.
+	result, err := pg_query.Parse(rawSQL)
+	if err != nil {
+		return "", ""
+	}
+	stmts := result.GetStmts()
+	if len(stmts) == 0 {
+		return "", ""
+	}
+	prep := stmts[0].GetStmt().GetPrepareStmt()
+	if prep == nil {
+		return "", ""
+	}
+	name = prep.GetName()
+	// Deparse the inner query.
+	innerResult := &pg_query.ParseResult{
+		Stmts: []*pg_query.RawStmt{
+			{Stmt: prep.GetQuery()},
+		},
+	}
+	innerSQL, err = pg_query.Deparse(innerResult)
+	if err != nil {
+		return name, ""
+	}
+	return name, innerSQL
+}
+
+// parseExecuteStmt extracts the name and parameter values from "EXECUTE name(param1, param2, ...)".
+// Parameters are returned as string literals.
+func parseExecuteStmt(rawSQL string) (name string, params []string) {
+	result, err := pg_query.Parse(rawSQL)
+	if err != nil {
+		return "", nil
+	}
+	stmts := result.GetStmts()
+	if len(stmts) == 0 {
+		return "", nil
+	}
+	exec := stmts[0].GetStmt().GetExecuteStmt()
+	if exec == nil {
+		return "", nil
+	}
+	name = exec.GetName()
+	for _, p := range exec.GetParams() {
+		if ac := p.GetAConst(); ac != nil {
+			if sv := ac.GetSval(); sv != nil {
+				params = append(params, "'"+sv.GetSval()+"'")
+			} else if iv := ac.GetIval(); iv != nil {
+				params = append(params, fmt.Sprintf("%d", iv.GetIval()))
+			} else if fv := ac.GetFval(); fv != nil {
+				params = append(params, fv.GetFval())
+			} else if ac.GetIsnull() {
+				params = append(params, "NULL")
+			} else if bv := ac.GetBoolval(); bv != nil {
+				if bv.GetBoolval() {
+					params = append(params, "TRUE")
+				} else {
+					params = append(params, "FALSE")
+				}
+			}
+		} else if tc := p.GetTypeCast(); tc != nil {
+			// Type cast: recurse on the argument and append ::type
+			if arg := tc.GetArg(); arg != nil {
+				if ac := arg.GetAConst(); ac != nil {
+					var val string
+					if sv := ac.GetSval(); sv != nil {
+						val = "'" + sv.GetSval() + "'"
+					} else if iv := ac.GetIval(); iv != nil {
+						val = fmt.Sprintf("%d", iv.GetIval())
+					}
+					// For simplicity, just use the value without the cast.
+					params = append(params, val)
+				}
+			}
+		}
+	}
+	return name, params
+}
+
+// substituteExecuteParams replaces $1, $2, ... placeholders in SQL with parameter values.
+func substituteExecuteParams(sql string, params []string) string {
+	result := sql
+	// Replace in reverse order to handle $10, $11, etc. correctly.
+	for i := len(params); i >= 1; i-- {
+		placeholder := fmt.Sprintf("$%d", i)
+		if i-1 < len(params) {
+			result = strings.ReplaceAll(result, placeholder, params[i-1])
+		}
+	}
+	return result
+}
+
+// parseDeallocateStmt extracts the statement name from "DEALLOCATE [PREPARE] name".
+func parseDeallocateStmt(rawSQL string) string {
+	result, err := pg_query.Parse(rawSQL)
+	if err != nil {
+		return ""
+	}
+	stmts := result.GetStmts()
+	if len(stmts) == 0 {
+		return ""
+	}
+	dealloc := stmts[0].GetStmt().GetDeallocateStmt()
+	if dealloc == nil {
+		return ""
+	}
+	return dealloc.GetName()
+}
+
+// markCascadedTablesFullyShadowed marks the given tables and all their FK children
+// (recursively) as fully shadowed, and clears their tombstones. This is needed for
+// TRUNCATE CASCADE, where PostgreSQL automatically truncates child tables that
+// have foreign key references to the truncated table.
+func markCascadedTablesFullyShadowed(tables []string, schemaRegistry *coreSchema.Registry, tombstones *delta.TombstoneSet) {
+	visited := make(map[string]bool)
+	var walk func(table string)
+	walk = func(table string) {
+		if visited[table] {
+			return
+		}
+		visited[table] = true
+		schemaRegistry.MarkFullyShadowed(table)
+		if tombstones != nil {
+			tombstones.ClearTable(table)
+		}
+		for _, fk := range schemaRegistry.GetReferencingFKs(table) {
+			walk(fk.ChildTable)
+		}
+	}
+	for _, t := range tables {
+		walk(t)
+	}
 }

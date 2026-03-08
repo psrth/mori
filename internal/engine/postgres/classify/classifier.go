@@ -121,21 +121,74 @@ func (c *PgClassifier) classifyNode(node *pg_query.Node, cl *core.Classification
 		c.classifyTransaction(node.GetTransactionStmt(), cl)
 	case node.GetVariableSetStmt() != nil:
 		cl.OpType = core.OpOther
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubSet
 	case node.GetVariableShowStmt() != nil:
 		cl.OpType = core.OpOther
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubShow
 	case node.GetExplainStmt() != nil:
-		cl.OpType = core.OpOther
-		cl.SubType = core.SubOther
+		c.classifyExplain(node.GetExplainStmt(), cl)
 	case node.GetTruncateStmt() != nil:
 		cl.OpType = core.OpWrite
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubTruncate
 		for _, rel := range node.GetTruncateStmt().GetRelations() {
 			if rv := rel.GetRangeVar(); rv != nil {
 				cl.Tables = appendUnique(cl.Tables, relName(rv))
 			}
 		}
+	case node.GetPrepareStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubPrepare
+	case node.GetExecuteStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubExecute
+	case node.GetDeallocateStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubDeallocate
+	case node.GetDeclareCursorStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubCursor
+		cl.HasCursor = true
+		// Extract tables from the cursor's query.
+		if query := node.GetDeclareCursorStmt().GetQuery(); query != nil {
+			if sel := query.GetSelectStmt(); sel != nil {
+				tables := extractTablesFromNodes(sel.GetFromClause())
+				cl.Tables = appendUnique(cl.Tables, tables...)
+			}
+		}
+	case node.GetFetchStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubCursor
+		cl.HasCursor = true
+	case node.GetClosePortalStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubCursor
+		cl.HasCursor = true
+	case node.GetListenStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubListen
+	case node.GetUnlistenStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubListen
+	case node.GetNotifyStmt() != nil:
+		cl.OpType = core.OpWrite
+		cl.SubType = core.SubNotify
+		cl.NotSupportedMsg = "NOTIFY is not supported through Mori — it would affect production subscribers"
+	case node.GetCopyStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "COPY is not supported through Mori — use INSERT/SELECT for data transfer"
+	case node.GetLockStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "LOCK TABLE is not supported through Mori — explicit locking is unsafe across split backends"
+	case node.GetDoStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "DO $$ anonymous blocks are not supported through Mori — queries inside PL/pgSQL are opaque to the proxy"
+	case node.GetCallStmt() != nil:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "CALL (stored procedures) is not supported through Mori — procedure bodies are opaque to the proxy"
 	default:
 		cl.OpType = core.OpOther
 		cl.SubType = core.SubOther
@@ -232,18 +285,133 @@ func (c *PgClassifier) classifySelect(sel *pg_query.SelectStmt, cl *core.Classif
 		cl.PKs = append(cl.PKs, pks...)
 	}
 
+	// Detect DISTINCT.
+	if len(sel.GetDistinctClause()) > 0 {
+		cl.HasDistinct = true
+	}
+
 	// Detect aggregates: GROUP BY or aggregate functions in target list.
 	if len(sel.GetGroupClause()) > 0 {
 		cl.HasAggregate = true
 	}
-	if !cl.HasAggregate {
-		for _, target := range sel.GetTargetList() {
-			if hasAggregateFunc(target) {
-				cl.HasAggregate = true
-				break
+	for _, target := range sel.GetTargetList() {
+		if !cl.HasAggregate && hasAggregateFunc(target) {
+			cl.HasAggregate = true
+		}
+		if hasWindowFunc(target) {
+			cl.HasWindowFunc = true
+			cl.IsComplexRead = true
+		}
+		if hasComplexAggFunc(target) {
+			cl.HasComplexAgg = true
+		}
+	}
+}
+
+// classifyExplain handles EXPLAIN statements.
+// EXPLAIN ANALYZE is not supported (it executes the query).
+// Regular EXPLAIN extracts tables from the inner query.
+func (c *PgClassifier) classifyExplain(stmt *pg_query.ExplainStmt, cl *core.Classification) {
+	// Check for ANALYZE option.
+	for _, opt := range stmt.GetOptions() {
+		if de := opt.GetDefElem(); de != nil {
+			if strings.ToLower(de.GetDefname()) == "analyze" {
+				cl.OpType = core.OpOther
+				cl.SubType = core.SubNotSupported
+				cl.NotSupportedMsg = "EXPLAIN ANALYZE is not supported through Mori — it executes the query, which is unsafe on modified state"
+				return
 			}
 		}
 	}
+
+	cl.OpType = core.OpOther
+	cl.SubType = core.SubExplain
+
+	// Extract tables from the inner query for dirty-table detection.
+	if query := stmt.GetQuery(); query != nil {
+		if sel := query.GetSelectStmt(); sel != nil {
+			tables := extractTablesFromNodes(sel.GetFromClause())
+			cl.Tables = appendUnique(cl.Tables, tables...)
+		} else if ins := query.GetInsertStmt(); ins != nil {
+			if rel := ins.GetRelation(); rel != nil {
+				cl.Tables = appendUnique(cl.Tables, relName(rel))
+			}
+		} else if upd := query.GetUpdateStmt(); upd != nil {
+			if rel := upd.GetRelation(); rel != nil {
+				cl.Tables = appendUnique(cl.Tables, relName(rel))
+			}
+		} else if del := query.GetDeleteStmt(); del != nil {
+			if rel := del.GetRelation(); rel != nil {
+				cl.Tables = appendUnique(cl.Tables, relName(rel))
+			}
+		}
+	}
+}
+
+// hasWindowFunc recursively checks if a node contains a window function call
+// (i.e., a FuncCall with an OVER clause).
+func hasWindowFunc(node *pg_query.Node) bool {
+	if node == nil {
+		return false
+	}
+	if rt := node.GetResTarget(); rt != nil {
+		return hasWindowFunc(rt.GetVal())
+	}
+	if fc := node.GetFuncCall(); fc != nil {
+		if fc.GetOver() != nil {
+			return true
+		}
+		for _, arg := range fc.GetArgs() {
+			if hasWindowFunc(arg) {
+				return true
+			}
+		}
+	}
+	if ae := node.GetAExpr(); ae != nil {
+		return hasWindowFunc(ae.GetLexpr()) || hasWindowFunc(ae.GetRexpr())
+	}
+	if tc := node.GetTypeCast(); tc != nil {
+		return hasWindowFunc(tc.GetArg())
+	}
+	return false
+}
+
+// hasComplexAggFunc recursively checks if a node contains a complex aggregate
+// function that can't be re-aggregated in Go (array_agg, json_agg, string_agg, etc.).
+func hasComplexAggFunc(node *pg_query.Node) bool {
+	if node == nil {
+		return false
+	}
+	if rt := node.GetResTarget(); rt != nil {
+		return hasComplexAggFunc(rt.GetVal())
+	}
+	if fc := node.GetFuncCall(); fc != nil {
+		if fc.GetOver() != nil {
+			return false // Window functions handled separately.
+		}
+		for _, nameNode := range fc.GetFuncname() {
+			if s := nameNode.GetString_(); s != nil {
+				name := strings.ToLower(s.GetSval())
+				switch name {
+				case "array_agg", "string_agg", "json_agg", "jsonb_agg",
+					"json_object_agg", "jsonb_object_agg":
+					return true
+				}
+			}
+		}
+		for _, arg := range fc.GetArgs() {
+			if hasComplexAggFunc(arg) {
+				return true
+			}
+		}
+	}
+	if ae := node.GetAExpr(); ae != nil {
+		return hasComplexAggFunc(ae.GetLexpr()) || hasComplexAggFunc(ae.GetRexpr())
+	}
+	if tc := node.GetTypeCast(); tc != nil {
+		return hasComplexAggFunc(tc.GetArg())
+	}
+	return false
 }
 
 // hasAggregateFunc recursively checks if a node contains an aggregate function call.
@@ -322,6 +490,16 @@ func (c *PgClassifier) classifyInsert(ins *pg_query.InsertStmt, cl *core.Classif
 		cl.Tables = appendUnique(cl.Tables, relName(rel))
 	}
 
+	// Detect ON CONFLICT (upsert).
+	if ins.GetOnConflictClause() != nil {
+		cl.HasOnConflict = true
+	}
+
+	// Detect RETURNING.
+	if len(ins.GetReturningList()) > 0 {
+		cl.HasReturning = true
+	}
+
 	// INSERT...SELECT: extract tables from the SELECT portion.
 	if ins.GetSelectStmt() != nil {
 		if subSel := ins.GetSelectStmt().GetSelectStmt(); subSel != nil {
@@ -346,6 +524,11 @@ func (c *PgClassifier) classifyUpdate(upd *pg_query.UpdateStmt, cl *core.Classif
 
 	cl.IsJoin = len(cl.Tables) > 1
 
+	// Detect RETURNING.
+	if len(upd.GetReturningList()) > 0 {
+		cl.HasReturning = true
+	}
+
 	if upd.GetWhereClause() != nil {
 		pks := c.extractPKsFromExpr(upd.GetWhereClause(), cl.Tables)
 		cl.PKs = append(cl.PKs, pks...)
@@ -366,6 +549,11 @@ func (c *PgClassifier) classifyDelete(del *pg_query.DeleteStmt, cl *core.Classif
 	cl.Tables = appendUnique(cl.Tables, tables...)
 
 	cl.IsJoin = len(cl.Tables) > 1
+
+	// Detect RETURNING.
+	if len(del.GetReturningList()) > 0 {
+		cl.HasReturning = true
+	}
 
 	if del.GetWhereClause() != nil {
 		pks := c.extractPKsFromExpr(del.GetWhereClause(), cl.Tables)
@@ -403,6 +591,10 @@ func (c *PgClassifier) classifyTransaction(stmt *pg_query.TransactionStmt, cl *c
 		cl.SubType = core.SubCommit
 	case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK:
 		cl.SubType = core.SubRollback
+	case pg_query.TransactionStmtKind_TRANS_STMT_SAVEPOINT:
+		cl.SubType = core.SubSavepoint
+	case pg_query.TransactionStmtKind_TRANS_STMT_RELEASE:
+		cl.SubType = core.SubRelease
 	default:
 		cl.SubType = core.SubOther
 	}

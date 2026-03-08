@@ -141,7 +141,69 @@ func runReset(cmd *cobra.Command, args []string) error {
 		ui.StepDone(fmt.Sprintf("Re-synced %d tables, %d sequence offsets",
 			len(dumpResult.Tables), len(dumpResult.Sequences)))
 	} else {
-		// Soft reset: truncate tables and reset sequences.
+		// Soft reset: revert DDL changes, truncate tables, and reset sequences.
+
+		// Revert DDL changes recorded in the schema registry before clearing it.
+		// Without this, shadow DB retains ALTER TABLE changes (added columns, etc.)
+		// and subsequent sessions fail when re-applying the same DDL.
+		registry, regErr := coreSchema.ReadRegistry(connDir)
+		if regErr == nil {
+			ddlCount := 0
+			_ = ui.Spinner("Reverting DDL changes...", func() error {
+				for _, tableName := range registry.Tables() {
+					diff := registry.GetDiff(tableName)
+					if diff == nil {
+						continue
+					}
+
+					// Drop tables that were created in Shadow.
+					if diff.IsNewTable {
+						shadowConn.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", quoteIdent(tableName)))
+						ddlCount++
+						continue
+					}
+
+					// Revert added columns.
+					for _, col := range diff.Added {
+						shadowConn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s",
+							quoteIdent(tableName), quoteIdent(col.Name)))
+						ddlCount++
+					}
+
+					// Revert dropped columns.
+					for _, colName := range diff.Dropped {
+						// Re-add with TEXT type as a safe default; the original type
+						// isn't tracked in the registry for drops.
+						shadowConn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s TEXT",
+							quoteIdent(tableName), quoteIdent(colName)))
+						ddlCount++
+					}
+
+					// Revert renamed columns (reverse: new_name → old_name).
+					for oldName, newName := range diff.Renamed {
+						shadowConn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s RENAME COLUMN %s TO %s",
+							quoteIdent(tableName), quoteIdent(newName), quoteIdent(oldName)))
+						ddlCount++
+					}
+
+					// Revert type changes.
+					for colName, types := range diff.TypeChanged {
+						oldType := types[0]
+						if oldType != "" && oldType != "unknown" {
+							shadowConn.Exec(ctx, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s TYPE %s USING %s::%s",
+								quoteIdent(tableName), quoteIdent(colName), oldType,
+								quoteIdent(colName), oldType))
+							ddlCount++
+						}
+					}
+				}
+				return nil
+			})
+			if ddlCount > 0 {
+				ui.StepDone(fmt.Sprintf("Reverted %d DDL %s", ddlCount, pluralize(ddlCount, "change", "changes")))
+			}
+		}
+
 		if tables != nil {
 			tableCount := len(tables)
 			_ = ui.Spinner("Truncating Shadow tables...", func() error {

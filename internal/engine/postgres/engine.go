@@ -89,6 +89,7 @@ func (e *pgEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.Tabl
 		deps.MoriDir,
 		deps.SchemaReg,
 		deps.Logger,
+		deps.MaxRowsHydrate,
 	)
 }
 

@@ -25,14 +25,24 @@ func NewRouter(deltaMap *delta.Map, tombstones *delta.TombstoneSet, schemaRegist
 
 // Route returns the execution strategy for a classified query.
 func (r *Router) Route(c *Classification) RoutingStrategy {
+	// Not-supported features always return an error.
+	if c.SubType == SubNotSupported {
+		return StrategyNotSupported
+	}
+
 	switch c.OpType {
 	case OpRead:
 		if r.anyTableAffected(c.Tables) {
-			// Set operations (UNION/INTERSECT/EXCEPT) and complex reads (CTEs,
-			// derived tables) cannot be safely merged or patched at the row level.
-			// Route to Prod for structurally correct results.
-			if c.HasSetOp || c.IsComplexRead {
-				return StrategyProdDirect
+			// Set operations (UNION/INTERSECT/EXCEPT) on affected tables need
+			// decomposition — each sub-SELECT runs through merged read, then
+			// the set operation is applied in memory.
+			if c.HasSetOp {
+				return StrategyMergedRead
+			}
+			// Complex reads (CTEs, derived tables) on affected tables use
+			// temp table materialization via merged read path.
+			if c.IsComplexRead {
+				return StrategyMergedRead
 			}
 			// Aggregate queries (COUNT, SUM, GROUP BY, etc.) on affected tables
 			// need row-level merge then re-aggregation. Route through MergedRead
@@ -41,12 +51,6 @@ func (r *Router) Route(c *Classification) RoutingStrategy {
 				return StrategyMergedRead
 			}
 			if c.IsJoin {
-				// JoinPatch sends the original query to Prod — if any table has
-				// schema diffs (added/renamed columns), Prod will reject it.
-				// Route through MergedRead which falls back to Shadow-only on Prod error.
-				if r.anyTableSchemaModified(c.Tables) {
-					return StrategyMergedRead
-				}
 				return StrategyJoinPatch
 			}
 			return StrategyMergedRead
@@ -56,11 +60,19 @@ func (r *Router) Route(c *Classification) RoutingStrategy {
 	case OpWrite:
 		switch c.SubType {
 		case SubInsert:
+			// INSERT ... ON CONFLICT needs hydration like UPDATE.
+			if c.HasOnConflict {
+				return StrategyHydrateAndWrite
+			}
 			return StrategyShadowWrite
 		case SubUpdate:
 			return StrategyHydrateAndWrite
 		case SubDelete:
 			return StrategyShadowDelete
+		case SubTruncate:
+			return StrategyTruncate
+		case SubNotify:
+			return StrategyNotSupported
 		default:
 			return StrategyShadowWrite
 		}
@@ -70,6 +82,39 @@ func (r *Router) Route(c *Classification) RoutingStrategy {
 
 	case OpTransaction:
 		return StrategyTransaction
+
+	case OpOther:
+		switch c.SubType {
+		case SubSet:
+			return StrategyForwardBoth
+		case SubShow:
+			return StrategyProdDirect
+		case SubExplain:
+			// EXPLAIN on dirty tables is unreliable — error out.
+			if r.anyTableAffected(c.Tables) {
+				return StrategyNotSupported
+			}
+			return StrategyProdDirect
+		case SubCursor:
+			// Cursor operations (DECLARE/FETCH/CLOSE) on affected tables need
+			// materialization through merged read. FETCH/CLOSE have no tables
+			// and will be forwarded to shadow by the handler.
+			if c.HasCursor && r.anyTableAffected(c.Tables) {
+				return StrategyMergedRead
+			}
+			// Clean cursor or FETCH/CLOSE — forward to shadow where the cursor lives.
+			return StrategyMergedRead
+		case SubListen:
+			return StrategyListenOnly
+		case SubNotSupported:
+			return StrategyNotSupported
+		case SubPrepare:
+			return StrategyShadowWrite // PREPARE forwarded to Shadow; proxy caches the SQL
+		case SubDeallocate:
+			return StrategyForwardBoth
+		default:
+			return StrategyProdDirect
+		}
 
 	default:
 		return StrategyProdDirect
@@ -101,6 +146,19 @@ func (r *Router) anyTableAffected(tables []string) bool {
 	if r.schemaRegistry != nil {
 		for _, t := range tables {
 			if r.schemaRegistry.HasDiff(t) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// anyTableFullyShadowed reports whether any of the given tables are fully shadowed
+// (e.g., after TRUNCATE), meaning all reads should go to Shadow only.
+func (r *Router) anyTableFullyShadowed(tables []string) bool {
+	if r.schemaRegistry != nil {
+		for _, t := range tables {
+			if r.schemaRegistry.IsFullyShadowed(t) {
 				return true
 			}
 		}

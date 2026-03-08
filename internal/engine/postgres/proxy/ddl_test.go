@@ -446,6 +446,95 @@ func TestHandleDDLPersistence(t *testing.T) {
 	}
 }
 
+func TestExtractAndStoreFKsCreateTable(t *testing.T) {
+	reg := coreSchema.NewRegistry()
+	ddh := &DDLHandler{
+		schemaRegistry: reg,
+		connID:         1,
+		verbose:        true,
+	}
+
+	ddh.extractAndStoreFKs("CREATE TABLE orders (id SERIAL PRIMARY KEY, user_id INT REFERENCES users(id) ON DELETE CASCADE)")
+
+	fks := reg.GetForeignKeys("orders")
+	if len(fks) != 1 {
+		t.Fatalf("expected 1 FK, got %d", len(fks))
+	}
+	if fks[0].ParentTable != "users" {
+		t.Errorf("FK parent = %q, want users", fks[0].ParentTable)
+	}
+	if fks[0].ChildTable != "orders" {
+		t.Errorf("FK child = %q, want orders", fks[0].ChildTable)
+	}
+	if len(fks[0].ChildColumns) != 1 || fks[0].ChildColumns[0] != "user_id" {
+		t.Errorf("FK child columns = %v, want [user_id]", fks[0].ChildColumns)
+	}
+	if fks[0].OnDelete != "CASCADE" {
+		t.Errorf("FK OnDelete = %q, want CASCADE", fks[0].OnDelete)
+	}
+}
+
+func TestExtractAndStoreFKsTableLevel(t *testing.T) {
+	reg := coreSchema.NewRegistry()
+	ddh := &DDLHandler{
+		schemaRegistry: reg,
+		connID:         1,
+		verbose:        false,
+	}
+
+	ddh.extractAndStoreFKs("CREATE TABLE orders (id SERIAL PRIMARY KEY, user_id INT, FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL)")
+
+	fks := reg.GetForeignKeys("orders")
+	if len(fks) != 1 {
+		t.Fatalf("expected 1 FK, got %d", len(fks))
+	}
+	if fks[0].ParentTable != "users" {
+		t.Errorf("FK parent = %q, want users", fks[0].ParentTable)
+	}
+	if fks[0].OnDelete != "SET NULL" {
+		t.Errorf("FK OnDelete = %q, want SET NULL", fks[0].OnDelete)
+	}
+}
+
+func TestExtractAndStoreFKsAlterTable(t *testing.T) {
+	reg := coreSchema.NewRegistry()
+	ddh := &DDLHandler{
+		schemaRegistry: reg,
+		connID:         1,
+		verbose:        false,
+	}
+
+	ddh.extractAndStoreFKs("ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT")
+
+	fks := reg.GetForeignKeys("orders")
+	if len(fks) != 1 {
+		t.Fatalf("expected 1 FK, got %d", len(fks))
+	}
+	if fks[0].ConstraintName != "fk_user" {
+		t.Errorf("FK constraint name = %q, want fk_user", fks[0].ConstraintName)
+	}
+	if fks[0].OnDelete != "RESTRICT" {
+		t.Errorf("FK OnDelete = %q, want RESTRICT", fks[0].OnDelete)
+	}
+}
+
+func TestExtractAndStoreFKsNonFK(t *testing.T) {
+	reg := coreSchema.NewRegistry()
+	ddh := &DDLHandler{
+		schemaRegistry: reg,
+		connID:         1,
+		verbose:        false,
+	}
+
+	// DDL without FK constraints — should be a no-op.
+	ddh.extractAndStoreFKs("CREATE TABLE simple (id SERIAL PRIMARY KEY, name TEXT)")
+
+	fks := reg.GetForeignKeys("simple")
+	if len(fks) != 0 {
+		t.Errorf("expected 0 FKs for table without FK constraints, got %d", len(fks))
+	}
+}
+
 func TestHandleDDLNilRegistry(t *testing.T) {
 	shadowConn, shadowBackend := newMockBackend()
 	defer shadowConn.Close()

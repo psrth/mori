@@ -34,17 +34,30 @@ func (o OpType) String() string {
 type SubType int
 
 const (
-	SubSelect   SubType = iota // SELECT
-	SubInsert                   // INSERT
-	SubUpdate                   // UPDATE
-	SubDelete                   // DELETE
-	SubAlter                    // ALTER TABLE
-	SubCreate                   // CREATE TABLE / CREATE INDEX
-	SubDrop                     // DROP TABLE
-	SubBegin                    // BEGIN
-	SubCommit                   // COMMIT
-	SubRollback                 // ROLLBACK
-	SubOther                    // Anything else
+	SubSelect      SubType = iota // SELECT
+	SubInsert                      // INSERT
+	SubUpdate                      // UPDATE
+	SubDelete                      // DELETE
+	SubAlter                       // ALTER TABLE
+	SubCreate                      // CREATE TABLE / CREATE INDEX
+	SubDrop                        // DROP TABLE
+	SubBegin                       // BEGIN
+	SubCommit                      // COMMIT
+	SubRollback                    // ROLLBACK
+	SubSavepoint                   // SAVEPOINT
+	SubRelease                     // RELEASE SAVEPOINT
+	SubTruncate                    // TRUNCATE
+	SubSet                         // SET (session variable)
+	SubShow                        // SHOW (session variable)
+	SubExplain                     // EXPLAIN (without ANALYZE)
+	SubPrepare                     // SQL-level PREPARE
+	SubExecute                     // SQL-level EXECUTE
+	SubDeallocate                  // DEALLOCATE
+	SubCursor                      // DECLARE / FETCH / CLOSE cursor
+	SubListen                      // LISTEN
+	SubNotify                      // NOTIFY
+	SubNotSupported                // COPY, LOCK, DO $$, CALL, EXPLAIN ANALYZE
+	SubOther                       // Anything else
 )
 
 func (s SubType) String() string {
@@ -69,6 +82,32 @@ func (s SubType) String() string {
 		return "COMMIT"
 	case SubRollback:
 		return "ROLLBACK"
+	case SubSavepoint:
+		return "SAVEPOINT"
+	case SubRelease:
+		return "RELEASE"
+	case SubTruncate:
+		return "TRUNCATE"
+	case SubSet:
+		return "SET"
+	case SubShow:
+		return "SHOW"
+	case SubExplain:
+		return "EXPLAIN"
+	case SubPrepare:
+		return "PREPARE"
+	case SubExecute:
+		return "EXECUTE"
+	case SubDeallocate:
+		return "DEALLOCATE"
+	case SubCursor:
+		return "CURSOR"
+	case SubListen:
+		return "LISTEN"
+	case SubNotify:
+		return "NOTIFY"
+	case SubNotSupported:
+		return "NOT_SUPPORTED"
 	case SubOther:
 		return "OTHER"
 	default:
@@ -88,6 +127,10 @@ const (
 	StrategyShadowDelete                            // Delete from Shadow, add tombstone
 	StrategyShadowDDL                               // Execute DDL on Shadow, update schema registry
 	StrategyTransaction                             // Transaction control (BEGIN/COMMIT/ROLLBACK)
+	StrategyNotSupported                            // Return error to client (COPY, LOCK, DO, CALL, EXPLAIN ANALYZE)
+	StrategyForwardBoth                             // Forward to both backends (SET)
+	StrategyTruncate                                // Forward to Shadow, mark table fully shadowed
+	StrategyListenOnly                              // Forward LISTEN to Prod only
 )
 
 func (r RoutingStrategy) String() string {
@@ -108,6 +151,14 @@ func (r RoutingStrategy) String() string {
 		return "SHADOW_DDL"
 	case StrategyTransaction:
 		return "TRANSACTION"
+	case StrategyNotSupported:
+		return "NOT_SUPPORTED"
+	case StrategyForwardBoth:
+		return "FORWARD_BOTH"
+	case StrategyTruncate:
+		return "TRUNCATE"
+	case StrategyListenOnly:
+		return "LISTEN_ONLY"
 	default:
 		return fmt.Sprintf("RoutingStrategy(%d)", int(r))
 	}
@@ -116,7 +167,7 @@ func (r RoutingStrategy) String() string {
 // Classification is the result of parsing a query.
 type Classification struct {
 	OpType       OpType   // READ, WRITE, DDL, TRANSACTION, OTHER
-	SubType      SubType  // SELECT, INSERT, UPDATE, DELETE, ALTER, CREATE, DROP, BEGIN, COMMIT, ROLLBACK
+	SubType      SubType  // SELECT, INSERT, UPDATE, DELETE, ALTER, CREATE, DROP, BEGIN, COMMIT, ROLLBACK, etc.
 	Tables       []string // All table names referenced
 	PKs          []TablePK // Extractable (table, pk) pairs from WHERE clauses
 	IsJoin       bool     // Whether the query involves multiple tables
@@ -126,6 +177,13 @@ type Classification struct {
 	HasAggregate  bool     // Whether the query uses aggregate functions (COUNT, SUM, etc.) or GROUP BY
 	HasSetOp      bool     // Whether the query uses UNION/INTERSECT/EXCEPT
 	IsComplexRead bool     // Whether the query is too complex for merged read (derived tables, complex CTEs)
+	HasReturning  bool     // Whether the query has a RETURNING clause
+	HasOnConflict bool     // Whether INSERT has ON CONFLICT (upsert)
+	HasWindowFunc bool     // Whether the query uses window functions (SUM() OVER())
+	HasComplexAgg bool     // Whether the query uses complex aggregates (array_agg, json_agg, string_agg)
+	HasDistinct   bool     // Whether the query uses DISTINCT
+	HasCursor     bool     // Whether the query involves DECLARE/FETCH/CLOSE cursor
+	NotSupportedMsg string // Error message for unsupported features (COPY, LOCK, DO, CALL, EXPLAIN ANALYZE)
 	RawSQL        string   // Original SQL text
 }
 

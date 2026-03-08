@@ -2,10 +2,12 @@ package proxy
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mori-dev/mori/internal/core"
 )
@@ -64,6 +66,12 @@ func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) 
 				effectiveSQL = injectPKColumn(querySQL, pkCol)
 				injectedPK = pkCol
 			}
+		} else if meta, ok := rh.tables[table]; ok && meta.PKType == "none" {
+			// No PK — inject ctid as a virtual PK for dedup and tombstone filtering.
+			if needsCtidInjection(querySQL) {
+				effectiveSQL = injectCtidColumn(querySQL)
+				injectedPK = "ctid"
+			}
 		}
 	}
 
@@ -87,6 +95,11 @@ func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) 
 		} else {
 			prodSQL = rewritten
 		}
+	}
+
+	// Check if table is fully shadowed (e.g., after TRUNCATE) — skip Prod entirely.
+	if !skipProd && rh.schemaRegistry != nil && rh.schemaRegistry.IsFullyShadowed(table) {
+		skipProd = true
 	}
 
 	// Step 2: Execute query on Prod (with over-fetching for LIMIT queries).
@@ -160,13 +173,23 @@ func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) 
 			mergedColumns, mergedValues, mergedNulls, injectedPK)
 	}
 
+	// Step 10: Apply DISTINCT if requested.
+	if cl != nil && cl.HasDistinct {
+		mergedValues, mergedNulls = deduplicateByFullRow(mergedValues, mergedNulls)
+	}
+
 	return mergedColumns, mergedValues, mergedNulls, nil
 }
 
 // aggregateReadCore handles aggregate queries on affected tables by converting
-// to a row-level merged read and re-aggregating. For simple COUNT(*) without
-// GROUP BY, it runs the base SELECT pk query through merged read and counts rows.
-// Complex aggregates (GROUP BY, SUM, etc.) fall back to Prod-only execution.
+// to a row-level merged read and re-aggregating.
+//
+// Strategy order:
+//  1. Simple COUNT(*) without GROUP BY → base SELECT pk, merge, count rows.
+//  2. GROUP BY with supported aggregates → base SELECT cols, merge, re-aggregate in Go.
+//  2.5. Complex aggregates (array_agg, json_agg, string_agg, etc.) → materialize
+//     base data into temp table, re-execute original aggregate on shadow.
+//  3. Fall back to Prod-only execution (when no schema diffs) or Shadow-only (with schema diffs).
 func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL string) (
 	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
 ) {
@@ -175,31 +198,46 @@ func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL strin
 	}
 	table := cl.Tables[0]
 
-	// Try to build a base query for row-level counting.
+	// Strategy 1: Simple COUNT(*) without GROUP BY.
 	baseSQL := rh.buildAggregateBaseQuery(querySQL, table)
-	if baseSQL == "" {
-		// Complex aggregate (GROUP BY, etc.) — fall back to Prod-only.
-		prodResult, err := execQuery(rh.prodConn, querySQL)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("prod aggregate query: %w", err)
-		}
-		if prodResult.Error != "" {
-			return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
-		}
-		return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
+	if baseSQL != "" {
+		return rh.executeSimpleCountAggregate(cl, baseSQL, querySQL)
 	}
 
-	// Create a non-aggregate classification for the base query.
+	// Strategy 2: GROUP BY with supported aggregates (COUNT, SUM, AVG, MIN, MAX).
+	spec := rh.buildGroupBySpec(querySQL, table)
+	if spec != nil {
+		return rh.executeGroupByAggregate(cl, spec)
+	}
+
+	// Strategy 2.5: Materialize and re-execute for complex/unsupported aggregates.
+	// For array_agg, json_agg, string_agg, and other aggregates that can't be
+	// decomposed into row-level merge + re-aggregation, materialize the base data
+	// into a temp table and let PostgreSQL handle the aggregate natively.
+	cols, vals, nuls, matErr := rh.materializeAndAggregate(cl, querySQL, table)
+	if matErr == nil {
+		return cols, vals, nuls, nil
+	}
+	if rh.verbose {
+		log.Printf("[conn %d] aggregate materialization failed, using fallback: %v", rh.connID, matErr)
+	}
+
+	// Strategy 3: Fall back to Prod or Shadow.
+	return rh.aggregateFallback(cl, querySQL)
+}
+
+// executeSimpleCountAggregate handles COUNT(*) without GROUP BY through the merge pipeline.
+func (rh *ReadHandler) executeSimpleCountAggregate(cl *core.Classification, baseSQL, querySQL string) (
+	[]ColumnInfo, [][]string, [][]bool, error,
+) {
 	baseCl := *cl
 	baseCl.HasAggregate = false
 	baseCl.HasLimit = false
 	baseCl.Limit = 0
 	baseCl.OrderBy = ""
 
-	// Execute the base query through normal merged read pipeline.
 	_, baseValues, _, mergeErr := rh.mergedReadCore(&baseCl, baseSQL)
 	if mergeErr != nil {
-		// If merged read fails, fall back to Prod-only.
 		if _, ok := mergeErr.(*relayError); ok {
 			prodResult, pErr := execQuery(rh.prodConn, querySQL)
 			if pErr != nil {
@@ -213,14 +251,122 @@ func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL strin
 		return nil, nil, nil, mergeErr
 	}
 
-	// Re-aggregate: count the merged rows.
 	count := len(baseValues)
 	countStr := fmt.Sprintf("%d", count)
-
 	return []ColumnInfo{{Name: "count", OID: 20}},
 		[][]string{{countStr}},
 		[][]bool{{false}},
 		nil
+}
+
+// executeGroupByAggregate handles GROUP BY queries by fetching row-level data
+// through the merge pipeline and re-aggregating in Go.
+func (rh *ReadHandler) executeGroupByAggregate(cl *core.Classification, spec *groupBySpec) (
+	[]ColumnInfo, [][]string, [][]bool, error,
+) {
+	baseCl := *cl
+	baseCl.HasAggregate = false
+	baseCl.HasLimit = false
+	baseCl.Limit = 0
+	baseCl.OrderBy = ""
+
+	baseCols, baseValues, baseNulls, err := rh.mergedReadCore(&baseCl, spec.BaseSQL)
+	if err != nil {
+		// If merge fails, try Shadow-only as last resort.
+		shadowResult, sErr := execQuery(rh.shadowConn, cl.RawSQL)
+		if sErr != nil || shadowResult.Error != "" {
+			return nil, nil, nil, fmt.Errorf("group by merge failed: %w", err)
+		}
+		return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+	}
+
+	// Re-aggregate the merged rows.
+	resultCols, resultValues, resultNulls := reAggregateRows(spec, baseCols, baseValues, baseNulls)
+
+	// Apply HAVING filter.
+	if spec.HavingAST != nil {
+		// Normalize HAVING AST: replace FuncCall nodes that match aggregates
+		// with ColumnRef nodes so evaluateWhere can resolve their values.
+		normalizedHaving := normalizeHavingForEval(spec.HavingAST, spec.Aggregates)
+
+		var filtered [][]string
+		var filteredNulls [][]bool
+		for i, row := range resultValues {
+			rowMap := make(map[string]string)
+			for j, col := range resultCols {
+				if j < len(row) {
+					rowMap[col.Name] = row[j]
+				}
+			}
+			if evaluateHaving(normalizedHaving, rowMap) {
+				filtered = append(filtered, row)
+				filteredNulls = append(filteredNulls, resultNulls[i])
+			}
+		}
+		resultValues = filtered
+		resultNulls = filteredNulls
+	}
+
+	// Apply ORDER BY.
+	if cl.OrderBy != "" {
+		sortMerged(resultCols, resultValues, resultNulls, cl.OrderBy)
+	}
+
+	// Apply LIMIT.
+	if cl.HasLimit && cl.Limit > 0 && len(resultValues) > cl.Limit {
+		resultValues = resultValues[:cl.Limit]
+		resultNulls = resultNulls[:cl.Limit]
+	}
+
+	return resultCols, resultValues, resultNulls, nil
+}
+
+// aggregateFallback handles aggregate queries that can't be decomposed into
+// row-level merge + re-aggregation. If the table has schema diffs, it tries
+// Prod with rewritten SQL; otherwise falls back to Prod-only execution.
+func (rh *ReadHandler) aggregateFallback(cl *core.Classification, querySQL string) (
+	[]ColumnInfo, [][]string, [][]bool, error,
+) {
+	hasSchemaChange := false
+	if rh.schemaRegistry != nil {
+		for _, t := range cl.Tables {
+			if rh.schemaRegistry.HasDiff(t) {
+				hasSchemaChange = true
+				break
+			}
+		}
+	}
+
+	if hasSchemaChange {
+		// Try rewriting the query for Prod compatibility.
+		rewritten, skipProd := rewriteSQLForProd(querySQL, rh.schemaRegistry, cl.Tables)
+		if !skipProd {
+			prodResult, err := execQuery(rh.prodConn, rewritten)
+			if err == nil && prodResult.Error == "" {
+				return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
+			}
+		}
+
+		// Prod failed or was skipped — try Shadow-only as last resort.
+		shadowResult, err := execQuery(rh.shadowConn, querySQL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("shadow aggregate fallback: %w", err)
+		}
+		if shadowResult.Error != "" {
+			return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
+		}
+		return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+	}
+
+	// No schema diffs — safe to run on Prod directly.
+	prodResult, err := execQuery(rh.prodConn, querySQL)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("prod aggregate query: %w", err)
+	}
+	if prodResult.Error != "" {
+		return nil, nil, nil, &relayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
+	}
+	return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
 }
 
 // buildAggregateBaseQuery converts a COUNT(*) query to SELECT pk FROM table [WHERE ...].
@@ -314,6 +460,75 @@ func containsColumn(selectList, col string) bool {
 	return false
 }
 
+// needsCtidInjection returns true if the query is a simple single-table SELECT
+// where ctid should be injected for dedup on PK-less tables.
+// Unlike needsPKInjection, ctid injection is needed for SELECT * too
+// (ctid is a system column not included in *).
+// Returns false for set operations, subqueries in FROM, and CTEs.
+func needsCtidInjection(sql string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(sql))
+
+	// Skip for set operations.
+	if strings.Contains(upper, " UNION ") || strings.Contains(upper, " INTERSECT ") || strings.Contains(upper, " EXCEPT ") {
+		return false
+	}
+
+	// Skip for CTEs.
+	if strings.HasPrefix(upper, "WITH ") {
+		return false
+	}
+
+	selectIdx := strings.Index(upper, "SELECT")
+	if selectIdx < 0 {
+		return false
+	}
+
+	fromIdx := strings.Index(upper, " FROM ")
+	if fromIdx < 0 {
+		return false
+	}
+
+	// Skip if FROM contains a subquery (derived table).
+	afterFrom := strings.TrimSpace(upper[fromIdx+6:])
+	if strings.HasPrefix(afterFrom, "(") {
+		return false
+	}
+
+	// Check if ctid is already in the SELECT list.
+	selectList := strings.ToLower(sql[selectIdx+6 : fromIdx])
+	return !containsColumn(selectList, "ctid")
+}
+
+// injectCtidColumn adds ctid to the SELECT list for dedup on PK-less tables.
+// Handles both explicit column lists and SELECT *.
+// Rewrites "SELECT col1, col2 FROM ..." to "SELECT ctid, col1, col2 FROM ..."
+// and "SELECT * FROM ..." to "SELECT ctid, * FROM ...".
+func injectCtidColumn(sql string) string {
+	upper := strings.ToUpper(sql)
+	selectIdx := strings.Index(upper, "SELECT")
+	if selectIdx < 0 {
+		return sql
+	}
+	insertPos := selectIdx + 6
+	// Handle DISTINCT.
+	afterSelect := strings.TrimSpace(sql[insertPos:])
+	if strings.HasPrefix(strings.ToUpper(afterSelect), "DISTINCT") {
+		insertPos += (len(sql[insertPos:]) - len(afterSelect)) + 8 // len("DISTINCT")
+	}
+	return sql[:insertPos] + " ctid," + sql[insertPos:]
+}
+
+// findColumnIndex returns the index of a named column in the result columns.
+// Returns -1 if the column is not found.
+func findColumnIndex(columns []ColumnInfo, name string) int {
+	for i, col := range columns {
+		if col.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
 // injectPKColumn adds the PK column to the SELECT list for dedup purposes.
 // Rewrites "SELECT col1, col2 FROM ..." to "SELECT pk, col1, col2 FROM ...".
 func injectPKColumn(sql, pkCol string) string {
@@ -385,58 +600,17 @@ func (rh *ReadHandler) rewriteForProd(sql, table string) (string, bool) {
 		return sql, true // Shadow-only table.
 	}
 
-	result := sql
-
-	// Handle added columns: strip them from the SELECT list.
-	// If it's SELECT *, no rewriting needed (Prod returns its columns, adaptation adds NULLs).
-	upper := strings.ToUpper(strings.TrimSpace(result))
-	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
-	isSelectStar := false
-	if selectIdx >= 0 && fromIdx > selectIdx {
-		selectPart := strings.TrimSpace(upper[selectIdx+6 : fromIdx])
-		isSelectStar = selectPart == "*" || strings.HasPrefix(selectPart, "DISTINCT *")
-	}
-
-	if !isSelectStar && selectIdx >= 0 && fromIdx > selectIdx {
-		// Strip added columns from the SELECT list.
-		addedSet := make(map[string]bool)
-		for _, col := range diff.Added {
-			addedSet[strings.ToLower(col.Name)] = true
-		}
-
-		selectList := result[selectIdx+6 : selectIdx+(fromIdx-selectIdx)]
-		parts := strings.Split(selectList, ",")
-		var kept []string
-		for _, part := range parts {
-			colName := strings.TrimSpace(part)
-			// Strip alias: "col AS alias"
-			checkName := colName
-			if asIdx := strings.Index(strings.ToUpper(checkName), " AS "); asIdx >= 0 {
-				checkName = strings.TrimSpace(checkName[:asIdx])
-			}
-			// Strip table prefix: "t.col"
-			if dotIdx := strings.LastIndex(checkName, "."); dotIdx >= 0 {
-				checkName = checkName[dotIdx+1:]
-			}
-			checkName = strings.Trim(checkName, `"`)
-			if !addedSet[strings.ToLower(checkName)] {
-				kept = append(kept, part)
-			}
-		}
-
-		if len(kept) == 0 {
-			// All columns were added — use SELECT * (Prod has its own columns).
-			result = result[:selectIdx+6] + " *" + result[selectIdx+(fromIdx-selectIdx):]
-		} else {
-			result = result[:selectIdx+6] + strings.Join(kept, ",") + result[selectIdx+(fromIdx-selectIdx):]
-		}
+	// Use AST-based rewriting for WHERE, ORDER BY, GROUP BY, and SELECT list.
+	// This handles shadow-only column references in all clauses correctly
+	// (e.g., WHERE added_col IS NULL becomes a no-op for Prod).
+	tables := []string{table}
+	result, skipProd := rewriteSQLForProd(sql, rh.schemaRegistry, tables)
+	if skipProd {
+		return sql, true
 	}
 
 	// Handle renamed columns: replace new name with old name.
-	// Build reverse map: new_name -> old_name.
 	for oldName, newName := range diff.Renamed {
-		// Case-insensitive replacement in the SQL.
 		result = replaceColumnName(result, newName, oldName)
 	}
 
@@ -522,8 +696,12 @@ func (rh *ReadHandler) findPKColumnIndex(table string, columns []ColumnInfo) int
 func (rh *ReadHandler) filterProdRows(table string, result *QueryResult) ([][]string, [][]bool) {
 	pkIdx := rh.findPKColumnIndex(table, result.Columns)
 	if pkIdx < 0 {
-		// No PK column found — cannot filter, return all rows.
-		return result.RowValues, result.RowNulls
+		// No PK column found — try ctid as fallback for PK-less tables.
+		pkIdx = findColumnIndex(result.Columns, "ctid")
+		if pkIdx < 0 {
+			// Neither PK nor ctid found — cannot filter, return all rows.
+			return result.RowValues, result.RowNulls
+		}
 	}
 
 	var filteredValues [][]string
@@ -697,16 +875,22 @@ func (rh *ReadHandler) dedup(
 	nulls [][]bool,
 ) ([][]string, [][]bool) {
 	meta, ok := rh.tables[table]
-	if !ok || len(meta.PKColumns) == 0 {
+	if !ok {
 		return values, nulls
 	}
 
 	pkIdx := -1
-	for i, col := range columns {
-		if col.Name == meta.PKColumns[0] {
-			pkIdx = i
-			break
+	if len(meta.PKColumns) > 0 {
+		for i, col := range columns {
+			if col.Name == meta.PKColumns[0] {
+				pkIdx = i
+				break
+			}
 		}
+	}
+	// No PK column found — try ctid as fallback for PK-less tables.
+	if pkIdx < 0 {
+		pkIdx = findColumnIndex(columns, "ctid")
 	}
 	if pkIdx < 0 {
 		return values, nulls
@@ -771,11 +955,19 @@ func sortMerged(
 		indices[i] = i
 	}
 
+	// Build a map from order-by column index to its OID for type-aware comparison.
+	colOIDs := make(map[int]uint32)
+	for _, oc := range resolved {
+		if oc.idx >= 0 && oc.idx < len(columns) {
+			colOIDs[oc.idx] = columns[oc.idx].OID
+		}
+	}
+
 	sort.SliceStable(indices, func(a, b int) bool {
 		for _, oc := range resolved {
 			va := values[indices[a]][oc.idx]
 			vb := values[indices[b]][oc.idx]
-			cmp := compareValues(va, vb)
+			cmp := compareValuesTyped(va, vb, colOIDs[oc.idx])
 			if cmp == 0 {
 				continue // Tie — break with next column.
 			}
@@ -820,6 +1012,114 @@ func compareValues(a, b string) int {
 		return 1
 	}
 	return 0
+}
+
+// compareValuesTyped compares two string values using type-aware comparison
+// based on the PostgreSQL OID. Falls back to compareValues for OID 0 (unknown).
+func compareValuesTyped(a, b string, oid uint32) int {
+	if oid == 0 {
+		return compareValues(a, b)
+	}
+
+	switch oid {
+	case 20, 21, 23, 26, 700, 701, 1700:
+		// Numeric types: int8, int2, int4, oid, float4, float8, numeric.
+		na, errA := strconv.ParseFloat(a, 64)
+		nb, errB := strconv.ParseFloat(b, 64)
+		if errA == nil && errB == nil {
+			if na < nb {
+				return -1
+			}
+			if na > nb {
+				return 1
+			}
+			return 0
+		}
+		// Fall through to string comparison if parsing fails.
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+
+	case 1082, 1114, 1184:
+		// Date/timestamp types: date, timestamp, timestamptz.
+		formats := []string{
+			time.RFC3339,
+			"2006-01-02 15:04:05.999999-07",
+			"2006-01-02 15:04:05.999999",
+			"2006-01-02 15:04:05",
+			"2006-01-02",
+		}
+		var ta, tb time.Time
+		var parsedA, parsedB bool
+		for _, fmt := range formats {
+			if t, err := time.Parse(fmt, a); err == nil {
+				ta = t
+				parsedA = true
+				break
+			}
+		}
+		for _, fmt := range formats {
+			if t, err := time.Parse(fmt, b); err == nil {
+				tb = t
+				parsedB = true
+				break
+			}
+		}
+		if parsedA && parsedB {
+			if ta.Before(tb) {
+				return -1
+			}
+			if ta.After(tb) {
+				return 1
+			}
+			return 0
+		}
+		// Fall back to string comparison.
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+
+	case 16:
+		// Boolean type.
+		na := normBoolForCompare(a)
+		nb := normBoolForCompare(b)
+		if na < nb {
+			return -1
+		}
+		if na > nb {
+			return 1
+		}
+		return 0
+
+	default:
+		// All other types: string comparison.
+		if a < b {
+			return -1
+		}
+		if a > b {
+			return 1
+		}
+		return 0
+	}
+}
+
+// normBoolForCompare normalizes a boolean value to "f" or "t" for comparison.
+func normBoolForCompare(s string) string {
+	switch strings.ToLower(s) {
+	case "t", "true", "1", "yes", "on":
+		return "t"
+	case "f", "false", "0", "no", "off":
+		return "f"
+	}
+	return s
 }
 
 // parseOrderBy parses an ORDER BY clause into individual columns.

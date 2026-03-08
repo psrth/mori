@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 )
 
@@ -59,10 +60,11 @@ type TableMeta struct {
 
 // DumpResult holds the complete result of the schema dump and analysis.
 type DumpResult struct {
-	SchemaSQL  string
-	Extensions []Extension
-	Sequences  map[string]SequenceOffset
-	Tables     map[string]TableMeta
+	SchemaSQL   string
+	Extensions  []Extension
+	Sequences   map[string]SequenceOffset
+	Tables      map[string]TableMeta
+	ForeignKeys []coreSchema.ForeignKey
 }
 
 // managedExtensions lists cloud-provider internal extensions that are injected
@@ -324,6 +326,114 @@ func DetectTableMetadata(ctx context.Context, conn *pgx.Conn) (map[string]TableM
 	return tables, nil
 }
 
+// fkActionCode maps PostgreSQL single-char FK action codes to their string names.
+var fkActionCode = map[byte]string{
+	'a': "NO ACTION",
+	'r': "RESTRICT",
+	'c': "CASCADE",
+	'n': "SET NULL",
+	'd': "SET DEFAULT",
+}
+
+// DetectForeignKeys queries Prod for all foreign key constraints in the public schema.
+// Uses pg_catalog for a single efficient query (same pattern as DetectTableMetadata).
+func DetectForeignKeys(ctx context.Context, conn *pgx.Conn) ([]coreSchema.ForeignKey, error) {
+	rows, err := conn.Query(ctx, `
+		SELECT con.conname                         AS constraint_name,
+		       child_cls.relname                    AS child_table,
+		       child_att.attname                    AS child_column,
+		       parent_cls.relname                   AS parent_table,
+		       parent_att.attname                   AS parent_column,
+		       con.confdeltype                      AS delete_action,
+		       con.confupdtype                      AS update_action,
+		       child_ord.ord                        AS ordinal
+		FROM pg_constraint con
+		JOIN pg_class child_cls ON child_cls.oid = con.conrelid
+		JOIN pg_namespace child_ns ON child_ns.oid = child_cls.relnamespace
+		JOIN pg_class parent_cls ON parent_cls.oid = con.confrelid
+		JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS child_ord(attnum, ord) ON true
+		JOIN pg_attribute child_att
+		     ON child_att.attrelid = con.conrelid AND child_att.attnum = child_ord.attnum
+		JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS parent_ord(attnum, ord) ON true
+		JOIN pg_attribute parent_att
+		     ON parent_att.attrelid = con.confrelid AND parent_att.attnum = parent_ord.attnum
+		WHERE con.contype = 'f'
+		  AND child_ns.nspname = 'public'
+		  AND child_ord.ord = parent_ord.ord
+		ORDER BY child_cls.relname, con.conname, child_ord.ord`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query foreign keys: %w", err)
+	}
+	defer rows.Close()
+
+	// Accumulate columns per constraint since multi-column FKs produce multiple rows.
+	type fkAccum struct {
+		constraintName string
+		childTable     string
+		parentTable    string
+		childColumns   []string
+		parentColumns  []string
+		deleteAction   byte
+		updateAction   byte
+	}
+	// Use ordered key to preserve deterministic output.
+	var orderedKeys []string
+	accum := make(map[string]*fkAccum)
+
+	for rows.Next() {
+		var constraintName, childTable, childCol, parentTable, parentCol string
+		var deleteAction, updateAction byte
+		var ordinal int
+		if err := rows.Scan(&constraintName, &childTable, &childCol, &parentTable, &parentCol,
+			&deleteAction, &updateAction, &ordinal); err != nil {
+			return nil, fmt.Errorf("failed to scan foreign key: %w", err)
+		}
+
+		key := childTable + "." + constraintName
+		a, ok := accum[key]
+		if !ok {
+			a = &fkAccum{
+				constraintName: constraintName,
+				childTable:     childTable,
+				parentTable:    parentTable,
+				deleteAction:   deleteAction,
+				updateAction:   updateAction,
+			}
+			accum[key] = a
+			orderedKeys = append(orderedKeys, key)
+		}
+		a.childColumns = append(a.childColumns, childCol)
+		a.parentColumns = append(a.parentColumns, parentCol)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	result := make([]coreSchema.ForeignKey, 0, len(orderedKeys))
+	for _, key := range orderedKeys {
+		a := accum[key]
+		onDelete := fkActionCode[a.deleteAction]
+		if onDelete == "" {
+			onDelete = "NO ACTION"
+		}
+		onUpdate := fkActionCode[a.updateAction]
+		if onUpdate == "" {
+			onUpdate = "NO ACTION"
+		}
+		result = append(result, coreSchema.ForeignKey{
+			ConstraintName: a.constraintName,
+			ChildTable:     a.childTable,
+			ChildColumns:   a.childColumns,
+			ParentTable:    a.parentTable,
+			ParentColumns:  a.parentColumns,
+			OnDelete:       onDelete,
+			OnUpdate:       onUpdate,
+		})
+	}
+
+	return result, nil
+}
+
 func classifyPKType(dataTypes []string, defaults []string) string {
 	if len(dataTypes) != 1 {
 		return "composite"
@@ -496,11 +606,21 @@ func FullDump(ctx context.Context, conn *pgx.Conn, dsn *connstr.ProdDSN, image s
 		return nil, fmt.Errorf("sequence offset detection failed: %w", err)
 	}
 
+	var foreignKeys []coreSchema.ForeignKey
+	if err := retryOnConflict(maxRetries, func() error {
+		var e error
+		foreignKeys, e = DetectForeignKeys(ctx, conn)
+		return e
+	}); err != nil {
+		return nil, fmt.Errorf("foreign key detection failed: %w", err)
+	}
+
 	return &DumpResult{
-		SchemaSQL:  schemaSQL,
-		Extensions: exts,
-		Sequences:  sequences,
-		Tables:     tables,
+		SchemaSQL:   schemaSQL,
+		Extensions:  exts,
+		Sequences:   sequences,
+		Tables:      tables,
+		ForeignKeys: foreignKeys,
 	}, nil
 }
 

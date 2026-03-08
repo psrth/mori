@@ -53,7 +53,7 @@ func TestProxyRelay_RefusesWithoutShadow(t *testing.T) {
 	defer cleanup()
 
 	// Without shadow/classifier/router, the write guard should refuse connections.
-	p := New(echoAddr, "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil)
+	p := New(echoAddr, "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -87,7 +87,7 @@ func TestProxyRelay_RefusesWithoutShadow(t *testing.T) {
 
 func TestProxyProdUnreachable(t *testing.T) {
 	// Point proxy at a port that's not listening.
-	p := New("127.0.0.1:1", "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil)
+	p := New("127.0.0.1:1", "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -133,7 +133,7 @@ func TestProxyShutdownDrains(t *testing.T) {
 		}
 	}()
 
-	p := New(ln.Addr().String(), "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil)
+	p := New(ln.Addr().String(), "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -171,7 +171,7 @@ func TestProxyConcurrentConns_RefusesWithoutShadow(t *testing.T) {
 	defer cleanup()
 
 	// Without shadow, all connections should be refused with an error response.
-	p := New(echoAddr, "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil)
+	p := New(echoAddr, "", "", 0, false, nil, nil, nil, nil, nil, "", nil, nil, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

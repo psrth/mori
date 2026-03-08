@@ -53,3 +53,11 @@ func (t *TombstoneSet) Snapshot() map[string][]string { return t.s.snapshot() }
 
 // Load populates the set from a deserialized representation.
 func (t *TombstoneSet) Load(data map[string][]string) { t.s.load(data) }
+
+// SnapshotAll returns a merged snapshot of committed + staged tombstone entries.
+// Used by savepoint support to capture the full in-flight tombstone state.
+func (t *TombstoneSet) SnapshotAll() map[string][]string { return t.s.snapshotAll() }
+
+// RestoreAll replaces committed + staged entries with the given snapshot.
+// Staged is cleared since the snapshot already includes everything up to the savepoint.
+func (t *TombstoneSet) RestoreAll(snap map[string][]string) { t.s.restoreAll(snap) }
