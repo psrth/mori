@@ -336,6 +336,20 @@ func (eh *ExtHandler) inTxn() bool {
 
 // handleExtInsert forwards batch to Shadow, captures the insert count, and tracks it.
 func (eh *ExtHandler) handleExtInsert(clientConn net.Conn, batchRaw []byte, cl *core.Classification) error {
+	// Enforce FK constraints before executing the INSERT.
+	if eh.writeHandler != nil && eh.writeHandler.fkEnforcer != nil && len(cl.Tables) == 1 {
+		fullSQL := eh.batchSQL
+		if len(eh.batchParams) > 0 {
+			fullSQL = reconstructSQL(eh.batchSQL, eh.batchParams, eh.batchFormatCodes)
+		}
+		if err := eh.writeHandler.fkEnforcer.EnforceInsert(cl.Tables[0], fullSQL); err != nil {
+			if eh.verbose {
+				log.Printf("[conn %d] ext: FK violation on INSERT: %v", eh.connID, err)
+			}
+			return sendFKError(clientConn, err.Error())
+		}
+	}
+
 	tag, err := forwardRelayAndCaptureTag(batchRaw, eh.shadowConn, clientConn)
 	if err != nil {
 		return err
@@ -364,6 +378,20 @@ func (eh *ExtHandler) handleExtInsert(clientConn net.Conn, batchRaw []byte, cl *
 func (eh *ExtHandler) handleExtUpdate(clientConn net.Conn, batchRaw []byte, cl *core.Classification) error {
 	if eh.writeHandler == nil {
 		return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+	}
+
+	// Enforce FK constraints for UPDATE.
+	if eh.writeHandler.fkEnforcer != nil && len(cl.Tables) == 1 {
+		fullSQL := eh.batchSQL
+		if len(eh.batchParams) > 0 {
+			fullSQL = reconstructSQL(eh.batchSQL, eh.batchParams, eh.batchFormatCodes)
+		}
+		if err := eh.writeHandler.fkEnforcer.EnforceUpdate(cl.Tables[0], fullSQL); err != nil {
+			if eh.verbose {
+				log.Printf("[conn %d] ext: FK violation on UPDATE: %v", eh.connID, err)
+			}
+			return sendFKError(clientConn, err.Error())
+		}
 	}
 
 	// Bulk update (no extractable PKs): delegate to WriteHandler's bulk path.

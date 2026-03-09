@@ -123,17 +123,19 @@ func (fke *FKEnforcer) CheckParentExists(fk coreSchema.ForeignKey, childValues m
 		quoteIdent(parentTable), whereClause)
 	prodResult, err := execQuery(fke.prodConn, prodSQL)
 	if err != nil {
-		// Best-effort: if prod query fails, log warning and allow the write.
+		// Fail-closed: if prod query fails, reject the write to avoid silent FK violations.
 		if fke.verbose {
 			log.Printf("[conn %d] FK check: prod query failed for %s: %v", fke.connID, parentTable, err)
 		}
-		return nil
+		return fmt.Errorf("insert or update on table %q: cannot verify foreign key constraint — "+
+			"parent lookup in %q failed (prod query error: %w)", fk.ChildTable, parentTable, err)
 	}
 	if prodResult.Error != "" {
 		if fke.verbose {
 			log.Printf("[conn %d] FK check: prod query error for %s: %s", fke.connID, parentTable, prodResult.Error)
 		}
-		return nil // Best-effort.
+		return fmt.Errorf("insert or update on table %q: cannot verify foreign key constraint — "+
+			"parent lookup in %q failed (prod error: %s)", fk.ChildTable, parentTable, prodResult.Error)
 	}
 
 	if len(prodResult.RowValues) > 0 {
@@ -165,9 +167,9 @@ func (fke *FKEnforcer) EnforceInsert(table string, rawSQL string) error {
 	rows, insertCols, err := parseInsertValues(rawSQL)
 	if err != nil {
 		if fke.verbose {
-			log.Printf("[conn %d] FK insert: parse failed: %v — allowing write", fke.connID, err)
+			log.Printf("[conn %d] FK insert: parse failed: %v — rejecting write", fke.connID, err)
 		}
-		return nil // Best-effort.
+		return fmt.Errorf("FK check failed: cannot parse INSERT: %w", err)
 	}
 
 	for _, fk := range fks {
@@ -207,9 +209,9 @@ func (fke *FKEnforcer) EnforceUpdate(table string, rawSQL string) error {
 	setValues, err := parseUpdateSetValues(rawSQL)
 	if err != nil {
 		if fke.verbose {
-			log.Printf("[conn %d] FK update: parse failed: %v — allowing write", fke.connID, err)
+			log.Printf("[conn %d] FK update: parse failed: %v — rejecting write", fke.connID, err)
 		}
-		return nil // Best-effort.
+		return fmt.Errorf("FK check failed: cannot parse UPDATE: %w", err)
 	}
 
 	for _, fk := range fks {

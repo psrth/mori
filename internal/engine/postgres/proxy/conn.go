@@ -826,7 +826,13 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 		return routeDecision{target: targetShadow, classification: classification, strategy: strategy}
 
 	default:
-		// ProdDirect, Other
+		// ProdDirect, Other — but override metadata queries about dirty tables
+		// so that \d and information_schema queries reflect Shadow schema.
+		if classification != nil && classification.IsMetadataQuery &&
+			classification.IntrospectedTable != "" && p.schemaRegistry != nil &&
+			p.schemaRegistry.HasDiff(classification.IntrospectedTable) {
+			return routeDecision{target: targetShadow, classification: classification, strategy: strategy}
+		}
 		return routeDecision{target: targetProd, strategy: strategy}
 	}
 }

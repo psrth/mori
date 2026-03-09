@@ -127,3 +127,87 @@ func isMutatingNode(n *pg_query.Node) bool {
 		n.GetUpdateStmt() != nil ||
 		n.GetDeleteStmt() != nil
 }
+
+// extractIntrospectedTable walks a WHERE clause AST looking for equality
+// comparisons like table_name = 'X' or relname = 'X', and returns the
+// string literal value. This is used to detect which user table a metadata
+// query (information_schema / pg_catalog) is inspecting.
+func extractIntrospectedTable(node *pg_query.Node) string {
+	if node == nil {
+		return ""
+	}
+
+	// Check A_Expr (binary expression like col = 'val').
+	if ae := node.GetAExpr(); ae != nil {
+		// Check for AND/OR — recurse into both sides.
+		if ae.GetKind() == pg_query.A_Expr_Kind_AEXPR_OP {
+			colName := extractColumnRefName(ae.GetLexpr())
+			if colName == "table_name" || colName == "relname" {
+				if val := extractStringConst(ae.GetRexpr()); val != "" {
+					return val
+				}
+			}
+			// Check reversed: 'X' = table_name
+			colName = extractColumnRefName(ae.GetRexpr())
+			if colName == "table_name" || colName == "relname" {
+				if val := extractStringConst(ae.GetLexpr()); val != "" {
+					return val
+				}
+			}
+		}
+		// Recurse into operands for AND/OR chains.
+		if v := extractIntrospectedTable(ae.GetLexpr()); v != "" {
+			return v
+		}
+		if v := extractIntrospectedTable(ae.GetRexpr()); v != "" {
+			return v
+		}
+	}
+
+	// BoolExpr (AND/OR) — recurse into args.
+	if be := node.GetBoolExpr(); be != nil {
+		for _, arg := range be.GetArgs() {
+			if v := extractIntrospectedTable(arg); v != "" {
+				return v
+			}
+		}
+	}
+
+	return ""
+}
+
+// extractColumnRefName returns the column name from a ColumnRef node, or "".
+func extractColumnRefName(node *pg_query.Node) string {
+	if node == nil {
+		return ""
+	}
+	cr := node.GetColumnRef()
+	if cr == nil {
+		return ""
+	}
+	fields := cr.GetFields()
+	if len(fields) == 0 {
+		return ""
+	}
+	// Take the last field (handles both "table_name" and "c.table_name").
+	last := fields[len(fields)-1]
+	if s := last.GetString_(); s != nil {
+		return strings.ToLower(s.GetSval())
+	}
+	return ""
+}
+
+// extractStringConst returns the string value from an A_Const string node, or "".
+func extractStringConst(node *pg_query.Node) string {
+	if node == nil {
+		return ""
+	}
+	ac := node.GetAConst()
+	if ac == nil {
+		return ""
+	}
+	if sv := ac.GetSval(); sv != nil {
+		return sv.GetSval()
+	}
+	return ""
+}
