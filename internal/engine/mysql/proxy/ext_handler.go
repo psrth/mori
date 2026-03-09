@@ -446,7 +446,7 @@ func (eh *ExtHandler) handleExtUpdate(clientConn net.Conn, rawPkt []byte, cl *co
 			if eh.deltaMap != nil && eh.deltaMap.IsDelta(pk.Table, pk.PK) {
 				continue
 			}
-			if err := eh.writeHandler.hydrateRow(pk.Table, pk.PK); err != nil {
+			if err := eh.writeHandler.hydrateRow(pk.Table, pkValuesFromSingle(eh.writeHandler.tables[pk.Table], pk.PK)); err != nil {
 				if eh.verbose {
 					log.Printf("[conn %d] ext: hydration failed for (%s, %s): %v",
 						eh.connID, pk.Table, pk.PK, err)

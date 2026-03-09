@@ -23,11 +23,12 @@ type ColumnInfo struct {
 
 // QueryResult holds the parsed result of executing a query on a MySQL backend.
 type QueryResult struct {
-	Columns   []ColumnInfo
-	RowValues [][]string
-	RowNulls  [][]bool
-	RawMsgs   []byte // all raw response bytes for relay
-	Error     string // error message if the response was an ERR packet
+	Columns      []ColumnInfo
+	RowValues    [][]string
+	RowNulls     [][]bool
+	RawMsgs      []byte // all raw response bytes for relay
+	Error        string // error message if the response was an ERR packet
+	AffectedRows uint64 // from OK packet for writes
 }
 
 // ReadHandler encapsulates merged read logic for a single MySQL connection.
@@ -53,6 +54,16 @@ func (rh *ReadHandler) HandleRead(
 ) error {
 	switch strategy {
 	case core.StrategyMergedRead:
+		// Sub-dispatch based on classification flags.
+		if cl.HasSetOp {
+			return rh.handleSetOperation(clientConn, cl)
+		}
+		if cl.IsComplexRead {
+			return rh.handleComplexRead(clientConn, cl)
+		}
+		if cl.HasWindowFunc {
+			return rh.handleWindowRead(clientConn, cl)
+		}
 		return rh.handleMergedRead(clientConn, cl)
 	case core.StrategyJoinPatch:
 		return rh.handleJoinPatch(clientConn, cl)
@@ -208,78 +219,11 @@ func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) 
 }
 
 // aggregateReadCore handles aggregate queries on affected tables.
+// Delegates to fullAggregateReadCore in aggregate.go for full aggregate support.
 func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL string) (
 	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
 ) {
-	if len(cl.Tables) == 0 {
-		return nil, nil, nil, fmt.Errorf("aggregate read with no tables")
-	}
-	table := cl.Tables[0]
-
-	baseSQL := rh.buildAggregateBaseQuery(querySQL, table)
-	if baseSQL == "" {
-		// Complex aggregate — fall back to Prod-only.
-		prodResult, err := execMySQLQuery(rh.prodConn, querySQL)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("prod aggregate query: %w", err)
-		}
-		if prodResult.Error != "" {
-			return nil, nil, nil, &mysqlRelayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
-		}
-		return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
-	}
-
-	baseCl := *cl
-	baseCl.HasAggregate = false
-	baseCl.HasLimit = false
-	baseCl.Limit = 0
-	baseCl.OrderBy = ""
-
-	_, baseValues, _, mergeErr := rh.mergedReadCore(&baseCl, baseSQL)
-	if mergeErr != nil {
-		if _, ok := mergeErr.(*mysqlRelayError); ok {
-			prodResult, pErr := execMySQLQuery(rh.prodConn, querySQL)
-			if pErr != nil {
-				return nil, nil, nil, mergeErr
-			}
-			if prodResult.Error != "" {
-				return nil, nil, nil, &mysqlRelayError{rawMsgs: prodResult.RawMsgs, msg: prodResult.Error}
-			}
-			return prodResult.Columns, prodResult.RowValues, prodResult.RowNulls, nil
-		}
-		return nil, nil, nil, mergeErr
-	}
-
-	count := len(baseValues)
-	countStr := fmt.Sprintf("%d", count)
-
-	return []ColumnInfo{{Name: "count(*)"}},
-		[][]string{{countStr}},
-		[][]bool{{false}},
-		nil
-}
-
-// buildAggregateBaseQuery converts a COUNT(*) query to SELECT pk FROM table [WHERE ...].
-func (rh *ReadHandler) buildAggregateBaseQuery(sql, table string) string {
-	upper := strings.ToUpper(strings.TrimSpace(sql))
-
-	if strings.Contains(upper, "GROUP BY") {
-		return ""
-	}
-
-	meta, ok := rh.tables[table]
-	if !ok || len(meta.PKColumns) == 0 {
-		return ""
-	}
-	pkCol := meta.PKColumns[0]
-
-	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
-	if selectIdx < 0 || fromIdx < 0 {
-		return ""
-	}
-
-	return "SELECT `" + pkCol + "`" + sql[fromIdx:]
+	return rh.fullAggregateReadCore(cl, querySQL)
 }
 
 // handleJoinPatch implements the JOIN merged read algorithm for MySQL.
@@ -303,6 +247,16 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
 ) {
 	deltaTables := rh.identifyDeltaTables(cl.Tables)
+
+	// If any joined table has schema diffs, use materialization approach.
+	if rh.schemaRegistry != nil {
+		for _, t := range cl.Tables {
+			if rh.schemaRegistry.HasDiff(t) {
+				return rh.joinMaterializeCore(cl, querySQL)
+			}
+		}
+	}
+
 	if len(deltaTables) == 0 {
 		prodResult, err := execMySQLQuery(rh.prodConn, querySQL)
 		if err != nil {
@@ -425,6 +379,10 @@ func execMySQLQuery(conn net.Conn, sql string) (*QueryResult, error) {
 
 	// OK packet (e.g., for queries returning no result set).
 	if isOKPacket(first.Payload) {
+		// Parse affected_rows from OK packet: header(0x00) + affected_rows(lenenc) + ...
+		if len(first.Payload) > 1 {
+			result.AffectedRows = readLenEncUint64(first.Payload[1:])
+		}
 		return result, nil
 	}
 
@@ -499,6 +457,26 @@ func readLenEncInt(data []byte) int {
 		return int(data[1]) | int(data[2])<<8 | int(data[3])<<16
 	case data[0] == 0xfe && len(data) >= 9:
 		return int(data[1]) | int(data[2])<<8 | int(data[3])<<16 | int(data[4])<<24
+	default:
+		return 0
+	}
+}
+
+// readLenEncUint64 reads a MySQL length-encoded integer as uint64.
+func readLenEncUint64(data []byte) uint64 {
+	if len(data) == 0 {
+		return 0
+	}
+	switch {
+	case data[0] < 0xfb:
+		return uint64(data[0])
+	case data[0] == 0xfc && len(data) >= 3:
+		return uint64(data[1]) | uint64(data[2])<<8
+	case data[0] == 0xfd && len(data) >= 4:
+		return uint64(data[1]) | uint64(data[2])<<8 | uint64(data[3])<<16
+	case data[0] == 0xfe && len(data) >= 9:
+		return uint64(data[1]) | uint64(data[2])<<8 | uint64(data[3])<<16 | uint64(data[4])<<24 |
+			uint64(data[5])<<32 | uint64(data[6])<<40 | uint64(data[7])<<48 | uint64(data[8])<<56
 	default:
 		return 0
 	}
@@ -850,12 +828,30 @@ func (rh *ReadHandler) rewriteForProd(sql, table string) (string, bool) {
 		isSelectStar = selectPart == "*" || strings.HasPrefix(selectPart, "DISTINCT *")
 	}
 
-	if !isSelectStar && selectIdx >= 0 && fromIdx > selectIdx {
-		addedSet := make(map[string]bool)
-		for _, col := range diff.Added {
-			addedSet[strings.ToLower(col.Name)] = true
-		}
+	// Build sets for added and dropped columns.
+	addedSet := make(map[string]bool)
+	for _, col := range diff.Added {
+		addedSet[strings.ToLower(col.Name)] = true
+	}
+	droppedSet := make(map[string]bool)
+	for _, col := range diff.Dropped {
+		droppedSet[strings.ToLower(col)] = true
+	}
 
+	// Check for dropped columns in WHERE — if referenced, skip Prod entirely.
+	if len(droppedSet) > 0 {
+		upperResult := strings.ToUpper(result)
+		if whereIdx := strings.Index(upperResult, " WHERE "); whereIdx >= 0 {
+			wherePart := strings.ToLower(result[whereIdx+7:])
+			for col := range droppedSet {
+				if containsWordBoundary(wherePart, col) {
+					return result, true // shadowOnly
+				}
+			}
+		}
+	}
+
+	if !isSelectStar && selectIdx >= 0 && fromIdx > selectIdx {
 		selectList := result[selectIdx+6 : selectIdx+(fromIdx-selectIdx)]
 		parts := strings.Split(selectList, ",")
 		var kept []string
@@ -881,11 +877,88 @@ func (rh *ReadHandler) rewriteForProd(sql, table string) (string, bool) {
 		}
 	}
 
+	// Strip added columns from ORDER BY.
+	if idx := strings.Index(strings.ToUpper(result), " ORDER BY "); idx >= 0 {
+		result = stripAddedColumnsFromClause(result, idx, " ORDER BY ", addedSet)
+	}
+
+	// Strip added columns from GROUP BY.
+	if idx := strings.Index(strings.ToUpper(result), " GROUP BY "); idx >= 0 {
+		result = stripAddedColumnsFromClause(result, idx, " GROUP BY ", addedSet)
+	}
+
 	for oldName, newName := range diff.Renamed {
 		result = replaceColumnName(result, newName, oldName)
 	}
 
 	return result, false
+}
+
+// stripAddedColumnsFromClause removes entries referencing added columns from
+// an ORDER BY or GROUP BY clause. If all entries are removed, the entire
+// clause is stripped from the SQL.
+func stripAddedColumnsFromClause(sql string, clauseIdx int, keyword string, addedSet map[string]bool) string {
+	afterClause := sql[clauseIdx+len(keyword):]
+
+	// Find the end of this clause (next keyword or end of string).
+	upperAfter := strings.ToUpper(afterClause)
+	endIdx := len(afterClause)
+	for _, kw := range []string{" ORDER BY ", " GROUP BY ", " HAVING ", " LIMIT ", " UNION ", " INTERSECT ", " EXCEPT ", " FOR "} {
+		if ki := strings.Index(upperAfter, kw); ki >= 0 && ki < endIdx {
+			endIdx = ki
+		}
+	}
+
+	clauseBody := afterClause[:endIdx]
+	rest := afterClause[endIdx:]
+
+	// Parse the column list.
+	parts := strings.Split(clauseBody, ",")
+	var kept []string
+	for _, part := range parts {
+		colName := strings.TrimSpace(part)
+		// Strip direction suffix (ASC/DESC) for matching.
+		checkName := colName
+		fields := strings.Fields(checkName)
+		if len(fields) >= 2 {
+			upper := strings.ToUpper(fields[len(fields)-1])
+			if upper == "ASC" || upper == "DESC" {
+				checkName = strings.Join(fields[:len(fields)-1], " ")
+			}
+		}
+		// Strip table qualifier and quotes.
+		if dotIdx := strings.LastIndex(checkName, "."); dotIdx >= 0 {
+			checkName = checkName[dotIdx+1:]
+		}
+		checkName = strings.Trim(strings.TrimSpace(checkName), "`\"")
+		if !addedSet[strings.ToLower(checkName)] {
+			kept = append(kept, part)
+		}
+	}
+
+	if len(kept) == 0 {
+		// Remove the entire clause.
+		return sql[:clauseIdx] + rest
+	}
+	return sql[:clauseIdx] + keyword + strings.Join(kept, ",") + rest
+}
+
+// containsWordBoundary checks if s contains word as a whole-word match.
+func containsWordBoundary(s, word string) bool {
+	offset := 0
+	for {
+		idx := strings.Index(s[offset:], word)
+		if idx < 0 {
+			return false
+		}
+		pos := offset + idx
+		before := pos == 0 || !isIdentChar(s[pos-1])
+		after := pos+len(word) >= len(s) || !isIdentChar(s[pos+len(word)])
+		if before && after {
+			return true
+		}
+		offset = pos + len(word)
+	}
 }
 
 // replaceColumnName replaces column name in SQL respecting word boundaries.
@@ -1098,7 +1171,8 @@ func (rh *ReadHandler) dedup(
 ) ([][]string, [][]bool) {
 	meta, ok := rh.tables[table]
 	if !ok || len(meta.PKColumns) == 0 {
-		return values, nulls
+		// No PK: deduplicate by full row hash (Shadow rows win = first occurrence kept).
+		return deduplicateByFullRow(values, nulls)
 	}
 
 	pkIdx := -1
@@ -1429,4 +1503,121 @@ func (rh *ReadHandler) dedupJoin(
 	}
 
 	return dedupValues, dedupNulls
+}
+
+// handleJoinWithMaterialization handles JOINs where tables have schema diffs
+// by materializing dirty tables into temp tables.
+func (rh *ReadHandler) handleJoinWithMaterialization(clientConn net.Conn, cl *core.Classification) error {
+	columns, values, nulls, err := rh.joinMaterializeCore(cl, cl.RawSQL)
+	if err != nil {
+		if re, ok := err.(*mysqlRelayError); ok {
+			_, writeErr := clientConn.Write(re.rawMsgs)
+			return writeErr
+		}
+		return err
+	}
+
+	response := buildMySQLSelectResponse(columns, values, nulls)
+	_, err = clientConn.Write(response)
+	return err
+}
+
+// joinMaterializeCore materializes dirty tables into temp tables, rewrites
+// the JOIN query to use the temp tables, and executes on Shadow.
+func (rh *ReadHandler) joinMaterializeCore(cl *core.Classification, querySQL string) (
+	[]ColumnInfo, [][]string, [][]bool, error,
+) {
+	// Collect dirty tables (tables with deltas, tombstones, or schema diffs).
+	var dirtyTables []string
+	seen := make(map[string]bool)
+	for _, t := range cl.Tables {
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		isDirty := false
+		if rh.deltaMap != nil && rh.deltaMap.CountForTable(t) > 0 {
+			isDirty = true
+		}
+		if rh.tombstones != nil && rh.tombstones.CountForTable(t) > 0 {
+			isDirty = true
+		}
+		if rh.schemaRegistry != nil && rh.schemaRegistry.HasDiff(t) {
+			isDirty = true
+		}
+		if isDirty {
+			dirtyTables = append(dirtyTables, t)
+		}
+	}
+
+	if len(dirtyTables) == 0 {
+		// No dirty tables — execute on Shadow verbatim.
+		result, err := execMySQLQuery(rh.shadowConn, querySQL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("shadow JOIN query: %w", err)
+		}
+		if result.Error != "" {
+			return nil, nil, nil, &mysqlRelayError{rawMsgs: result.RawMsgs, msg: result.Error}
+		}
+		return result.Columns, result.RowValues, result.RowNulls, nil
+	}
+
+	// Materialize each dirty table into a temp table via merged read.
+	var utilTables []string
+	tableMap := make(map[string]string)
+	defer func() {
+		for _, ut := range utilTables {
+			dropUtilTable(rh.shadowConn, ut)
+		}
+	}()
+
+	for _, table := range dirtyTables {
+		selectSQL := "SELECT * FROM `" + table + "`"
+		utilName := utilTableName(selectSQL)
+
+		_, err := rh.materializeToUtilTable(selectSQL, utilName, 0)
+		if err != nil {
+			rh.logf("JOIN materialization failed for %s: %v", table, err)
+			// Fall back to Shadow-only.
+			result, qerr := execMySQLQuery(rh.shadowConn, querySQL)
+			if qerr != nil {
+				return nil, nil, nil, qerr
+			}
+			if result.Error != "" {
+				return nil, nil, nil, &mysqlRelayError{rawMsgs: result.RawMsgs, msg: result.Error}
+			}
+			return result.Columns, result.RowValues, result.RowNulls, nil
+		}
+		tableMap[table] = utilName
+		utilTables = append(utilTables, utilName)
+	}
+
+	// Rewrite the original SQL, replacing table names with temp table names.
+	rewritten := querySQL
+	for origTable, utilName := range tableMap {
+		// Replace backtick-quoted table name.
+		rewritten = strings.Replace(rewritten, "`"+origTable+"`", "`"+utilName+"`", -1)
+		// Replace unquoted table name (word boundary aware).
+		rewritten = replaceColumnName(rewritten, origTable, "`"+utilName+"`")
+	}
+
+	// Execute rewritten query on Shadow.
+	result, err := execMySQLQuery(rh.shadowConn, rewritten)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("shadow materialized JOIN query: %w", err)
+	}
+	if result.Error != "" {
+		rh.logf("materialized JOIN query error: %s, falling back to shadow-only", result.Error)
+		// Fall back to Shadow-only with original query.
+		fallback, ferr := execMySQLQuery(rh.shadowConn, querySQL)
+		if ferr != nil {
+			return nil, nil, nil, ferr
+		}
+		if fallback.Error != "" {
+			return nil, nil, nil, &mysqlRelayError{rawMsgs: fallback.RawMsgs, msg: fallback.Error}
+		}
+		return fallback.Columns, fallback.RowValues, fallback.RowNulls, nil
+	}
+
+	return result.Columns, result.RowValues, result.RowNulls, nil
 }

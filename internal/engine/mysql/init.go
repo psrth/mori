@@ -123,6 +123,12 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		initErr = err
 		return nil, fmt.Errorf("table metadata detection failed: %w", err)
 	}
+	// Detect generated columns.
+	if err := schema.DetectGeneratedColumns(ctx, prodDB, dsn.DBName, tables); err != nil {
+		// Non-fatal: log warning but continue.
+		// Generated column detection failure shouldn't block init.
+	}
+
 	ui.StepDone(fmt.Sprintf("%d tables dumped", len(tables)))
 
 	// 8. Detect auto_increment offsets.

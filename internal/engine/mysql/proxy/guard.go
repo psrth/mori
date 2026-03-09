@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -51,10 +52,17 @@ func validateRouteDecision(cl *core.Classification, strategy core.RoutingStrateg
 // SafeProdConn wraps a net.Conn to the production database and blocks any
 // COM_QUERY messages that contain write SQL from being sent.
 type SafeProdConn struct {
-	inner   net.Conn
-	connID  int64
-	verbose bool
-	logger  *logging.Logger
+	inner      net.Conn
+	connID     int64
+	verbose    bool
+	logger     *logging.Logger
+	extHandler *ExtHandler
+}
+
+// SetExtHandler attaches an ExtHandler so the guard can inspect
+// COM_STMT_EXECUTE packets by looking up statement SQL from the cache.
+func (s *SafeProdConn) SetExtHandler(eh *ExtHandler) {
+	s.extHandler = eh
 }
 
 // NewSafeProdConn creates a new SafeProdConn wrapping the given connection.
@@ -67,12 +75,14 @@ func NewSafeProdConn(inner net.Conn, connID int64, verbose bool, logger *logging
 	}
 }
 
-// Write inspects outgoing data for COM_QUERY messages containing write SQL.
+// Write inspects outgoing data for COM_QUERY messages containing write SQL
+// and COM_STMT_EXECUTE packets whose cached SQL looks like a write.
 func (s *SafeProdConn) Write(b []byte) (int, error) {
 	// MySQL packet: 3-byte length + 1-byte sequence + payload.
-	// COM_QUERY: payload[0] == 0x03, followed by SQL.
 	if len(b) >= 5 {
 		payloadStart := 4
+
+		// COM_QUERY: payload[0] == 0x03, followed by SQL.
 		if b[payloadStart] == comQuery && len(b) > payloadStart+1 {
 			sql := string(b[payloadStart+1:])
 			if looksLikeWrite(sql) {
@@ -90,6 +100,30 @@ func (s *SafeProdConn) Write(b []byte) (int, error) {
 				}
 
 				return 0, fmt.Errorf("write guard: write query blocked from reaching production")
+			}
+		}
+
+		// COM_STMT_EXECUTE: payload[0] == 0x17, stmt_id at bytes 1-4 (LE uint32).
+		if b[payloadStart] == comStmtExecute && len(b) >= payloadStart+5 && s.extHandler != nil {
+			stmtID := binary.LittleEndian.Uint32(b[payloadStart+1 : payloadStart+5])
+			s.extHandler.mu.Lock()
+			entry, ok := s.extHandler.stmtCache[stmtIDKey(stmtID)]
+			s.extHandler.mu.Unlock()
+			if ok && looksLikeWrite(entry.sql) {
+				msg := fmt.Sprintf("[CRITICAL] [conn %d] WRITE GUARD L2: blocked COM_STMT_EXECUTE write to prod (stmtID=%d): %s",
+					s.connID, stmtID, truncateSQL(entry.sql, 120))
+				log.Printf("%s", msg)
+
+				if s.logger != nil {
+					s.logger.Log(logging.LogEntry{
+						Level:  "critical",
+						ConnID: s.connID,
+						Event:  "write_guard_l2",
+						Detail: msg,
+					})
+				}
+
+				return 0, fmt.Errorf("write guard: prepared statement write blocked from reaching production")
 			}
 		}
 	}

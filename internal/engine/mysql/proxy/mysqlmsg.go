@@ -64,13 +64,17 @@ func buildMySQLPacket(seq byte, payload []byte) []byte {
 
 // MySQL command bytes.
 const (
-	comQuit       byte = 0x01
-	comInitDB     byte = 0x02
-	comQuery      byte = 0x03
-	comPing       byte = 0x0e
-	comStmtPrepare byte = 0x16
-	comStmtExecute byte = 0x17
-	comStmtClose   byte = 0x19
+	comQuit             byte = 0x01
+	comInitDB           byte = 0x02
+	comQuery            byte = 0x03
+	comFieldList        byte = 0x04
+	comPing             byte = 0x0e
+	comStmtPrepare      byte = 0x16
+	comStmtExecute      byte = 0x17
+	comStmtSendLongData byte = 0x18
+	comStmtClose        byte = 0x19
+	comStmtReset        byte = 0x1a
+	comStmtFetch        byte = 0x1c
 )
 
 // MySQL response packet types (first byte of payload).
@@ -116,6 +120,43 @@ func buildERRPacket(seq byte, code uint16, sqlState, message string) []byte {
 	payload = append(payload, []byte(sqlState[:5])...)
 	payload = append(payload, []byte(message)...)
 	return buildMySQLPacket(seq, payload)
+}
+
+// buildOKPacketWithAffectedRows constructs a MySQL OK packet with the given
+// affected rows count.
+func buildOKPacketWithAffectedRows(affectedRows uint64) []byte {
+	// OK packet payload: header(0x00) + affected_rows(lenenc) + last_insert_id(lenenc) + status_flags(2) + warnings(2)
+	var payload []byte
+	payload = append(payload, 0x00) // OK header
+	payload = append(payload, encodeLenEncInt(affectedRows)...)
+	payload = append(payload, 0x00)       // last_insert_id = 0
+	payload = append(payload, 0x02, 0x00) // status flags (SERVER_STATUS_AUTOCOMMIT)
+	payload = append(payload, 0x00, 0x00) // warnings
+
+	// MySQL packet: 3-byte length + 1-byte sequence (1) + payload
+	pktLen := len(payload)
+	pkt := make([]byte, 4+pktLen)
+	pkt[0] = byte(pktLen)
+	pkt[1] = byte(pktLen >> 8)
+	pkt[2] = byte(pktLen >> 16)
+	pkt[3] = 1 // sequence number
+	copy(pkt[4:], payload)
+	return pkt
+}
+
+// encodeLenEncInt encodes an integer as MySQL length-encoded integer.
+func encodeLenEncInt(n uint64) []byte {
+	if n < 251 {
+		return []byte{byte(n)}
+	}
+	if n < 1<<16 {
+		return []byte{0xfc, byte(n), byte(n >> 8)}
+	}
+	if n < 1<<24 {
+		return []byte{0xfd, byte(n), byte(n >> 8), byte(n >> 16)}
+	}
+	return []byte{0xfe, byte(n), byte(n >> 8), byte(n >> 16), byte(n >> 24),
+		byte(n >> 32), byte(n >> 40), byte(n >> 48), byte(n >> 56)}
 }
 
 // buildEOFPacket constructs a MySQL EOF packet.

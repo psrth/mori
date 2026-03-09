@@ -86,6 +86,7 @@ func (e *mysqlEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 		deps.MoriDir,
 		deps.SchemaReg,
 		deps.Logger,
+		deps.MaxRowsHydrate,
 	)
 }
 

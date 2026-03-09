@@ -117,6 +117,13 @@ func (c *MySQLClassifier) classifyStmt(stmt sqlparser.Statement, cl *core.Classi
 		if s.Table.Name.String() != "" {
 			cl.Tables = appendUnique(cl.Tables, normalizeTableName(s.Table.Name.String()))
 		}
+	case *sqlparser.RenameTable:
+		cl.OpType = core.OpDDL
+		cl.SubType = core.SubAlter
+		// Extract both old and new table names.
+		for _, pair := range s.TablePairs {
+			cl.Tables = appendUnique(cl.Tables, normalizeTableName(pair.FromTable.Name.String()))
+		}
 	case *sqlparser.DropTable:
 		cl.OpType = core.OpDDL
 		cl.SubType = core.SubDrop
@@ -125,7 +132,7 @@ func (c *MySQLClassifier) classifyStmt(stmt sqlparser.Statement, cl *core.Classi
 		}
 	case *sqlparser.TruncateTable:
 		cl.OpType = core.OpWrite
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubTruncate
 		if s.Table.Name.String() != "" {
 			cl.Tables = appendUnique(cl.Tables, normalizeTableName(s.Table.Name.String()))
 		}
@@ -138,18 +145,32 @@ func (c *MySQLClassifier) classifyStmt(stmt sqlparser.Statement, cl *core.Classi
 	case *sqlparser.Rollback:
 		cl.OpType = core.OpTransaction
 		cl.SubType = core.SubRollback
+	case *sqlparser.Savepoint:
+		cl.OpType = core.OpTransaction
+		cl.SubType = core.SubSavepoint
+	case *sqlparser.Release:
+		cl.OpType = core.OpTransaction
+		cl.SubType = core.SubRelease
+	case *sqlparser.SRollback:
+		cl.OpType = core.OpTransaction
+		cl.SubType = core.SubRollback
 	case *sqlparser.Set:
 		cl.OpType = core.OpOther
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubSet
 	case *sqlparser.Show:
 		cl.OpType = core.OpOther
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubShow
 	case *sqlparser.ExplainStmt:
 		cl.OpType = core.OpOther
-		cl.SubType = core.SubOther
+		if s.Type == sqlparser.AnalyzeType {
+			cl.SubType = core.SubNotSupported
+			cl.NotSupportedMsg = "EXPLAIN ANALYZE is not supported through Mori"
+		} else {
+			cl.SubType = core.SubExplain
+		}
 	case *sqlparser.ExplainTab:
 		cl.OpType = core.OpOther
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubExplain
 	case *sqlparser.Use:
 		cl.OpType = core.OpOther
 		cl.SubType = core.SubOther
@@ -198,17 +219,36 @@ func (c *MySQLClassifier) classifySelect(sel *sqlparser.Select, cl *core.Classif
 		cl.OrderBy = extractOrderByFromRaw(cl.RawSQL)
 	}
 
+	// Detect DISTINCT.
+	if sel.Distinct {
+		cl.HasDistinct = true
+	}
+
+	// Detect metadata queries (information_schema, mysql, performance_schema).
+	if hasMetadataTable(sel.From) {
+		cl.IsMetadataQuery = true
+	}
+
 	// Detect aggregates.
 	if sel.GroupBy != nil && len(sel.GroupBy.Exprs) > 0 {
 		cl.HasAggregate = true
 	}
-	if !cl.HasAggregate && sel.SelectExprs != nil {
+	if sel.SelectExprs != nil {
 		for _, expr := range sel.SelectExprs.Exprs {
-			if hasAggregateExpr(expr) {
+			if !cl.HasAggregate && hasAggregateExpr(expr) {
 				cl.HasAggregate = true
-				break
+			}
+			if !cl.HasWindowFunc && hasWindowFuncExpr(expr) {
+				cl.HasWindowFunc = true
+				cl.IsComplexRead = true
 			}
 		}
+	}
+
+	// Detect named WINDOW clauses (e.g., SELECT ... WINDOW w AS (...)).
+	if !cl.HasWindowFunc && len(sel.Windows) > 0 {
+		cl.HasWindowFunc = true
+		cl.IsComplexRead = true
 	}
 
 	// Extract PKs from WHERE.
@@ -251,6 +291,11 @@ func (c *MySQLClassifier) classifyInsert(ins *sqlparser.Insert, cl *core.Classif
 		if tableName != "" {
 			cl.Tables = appendUnique(cl.Tables, normalizeTableName(tableName))
 		}
+	}
+
+	// Detect INSERT ... ON DUPLICATE KEY UPDATE (MySQL upsert).
+	if ins.OnDup != nil {
+		cl.HasOnConflict = true
 	}
 
 	// INSERT ... SELECT: extract tables from the SELECT.
@@ -385,6 +430,33 @@ func hasSubqueryInFrom(exprs sqlparser.TableExprs) bool {
 	return false
 }
 
+// hasMetadataTable checks if FROM clause references system schema tables
+// (information_schema, mysql, performance_schema). This must inspect the raw
+// AST qualifier rather than the normalised table names, because normalizeTableName
+// strips the schema prefix.
+func hasMetadataTable(exprs sqlparser.TableExprs) bool {
+	for _, expr := range exprs {
+		switch t := expr.(type) {
+		case *sqlparser.AliasedTableExpr:
+			if tn, ok := t.Expr.(sqlparser.TableName); ok {
+				qualifier := strings.ToLower(tn.Qualifier.String())
+				if qualifier == "information_schema" || qualifier == "mysql" || qualifier == "performance_schema" {
+					return true
+				}
+			}
+		case *sqlparser.JoinTableExpr:
+			if hasMetadataTable(sqlparser.TableExprs{t.LeftExpr}) || hasMetadataTable(sqlparser.TableExprs{t.RightExpr}) {
+				return true
+			}
+		case *sqlparser.ParenTableExpr:
+			if hasMetadataTable(t.Exprs) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // hasAggregateExpr checks if a select expression contains an aggregate function.
 func hasAggregateExpr(expr sqlparser.SelectExpr) bool {
 	ae, ok := expr.(*sqlparser.AliasedExpr)
@@ -415,6 +487,56 @@ func containsAggregate(expr sqlparser.Expr) bool {
 	return false
 }
 
+// hasWindowFuncExpr checks if a select expression contains a window function.
+// In Vitess, window functions are represented by dedicated AST types
+// (ArgumentLessWindowExpr, LagLeadExpr, etc.) or aggregate types used
+// with an OVER clause (e.g., SUM(...) OVER (...)).
+func hasWindowFuncExpr(expr sqlparser.SelectExpr) bool {
+	ae, ok := expr.(*sqlparser.AliasedExpr)
+	if !ok {
+		return false
+	}
+	return containsWindowFunc(ae.Expr)
+}
+
+func containsWindowFunc(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	switch e := expr.(type) {
+	// Dedicated window function types.
+	case *sqlparser.ArgumentLessWindowExpr:
+		// ROW_NUMBER, RANK, DENSE_RANK, PERCENT_RANK, CUME_DIST
+		return true
+	case *sqlparser.LagLeadExpr:
+		// LAG, LEAD
+		return true
+	case *sqlparser.FirstOrLastValueExpr:
+		// FIRST_VALUE, LAST_VALUE
+		return true
+	case *sqlparser.NtileExpr:
+		// NTILE
+		return true
+	case *sqlparser.NTHValueExpr:
+		// NTH_VALUE
+		return true
+	// Aggregate types used as window functions (with OVER clause).
+	case *sqlparser.Count:
+		return e.OverClause != nil
+	case *sqlparser.CountStar:
+		return e.OverClause != nil
+	case *sqlparser.Sum:
+		return e.OverClause != nil
+	case *sqlparser.Avg:
+		return e.OverClause != nil
+	case *sqlparser.Min:
+		return e.OverClause != nil
+	case *sqlparser.Max:
+		return e.OverClause != nil
+	}
+	return false
+}
+
 // extractIntFromExpr extracts an integer from a sqlparser expression.
 func extractIntFromExpr(expr sqlparser.Expr) int {
 	if lit, ok := expr.(*sqlparser.Literal); ok {
@@ -435,11 +557,13 @@ func (c *MySQLClassifier) extractPKsFromExpr(expr sqlparser.Expr, tables []strin
 			return nil
 		}
 		colName := extractColumnName(e.Left)
-		if colName == "" {
-			return nil
-		}
 		val := extractValue(e.Right)
-		if val == "" {
+		// Support reversed comparison: value = column.
+		if colName == "" {
+			colName = extractColumnName(e.Right)
+			val = extractValue(e.Left)
+		}
+		if colName == "" || val == "" {
 			return nil
 		}
 
@@ -466,8 +590,13 @@ func (c *MySQLClassifier) extractPKsFromExpr(expr sqlparser.Expr, tables []strin
 
 // extractColumnName extracts the column name from an expression.
 func extractColumnName(expr sqlparser.Expr) string {
-	if col, ok := expr.(*sqlparser.ColName); ok {
-		return col.Name.String()
+	switch e := expr.(type) {
+	case *sqlparser.ColName:
+		return e.Name.String()
+	case *sqlparser.CastExpr:
+		return extractColumnName(e.Expr)
+	case *sqlparser.ConvertExpr:
+		return extractColumnName(e.Expr)
 	}
 	return ""
 }
@@ -479,6 +608,10 @@ func extractValue(expr sqlparser.Expr) string {
 		return e.Val
 	case *sqlparser.Argument:
 		return "?"
+	case *sqlparser.CastExpr:
+		return extractValue(e.Expr)
+	case *sqlparser.ConvertExpr:
+		return extractValue(e.Expr)
 	}
 	return ""
 }
@@ -538,25 +671,48 @@ func (c *MySQLClassifier) classifyRegex(trimmed string, cl *core.Classification)
 	case hasPrefix(upper, "ALTER"):
 		cl.OpType = core.OpDDL
 		cl.SubType = core.SubAlter
+	case hasPrefix(upper, "RENAME"):
+		cl.OpType = core.OpDDL
+		cl.SubType = core.SubAlter
 	case hasPrefix(upper, "DROP"):
 		cl.OpType = core.OpDDL
 		cl.SubType = core.SubDrop
 	case hasPrefix(upper, "TRUNCATE"):
 		cl.OpType = core.OpWrite
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubTruncate
+		if m := reTruncateTable.FindStringSubmatch(upper); len(m) > 1 {
+			cl.Tables = appendUnique(cl.Tables, cleanTableName(m[1]))
+		}
 	case hasPrefix(upper, "BEGIN"), hasPrefix(upper, "START TRANSACTION"):
 		cl.OpType = core.OpTransaction
 		cl.SubType = core.SubBegin
 	case hasPrefix(upper, "COMMIT"):
 		cl.OpType = core.OpTransaction
 		cl.SubType = core.SubCommit
+	case hasPrefix(upper, "RELEASE"):
+		cl.OpType = core.OpTransaction
+		cl.SubType = core.SubRelease
+	case hasPrefix(upper, "SAVEPOINT"):
+		cl.OpType = core.OpTransaction
+		cl.SubType = core.SubSavepoint
 	case hasPrefix(upper, "ROLLBACK"):
 		cl.OpType = core.OpTransaction
 		cl.SubType = core.SubRollback
-	case hasPrefix(upper, "SET"), hasPrefix(upper, "SHOW"),
-		hasPrefix(upper, "EXPLAIN"), hasPrefix(upper, "DESCRIBE"),
-		hasPrefix(upper, "DESC"), hasPrefix(upper, "USE"),
-		hasPrefix(upper, "HELP"):
+	case hasPrefix(upper, "SET"):
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubSet
+	case hasPrefix(upper, "SHOW"):
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubShow
+	case hasPrefix(upper, "EXPLAIN"), hasPrefix(upper, "DESCRIBE"), hasPrefix(upper, "DESC"):
+		cl.OpType = core.OpOther
+		if reExplainAnalyze.MatchString(upper) {
+			cl.SubType = core.SubNotSupported
+			cl.NotSupportedMsg = "EXPLAIN ANALYZE is not supported through Mori"
+		} else {
+			cl.SubType = core.SubExplain
+		}
+	case hasPrefix(upper, "USE"), hasPrefix(upper, "HELP"):
 		cl.OpType = core.OpOther
 		cl.SubType = core.SubOther
 	case hasPrefix(upper, "WITH"):
@@ -583,9 +739,19 @@ func (c *MySQLClassifier) classifySelectRegex(raw, upper string, cl *core.Classi
 	if idx := strings.Index(upper, "ORDER BY"); idx >= 0 {
 		cl.OrderBy = extractOrderByRegex(raw, idx)
 	}
+	if strings.Contains(upper, "SELECT DISTINCT") {
+		cl.HasDistinct = true
+	}
+	if strings.Contains(upper, "INFORMATION_SCHEMA") || strings.Contains(upper, "PERFORMANCE_SCHEMA") {
+		cl.IsMetadataQuery = true
+	}
 	cl.HasAggregate = reAggregate.MatchString(upper) || strings.Contains(upper, "GROUP BY")
 	cl.HasSetOp = reSetOp.MatchString(upper)
 	if reSubqueryFrom.MatchString(upper) {
+		cl.IsComplexRead = true
+	}
+	if reWindowFunc.MatchString(upper) || strings.Contains(upper, " OVER(") || strings.Contains(upper, " OVER ") {
+		cl.HasWindowFunc = true
 		cl.IsComplexRead = true
 	}
 	cl.PKs = c.extractPKsRegex(raw, cl.Tables)
@@ -596,6 +762,10 @@ func (c *MySQLClassifier) classifyInsertRegex(upper string, cl *core.Classificat
 	cl.SubType = core.SubInsert
 	if m := reInsertTable.FindStringSubmatch(upper); len(m) > 1 {
 		cl.Tables = appendUnique(cl.Tables, cleanTableName(m[1]))
+	}
+	// Detect INSERT ... ON DUPLICATE KEY UPDATE via regex fallback.
+	if strings.Contains(upper, "ON DUPLICATE KEY UPDATE") {
+		cl.HasOnConflict = true
 	}
 }
 
@@ -628,6 +798,9 @@ func (c *MySQLClassifier) classifyCTERegex(raw, upper string, cl *core.Classific
 	cl.Tables = extractFromTablesRegex(upper)
 	cl.IsJoin = len(cl.Tables) > 1 || reJoin.MatchString(upper)
 	cl.HasAggregate = reAggregate.MatchString(upper) || strings.Contains(upper, "GROUP BY")
+	if reWindowFunc.MatchString(upper) || strings.Contains(upper, " OVER(") || strings.Contains(upper, " OVER ") {
+		cl.HasWindowFunc = true
+	}
 	cl.IsComplexRead = true
 }
 
@@ -673,9 +846,12 @@ var (
 	reAggregate    = regexp.MustCompile(`(?i)\b(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(`)
 	reSetOp        = regexp.MustCompile(`(?i)\b(UNION|INTERSECT|EXCEPT)\b`)
 	reSubqueryFrom = regexp.MustCompile(`(?i)\bFROM\s*\(`)
+	reWindowFunc   = regexp.MustCompile(`(?i)\b(ROW_NUMBER|RANK|DENSE_RANK|NTILE|LAG|LEAD|FIRST_VALUE|LAST_VALUE|NTH_VALUE)\s*\(`)
 
-	reInsertTable  = regexp.MustCompile(`(?i)INSERT\s+(?:IGNORE\s+)?INTO\s+` + tablePattern)
-	reReplaceTable = regexp.MustCompile(`(?i)REPLACE\s+INTO\s+` + tablePattern)
+	reInsertTable    = regexp.MustCompile(`(?i)INSERT\s+(?:IGNORE\s+)?INTO\s+` + tablePattern)
+	reReplaceTable   = regexp.MustCompile(`(?i)REPLACE\s+INTO\s+` + tablePattern)
+	reTruncateTable  = regexp.MustCompile(`(?i)TRUNCATE\s+(?:TABLE\s+)?` + tablePattern)
+	reExplainAnalyze = regexp.MustCompile(`(?i)^EXPLAIN\s+ANALYZE\b`)
 
 	reFromClause = regexp.MustCompile(`(?i)\bFROM\s+(` + tableListPattern + `)`)
 	reJoinTable  = regexp.MustCompile(`(?i)\bJOIN\s+` + tablePattern)
