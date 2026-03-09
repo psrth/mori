@@ -258,6 +258,21 @@ func (c *PgClassifier) classifySelect(sel *pg_query.SelectStmt, cl *core.Classif
 		cl.Tables = appendUnique(cl.Tables, t)
 	}
 
+	// Detect metadata queries (information_schema.*, pg_catalog.*).
+	for _, t := range cl.Tables {
+		if strings.HasPrefix(t, "information_schema.") || strings.HasPrefix(t, "pg_catalog.") {
+			cl.IsMetadataQuery = true
+			break
+		}
+	}
+	// If it's a metadata query, extract the introspected table from WHERE clause
+	// (e.g. WHERE table_name = 'users' or WHERE relname = 'users').
+	if cl.IsMetadataQuery && sel.GetWhereClause() != nil {
+		if tbl := extractIntrospectedTable(sel.GetWhereClause()); tbl != "" {
+			cl.IntrospectedTable = tbl
+		}
+	}
+
 	// Detect JOINs based on this SELECT's own FROM clause.
 	fromTables := extractTablesFromNodes(sel.GetFromClause())
 	realFromCount := 0

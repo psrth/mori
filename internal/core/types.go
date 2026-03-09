@@ -183,6 +183,8 @@ type Classification struct {
 	HasComplexAgg bool     // Whether the query uses complex aggregates (array_agg, json_agg, string_agg)
 	HasDistinct   bool     // Whether the query uses DISTINCT
 	HasCursor     bool     // Whether the query involves DECLARE/FETCH/CLOSE cursor
+	IsMetadataQuery   bool   // Whether the query reads from information_schema or pg_catalog
+	IntrospectedTable string // The user table being introspected (e.g. from WHERE table_name = 'X')
 	NotSupportedMsg string // Error message for unsupported features (COPY, LOCK, DO, CALL, EXPLAIN ANALYZE)
 	RawSQL        string   // Original SQL text
 }

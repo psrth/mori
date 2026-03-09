@@ -98,8 +98,9 @@ func convertTablesFromPG(pgTables map[string]schema.TableMeta) map[string]engine
 	out := make(map[string]engine.TableMeta, len(pgTables))
 	for name, t := range pgTables {
 		out[name] = engine.TableMeta{
-			PKColumns: t.PKColumns,
-			PKType:    t.PKType,
+			PKColumns:     t.PKColumns,
+			PKType:        t.PKType,
+			GeneratedCols: t.GeneratedCols,
 		}
 	}
 	return out
@@ -110,8 +111,9 @@ func convertTablesToPG(tables map[string]engine.TableMeta) map[string]schema.Tab
 	out := make(map[string]schema.TableMeta, len(tables))
 	for name, t := range tables {
 		out[name] = schema.TableMeta{
-			PKColumns: t.PKColumns,
-			PKType:    t.PKType,
+			PKColumns:     t.PKColumns,
+			PKType:        t.PKType,
+			GeneratedCols: t.GeneratedCols,
 		}
 	}
 	return out

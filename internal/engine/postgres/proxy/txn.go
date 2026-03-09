@@ -8,32 +8,36 @@ import (
 
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/logging"
 )
 
-// savepointSnapshot captures the delta/tombstone/insert state at the time
+// savepointSnapshot captures the delta/tombstone/insert/schema state at the time
 // a SAVEPOINT is created, so it can be restored on ROLLBACK TO.
 type savepointSnapshot struct {
 	name       string
 	deltaSnap  map[string][]string
 	tombSnap   map[string][]string
 	insertSnap map[string]int
+	schemaSnap map[string]*coreSchema.TableDiff
 }
 
 // TxnHandler manages transaction state for a single connection.
 // It coordinates BEGIN/COMMIT/ROLLBACK across both Prod and Shadow backends
 // and controls delta/tombstone staging.
 type TxnHandler struct {
-	prodConn       net.Conn
-	shadowConn     net.Conn
-	deltaMap       *delta.Map
-	tombstones     *delta.TombstoneSet
-	moriDir        string
-	connID         int64
-	verbose        bool
-	logger         *logging.Logger
-	inTxn          bool
-	savepointStack []savepointSnapshot
+	prodConn        net.Conn
+	shadowConn      net.Conn
+	deltaMap        *delta.Map
+	tombstones      *delta.TombstoneSet
+	schemaRegistry  *coreSchema.Registry
+	moriDir         string
+	connID          int64
+	verbose         bool
+	logger          *logging.Logger
+	inTxn           bool
+	savepointStack  []savepointSnapshot
+	beginSchemaSnap map[string]*coreSchema.TableDiff // schema state at BEGIN
 }
 
 // InTxn reports whether this connection is inside an explicit transaction.
@@ -96,6 +100,10 @@ func (th *TxnHandler) handleBegin(clientConn net.Conn, rawMsg []byte) error {
 
 	if !hadProdError {
 		th.inTxn = true
+		// Snapshot schema registry state so we can restore on ROLLBACK.
+		if th.schemaRegistry != nil {
+			th.beginSchemaSnap = th.schemaRegistry.SnapshotAll()
+		}
 		if th.verbose {
 			log.Printf("[conn %d] BEGIN: Shadow=ok Prod=REPEATABLE READ", th.connID)
 		}
@@ -121,6 +129,7 @@ func (th *TxnHandler) handleCommit(clientConn net.Conn, rawMsg []byte) error {
 
 	th.inTxn = false
 	th.savepointStack = nil // Clear savepoint stack on commit.
+	th.beginSchemaSnap = nil // Schema changes are now permanent.
 
 	// Only promote staged deltas if both backends committed successfully.
 	if !shadowHadError && !prodHadError {
@@ -179,8 +188,20 @@ func (th *TxnHandler) handleRollback(clientConn net.Conn, rawMsg []byte) error {
 	th.deltaMap.RollbackInsertCounts()
 	th.tombstones.Rollback()
 
+	// Restore schema registry to pre-BEGIN state so rolled-back DDL
+	// doesn't leave stale schema diffs.
+	if th.schemaRegistry != nil && th.beginSchemaSnap != nil {
+		th.schemaRegistry.RestoreAll(th.beginSchemaSnap)
+		th.beginSchemaSnap = nil
+		if err := coreSchema.WriteRegistry(th.moriDir, th.schemaRegistry); err != nil {
+			if th.verbose {
+				log.Printf("[conn %d] failed to persist schema registry after ROLLBACK: %v", th.connID, err)
+			}
+		}
+	}
+
 	if th.verbose {
-		log.Printf("[conn %d] ROLLBACK: staged deltas discarded", th.connID)
+		log.Printf("[conn %d] ROLLBACK: staged deltas and schema changes discarded", th.connID)
 	}
 	th.logger.Event(th.connID, "txn", "ROLLBACK")
 
@@ -208,6 +229,9 @@ func (th *TxnHandler) handleSavepoint(clientConn net.Conn, rawMsg []byte, rawSQL
 		deltaSnap:  th.deltaMap.SnapshotAll(),
 		tombSnap:   th.tombstones.SnapshotAll(),
 		insertSnap: th.deltaMap.SnapshotInsertedTables(),
+	}
+	if th.schemaRegistry != nil {
+		snap.schemaSnap = th.schemaRegistry.SnapshotAll()
 	}
 	th.savepointStack = append(th.savepointStack, snap)
 
@@ -252,6 +276,15 @@ func (th *TxnHandler) handleRollbackTo(clientConn net.Conn, rawMsg []byte, rawSQ
 		th.deltaMap.RestoreAll(snap.deltaSnap)
 		th.tombstones.RestoreAll(snap.tombSnap)
 		th.deltaMap.RestoreInsertedTables(snap.insertSnap)
+		// Restore schema registry to savepoint state.
+		if th.schemaRegistry != nil && snap.schemaSnap != nil {
+			th.schemaRegistry.RestoreAll(snap.schemaSnap)
+			if err := coreSchema.WriteRegistry(th.moriDir, th.schemaRegistry); err != nil {
+				if th.verbose {
+					log.Printf("[conn %d] failed to persist schema registry after ROLLBACK TO: %v", th.connID, err)
+				}
+			}
+		}
 		// Trim the stack: keep up to and including the matched savepoint,
 		// discard anything pushed after it.
 		th.savepointStack = th.savepointStack[:idx+1]

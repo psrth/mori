@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 )
 
 // buildQueryMsg constructs a PG wire protocol Query ('Q') message.
@@ -136,8 +137,29 @@ type QueryResult struct {
 	Error      string       // ErrorResponse message text, if any
 }
 
+// drainToReady attempts to read and discard messages from a connection until
+// ReadyForQuery ('Z') is received. Uses a short timeout to avoid blocking
+// indefinitely on a broken connection. This prevents connection desynchronization
+// when a previous execQuery fails mid-stream, leaving unread response bytes in
+// the TCP buffer that would corrupt subsequent queries.
+func drainToReady(conn net.Conn, timeout time.Duration) {
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	defer conn.SetReadDeadline(time.Time{}) // clear deadline
+	for {
+		msg, err := readMsg(conn)
+		if err != nil {
+			return // connection is truly broken, give up
+		}
+		if msg.Type == 'Z' {
+			return // successfully drained
+		}
+	}
+}
+
 // execQuery sends a Query message to the backend and collects the full response.
 // It reads messages until ReadyForQuery ('Z') and returns the parsed result.
+// If a read error occurs mid-stream (after at least one message was received),
+// it attempts to drain remaining response bytes to prevent connection desync.
 func execQuery(conn net.Conn, sql string) (*QueryResult, error) {
 	msg := buildQueryMsg(sql)
 	if _, err := conn.Write(msg); err != nil {
@@ -145,12 +167,19 @@ func execQuery(conn net.Conn, sql string) (*QueryResult, error) {
 	}
 
 	result := &QueryResult{}
+	receivedAny := false
 
 	for {
 		respMsg, err := readMsg(conn)
 		if err != nil {
+			if receivedAny {
+				// We've read partial response — try to drain remaining messages
+				// so the connection isn't left in a desynchronized state.
+				drainToReady(conn, 5*time.Second)
+			}
 			return nil, fmt.Errorf("reading response: %w", err)
 		}
+		receivedAny = true
 		result.RawMsgs = append(result.RawMsgs, respMsg.Raw...)
 
 		switch respMsg.Type {
@@ -342,19 +371,35 @@ func buildExtSelectResponse(hasParse, hasBind bool, columns []ColumnInfo, rowVal
 
 // buildInsertSQL constructs an INSERT statement from column metadata and values.
 // Uses ON CONFLICT DO NOTHING to handle concurrent/duplicate hydration.
-func buildInsertSQL(table string, columns []ColumnInfo, values []string, nulls []bool) string {
-	colNames := make([]string, len(columns))
-	valParts := make([]string, len(columns))
+// skipCols is an optional set of column names to exclude (e.g., GENERATED ALWAYS
+// columns that PostgreSQL rejects explicit values for).
+func buildInsertSQL(table string, columns []ColumnInfo, values []string, nulls []bool, skipCols map[string]bool) string {
+	var colNames, valParts []string
 	for i, col := range columns {
-		colNames[i] = quoteIdent(col.Name)
+		if skipCols[col.Name] {
+			continue
+		}
+		colNames = append(colNames, quoteIdent(col.Name))
 		if nulls[i] {
-			valParts[i] = "NULL"
+			valParts = append(valParts, "NULL")
 		} else {
-			valParts[i] = quoteLiteral(values[i])
+			valParts = append(valParts, quoteLiteral(values[i]))
 		}
 	}
 	return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING",
 		quoteIdent(table),
 		strings.Join(colNames, ", "),
 		strings.Join(valParts, ", "))
+}
+
+// toSkipSet builds a fast-lookup set from a slice of column names.
+func toSkipSet(cols []string) map[string]bool {
+	if len(cols) == 0 {
+		return nil
+	}
+	s := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		s[c] = true
+	}
+	return s
 }

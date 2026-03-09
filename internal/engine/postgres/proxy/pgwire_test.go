@@ -446,7 +446,7 @@ func TestBuildInsertSQL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := buildInsertSQL(tt.table, tt.columns, tt.values, tt.nulls)
+			got := buildInsertSQL(tt.table, tt.columns, tt.values, tt.nulls, nil)
 			if got != tt.want {
 				t.Errorf("buildInsertSQL() = %q, want %q", got, tt.want)
 			}

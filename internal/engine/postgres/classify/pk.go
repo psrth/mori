@@ -114,7 +114,8 @@ func extractColumnRef(n *pg_query.Node) (colName string, tableName string) {
 }
 
 // extractLiteralValue extracts a string representation of a literal value.
-// Handles integers, strings, floats, and parameter references ($N).
+// Handles integers, strings, floats, parameter references ($N), and
+// type casts (e.g., 'value'::uuid).
 func extractLiteralValue(n *pg_query.Node) string {
 	if n == nil {
 		return ""
@@ -138,6 +139,10 @@ func extractLiteralValue(n *pg_query.Node) string {
 	}
 	if pr := n.GetParamRef(); pr != nil {
 		return fmt.Sprintf("$%d", pr.GetNumber())
+	}
+	// TypeCast: unwrap 'value'::type to extract the inner literal.
+	if tc := n.GetTypeCast(); tc != nil {
+		return extractLiteralValue(tc.GetArg())
 	}
 	return ""
 }

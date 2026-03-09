@@ -54,8 +54,9 @@ type SequenceOffset struct {
 
 // TableMeta holds primary key metadata for a table.
 type TableMeta struct {
-	PKColumns []string `json:"pk_columns"`
-	PKType    string   `json:"pk_type"` // "serial", "bigserial", "uuid", "composite", "none"
+	PKColumns     []string `json:"pk_columns"`
+	PKType        string   `json:"pk_type"` // "serial", "bigserial", "uuid", "composite", "none"
+	GeneratedCols []string `json:"generated_cols,omitempty"`
 }
 
 // DumpResult holds the complete result of the schema dump and analysis.
@@ -472,6 +473,49 @@ func classifyPKType(dataTypes []string, defaults []string) string {
 	return dt
 }
 
+// DetectGeneratedColumns queries Prod for GENERATED ALWAYS AS STORED columns
+// and merges them into the existing table metadata. These columns must be
+// excluded from hydration INSERTs because PostgreSQL rejects explicit values
+// for generated columns.
+//
+// Requires PostgreSQL 12+ (which introduced generated columns). On older
+// versions the query fails gracefully and no columns are marked.
+func DetectGeneratedColumns(ctx context.Context, conn *pgx.Conn, tables map[string]TableMeta) {
+	rows, err := conn.Query(ctx, `
+		SELECT c.relname  AS table_name,
+		       a.attname  AS column_name
+		FROM pg_attribute a
+		JOIN pg_class c     ON c.oid = a.attrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public'
+		  AND c.relkind = 'r'
+		  AND a.attgenerated = 's'
+		  AND a.attnum > 0
+		  AND NOT a.attisdropped
+		ORDER BY c.relname, a.attnum`)
+	if err != nil {
+		// pg_attribute.attgenerated doesn't exist on PG < 12; ignore gracefully.
+		return
+	}
+	defer rows.Close()
+
+	genCols := make(map[string][]string)
+	for rows.Next() {
+		var tableName, colName string
+		if err := rows.Scan(&tableName, &colName); err != nil {
+			return
+		}
+		genCols[tableName] = append(genCols[tableName], colName)
+	}
+
+	for tableName, cols := range genCols {
+		if meta, ok := tables[tableName]; ok {
+			meta.GeneratedCols = cols
+			tables[tableName] = meta
+		}
+	}
+}
+
 // DetectSequenceOffsets queries Prod for the current max PK value per table
 // and computes Shadow sequence start values.
 func DetectSequenceOffsets(ctx context.Context, conn *pgx.Conn, tables map[string]TableMeta) (map[string]SequenceOffset, error) {
@@ -596,6 +640,10 @@ func FullDump(ctx context.Context, conn *pgx.Conn, dsn *connstr.ProdDSN, image s
 	}); err != nil {
 		return nil, fmt.Errorf("table metadata detection failed: %w", err)
 	}
+
+	// Detect GENERATED ALWAYS AS STORED columns so hydration INSERTs can
+	// exclude them (PostgreSQL rejects explicit values for generated columns).
+	DetectGeneratedColumns(ctx, conn, tables)
 
 	var sequences map[string]SequenceOffset
 	if err := retryOnConflict(maxRetries, func() error {

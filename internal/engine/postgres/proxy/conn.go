@@ -333,14 +333,15 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	var txh *TxnHandler
 	if p.deltaMap != nil && p.tombstones != nil {
 		txh = &TxnHandler{
-			prodConn:   prodConn,
-			shadowConn: shadowConn,
-			deltaMap:   p.deltaMap,
-			tombstones: p.tombstones,
-			moriDir:    p.moriDir,
-			connID:     connID,
-			verbose:    p.verbose,
-			logger:     p.logger,
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			schemaRegistry: p.schemaRegistry,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
 		}
 	}
 
@@ -826,7 +827,13 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 		return routeDecision{target: targetShadow, classification: classification, strategy: strategy}
 
 	default:
-		// ProdDirect, Other
+		// ProdDirect, Other — but override metadata queries about dirty tables
+		// so that \d and information_schema queries reflect Shadow schema.
+		if classification != nil && classification.IsMetadataQuery &&
+			classification.IntrospectedTable != "" && p.schemaRegistry != nil &&
+			p.schemaRegistry.HasDiff(classification.IntrospectedTable) {
+			return routeDecision{target: targetShadow, classification: classification, strategy: strategy}
+		}
 		return routeDecision{target: targetProd, strategy: strategy}
 	}
 }
