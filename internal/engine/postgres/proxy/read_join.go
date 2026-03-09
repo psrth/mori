@@ -2,8 +2,11 @@ package proxy
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"strings"
+
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 
 	"github.com/mori-dev/mori/internal/core"
 )
@@ -70,39 +73,20 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 		}
 	}
 
-	// Rewrite Prod SQL for schema diffs (added/renamed/dropped columns).
-	prodSQL := effectiveSQL
-	skipProd := false
+	// Handle schema diffs via materialization instead of rewriteSQLForProd.
+	// rewriteSQLForProd uses parse→modify AST→deparse which can corrupt CROSS JOINs
+	// by dropping the right-hand table from the FROM clause. Materialization avoids
+	// this by only rewriting table names (RangeVar nodes), preserving JOIN structure.
 	if rh.schemaRegistry != nil {
 		for _, t := range cl.Tables {
 			if rh.schemaRegistry.HasDiff(t) {
-				// Use rewriteSQLForProd to strip shadow-only columns from the entire query.
-				rewritten, shouldSkip := rewriteSQLForProd(prodSQL, rh.schemaRegistry, cl.Tables)
-				if shouldSkip {
-					skipProd = true
-				} else {
-					prodSQL = rewritten
-				}
-				break // Only need to rewrite once for all tables
+				return rh.handleJoinWithMaterialization(cl, querySQL)
 			}
 		}
 	}
 
-	// If skipProd is true, the query cannot be meaningfully executed on Prod
-	// (e.g., JOIN condition references a shadow-only column). Use Shadow only.
-	if skipProd {
-		shadowResult, err := execQuery(rh.shadowConn, querySQL)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("shadow JOIN query (skip prod): %w", err)
-		}
-		if shadowResult.Error != "" {
-			return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
-		}
-		return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
-	}
-
-	// Step 1: Execute JOIN on Prod (use rewritten SQL if schema diffs exist).
-	prodResult, err := execQuery(rh.prodConn, prodSQL)
+	// Step 1: Execute JOIN on Prod (no schema diffs at this point).
+	prodResult, err := execQuery(rh.prodConn, effectiveSQL)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("prod JOIN query: %w", err)
 	}
@@ -217,112 +201,93 @@ func (rh *ReadHandler) joinPatchCore(cl *core.Classification, querySQL string) (
 }
 
 // joinPatchWithSchemaDiffs handles JOINs where tables have schema diffs but
-// no delta rows. It rewrites the Prod SQL, adapts columns, and merges with Shadow.
+// no delta rows. It delegates to handleJoinWithMaterialization to avoid the
+// parse→modify AST→deparse roundtrip that can corrupt CROSS JOIN structure.
 func (rh *ReadHandler) joinPatchWithSchemaDiffs(cl *core.Classification, querySQL string, injectedPKs map[string]string) (
+	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
+) {
+	return rh.handleJoinWithMaterialization(cl, querySQL)
+}
+
+// handleJoinWithMaterialization handles JOINs where tables have schema diffs
+// by materializing dirty tables into temp tables and executing on shadow.
+// This avoids the parse→modify AST→deparse roundtrip of rewriteSQLForProd,
+// which can corrupt CROSS JOIN structure (dropping the right-hand table from
+// the FROM clause). Instead, we only rewrite RangeVar table names — which is
+// safe because it doesn't change the JOIN structure.
+func (rh *ReadHandler) handleJoinWithMaterialization(cl *core.Classification, querySQL string) (
 	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
 ) {
 	// Check if any table is fully shadowed — must use Shadow only.
 	if rh.schemaRegistry != nil {
 		for _, t := range cl.Tables {
 			if rh.schemaRegistry.IsFullyShadowed(t) {
-				shadowResult, err := execQuery(rh.shadowConn, querySQL)
-				if err != nil {
-					return nil, nil, nil, fmt.Errorf("shadow JOIN query (fully shadowed): %w", err)
-				}
-				if shadowResult.Error != "" {
-					return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
-				}
-				return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+				return rh.shadowOnlyQuery(querySQL)
 			}
 		}
 	}
 
-	// Rewrite Prod SQL for schema diffs.
-	prodSQL := querySQL
-	if rh.schemaRegistry != nil {
-		rewritten, shouldSkip := rewriteSQLForProd(querySQL, rh.schemaRegistry, cl.Tables)
-		if shouldSkip {
-			// Shadow-only execution.
-			shadowResult, err := execQuery(rh.shadowConn, querySQL)
-			if err != nil {
-				return nil, nil, nil, fmt.Errorf("shadow JOIN query (skip prod): %w", err)
+	var utilTables []string
+	defer func() {
+		for _, ut := range utilTables {
+			dropUtilTable(rh.shadowConn, ut)
+		}
+	}()
+
+	// Materialize each dirty table with schema diffs into a temp table.
+	tableMap := make(map[string]string)
+	for _, table := range cl.Tables {
+		if !rh.isTableDirty(table) {
+			continue
+		}
+		selectSQL := fmt.Sprintf("SELECT * FROM %s", quoteIdent(table))
+		utilName, mErr := rh.materializeSubquery(selectSQL, table)
+		if mErr != nil {
+			if rh.verbose {
+				log.Printf("[conn %d] JOIN materialization failed for %s: %v", rh.connID, table, mErr)
 			}
-			if shadowResult.Error != "" {
-				return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
-			}
-			return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+			// Materialization failed — fall back to shadow-only.
+			return rh.shadowOnlyQuery(querySQL)
 		}
-		prodSQL = rewritten
+		tableMap[table] = utilName
+		utilTables = append(utilTables, utilName)
 	}
 
-	// Execute on Prod with rewritten SQL.
-	prodResult, err := execQuery(rh.prodConn, prodSQL)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("prod JOIN query: %w", err)
-	}
-	if prodResult.Error != "" {
-		// If Prod query fails due to schema mismatch, fall back to Shadow-only.
-		shadowResult, err := execQuery(rh.shadowConn, querySQL)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("shadow JOIN query (prod error fallback): %w", err)
-		}
-		if shadowResult.Error != "" {
-			return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
-		}
-		return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+	if len(tableMap) == 0 {
+		// No dirty tables — execute on shadow as-is.
+		return rh.shadowOnlyQuery(querySQL)
 	}
 
-	// Adapt Prod columns and rows for schema diffs.
-	adaptedColumns := prodResult.Columns
-	adaptedValues := prodResult.RowValues
-	adaptedNulls := prodResult.RowNulls
-	if rh.schemaRegistry != nil {
-		for _, t := range cl.Tables {
-			if rh.schemaRegistry.HasDiff(t) {
-				adaptedColumns = rh.adaptColumns(t, adaptedColumns)
-				adaptedValues, adaptedNulls = rh.adaptRows(t, prodResult.Columns, adaptedValues, adaptedNulls)
-			}
-		}
+	// Parse the original SQL and rewrite table references to temp tables.
+	result, parseErr := pg_query.Parse(querySQL)
+	if parseErr != nil {
+		return rh.shadowOnlyQuery(querySQL)
+	}
+	stmts := result.GetStmts()
+	if len(stmts) == 0 {
+		return rh.shadowOnlyQuery(querySQL)
+	}
+	rewriteTableRefsInNode(stmts[0].GetStmt(), tableMap)
+
+	rewrittenSQL, deparseErr := pg_query.Deparse(result)
+	if deparseErr != nil {
+		return rh.shadowOnlyQuery(querySQL)
 	}
 
-	// Execute on Shadow to get the canonical column set and any Shadow-only rows.
-	shadowResult, err := execQuery(rh.shadowConn, querySQL)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("shadow JOIN query: %w", err)
+	if rh.verbose {
+		log.Printf("[conn %d] JOIN materialized rewrite: %s", rh.connID, truncateSQL(rewrittenSQL, 200))
 	}
 
-	// Merge Shadow + adapted Prod. Shadow rows first (priority).
-	resultColumns := adaptedColumns
-	if len(shadowResult.Columns) > 0 && shadowResult.Error == "" {
-		resultColumns = shadowResult.Columns
+	// Execute the rewritten query on shadow.
+	shadowResult, execErr := execQuery(rh.shadowConn, rewrittenSQL)
+	if execErr != nil {
+		return nil, nil, nil, fmt.Errorf("shadow JOIN query (materialized): %w", execErr)
+	}
+	if shadowResult.Error != "" {
+		return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
 	}
 
-	var mergedValues [][]string
-	var mergedNulls [][]bool
-
-	if shadowResult.Error == "" {
-		mergedValues = append(mergedValues, shadowResult.RowValues...)
-		mergedNulls = append(mergedNulls, shadowResult.RowNulls...)
-	}
-	mergedValues = append(mergedValues, adaptedValues...)
-	mergedNulls = append(mergedNulls, adaptedNulls...)
-
-	// Deduplicate by composite key.
-	allPKIndices := rh.findPKIndicesForJoin(cl.Tables, resultColumns, injectedPKs)
-	mergedValues, mergedNulls = rh.dedupJoin(cl.Tables, allPKIndices, resultColumns, mergedValues, mergedNulls)
-
-	// Re-sort by ORDER BY.
-	if cl.OrderBy != "" {
-		sortMerged(resultColumns, mergedValues, mergedNulls, cl.OrderBy)
-	}
-
-	// Apply LIMIT.
-	if cl.HasLimit && cl.Limit > 0 && len(mergedValues) > cl.Limit {
-		mergedValues = mergedValues[:cl.Limit]
-		mergedNulls = mergedNulls[:cl.Limit]
-	}
-
-	return resultColumns, mergedValues, mergedNulls, nil
+	return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
 }
 
 // anyTableSchemaModified reports whether any of the given tables have schema diffs.

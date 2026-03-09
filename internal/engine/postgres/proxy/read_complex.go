@@ -134,6 +134,18 @@ func (rh *ReadHandler) complexReadCore(cl *core.Classification, querySQL string)
 		}
 	}
 
+	// Materialize dirty plain RangeVar tables in FROM clause.
+	// This handles cases like LATERAL joins or CROSS JOINs where the outer
+	// table is a plain RangeVar (not a derived table or CTE) but is dirty.
+	{
+		tableMap := make(map[string]string)
+		rh.collectDirtyRangeVarsFromNodes(sel.GetFromClause(), tableMap, &utilTables)
+		if len(tableMap) > 0 {
+			rewriteTableRefsInNode(stmts[0].GetStmt(), tableMap)
+			modified = true
+		}
+	}
+
 	if !modified {
 		// Nothing was dirty -- execute on shadow as-is.
 		return rh.shadowOnlyQuery(querySQL)
@@ -185,25 +197,59 @@ func (rh *ReadHandler) rewriteDerivedTables(node *pg_query.Node) (*pg_query.Node
 					alias = "_mori_derived"
 				}
 
-				utilName, err := rh.materializeSubquery(subSQL, alias)
-				if err == nil {
-					utilTables = append(utilTables, utilName)
-					// Replace with a RangeVar pointing to the temp table.
-					newNode := &pg_query.Node{
-						Node: &pg_query.Node_RangeVar{
-							RangeVar: &pg_query.RangeVar{
-								Relname: utilName,
-								Inh:     true,
+				if rs.GetLateral() {
+					// LATERAL subqueries reference columns from outer tables, so they
+					// cannot be executed as standalone queries (causes "missing
+					// FROM-clause entry" errors). Instead, materialize the dirty base
+					// tables that the LATERAL references into temp tables, rewrite
+					// table references inside the subquery to point at the temp
+					// tables, and let PostgreSQL handle the LATERAL join natively.
+					tables, tErr := classifyForDirtyCheck(subSQL)
+					if tErr == nil {
+						seen := make(map[string]bool)
+						tableMap := make(map[string]string)
+						for _, table := range tables {
+							if seen[table] || !rh.isTableDirty(table) {
+								continue
+							}
+							seen[table] = true
+							selectSQL := fmt.Sprintf("SELECT * FROM %s", quoteIdent(table))
+							utilName, mErr := rh.materializeSubquery(selectSQL, table)
+							if mErr != nil {
+								if rh.verbose {
+									log.Printf("[conn %d] LATERAL base table materialization failed for %s: %v", rh.connID, table, mErr)
+								}
+								continue
+							}
+							tableMap[table] = utilName
+							utilTables = append(utilTables, utilName)
+						}
+						if len(tableMap) > 0 {
+							rewriteTableRefsInNode(subquery, tableMap)
+							modified = true
+						}
+					}
+				} else {
+					utilName, err := rh.materializeSubquery(subSQL, alias)
+					if err == nil {
+						utilTables = append(utilTables, utilName)
+						// Replace with a RangeVar pointing to the temp table.
+						newNode := &pg_query.Node{
+							Node: &pg_query.Node_RangeVar{
+								RangeVar: &pg_query.RangeVar{
+									Relname: utilName,
+									Inh:     true,
+								},
 							},
-						},
+						}
+						// Preserve the alias so outer query column references still resolve.
+						if a := rs.GetAlias(); a != nil {
+							newNode.GetRangeVar().Alias = a
+						}
+						return newNode, true, utilTables
+					} else if rh.verbose {
+						log.Printf("[conn %d] derived table materialization failed for %s: %v", rh.connID, alias, err)
 					}
-					// Preserve the alias so outer query column references still resolve.
-					if a := rs.GetAlias(); a != nil {
-						newNode.GetRangeVar().Alias = a
-					}
-					return newNode, true, utilTables
-				} else if rh.verbose {
-					log.Printf("[conn %d] derived table materialization failed for %s: %v", rh.connID, alias, err)
 				}
 			}
 		}
@@ -356,6 +402,47 @@ func (rh *ReadHandler) materializeDirtyBaseTables(
 	return tableMap, utilTables, len(tableMap) > 0
 }
 
+// collectDirtyRangeVarsFromNodes walks FROM clause nodes and materializes any
+// dirty plain RangeVar tables into temp tables. It recurses into JoinExpr
+// children to find nested RangeVar nodes. The tableMap is populated with
+// original→temp table mappings and utilTables is appended with new temp names.
+func (rh *ReadHandler) collectDirtyRangeVarsFromNodes(nodes []*pg_query.Node, tableMap map[string]string, utilTables *[]string) {
+	for _, node := range nodes {
+		rh.collectDirtyRangeVarsFromNode(node, tableMap, utilTables)
+	}
+}
+
+func (rh *ReadHandler) collectDirtyRangeVarsFromNode(node *pg_query.Node, tableMap map[string]string, utilTables *[]string) {
+	if node == nil {
+		return
+	}
+	if rv := node.GetRangeVar(); rv != nil {
+		tableName := rv.GetRelname()
+		if s := rv.GetSchemaname(); s != "" {
+			tableName = s + "." + tableName
+		}
+		if _, already := tableMap[tableName]; already {
+			return
+		}
+		if rh.isTableDirty(tableName) {
+			selectSQL := fmt.Sprintf("SELECT * FROM %s", quoteIdent(tableName))
+			utilName, mErr := rh.materializeSubquery(selectSQL, tableName)
+			if mErr != nil {
+				if rh.verbose {
+					log.Printf("[conn %d] plain RangeVar materialization failed for %s: %v", rh.connID, tableName, mErr)
+				}
+				return
+			}
+			tableMap[tableName] = utilName
+			*utilTables = append(*utilTables, utilName)
+		}
+	}
+	if je := node.GetJoinExpr(); je != nil {
+		rh.collectDirtyRangeVarsFromNode(je.GetLarg(), tableMap, utilTables)
+		rh.collectDirtyRangeVarsFromNode(je.GetRarg(), tableMap, utilTables)
+	}
+}
+
 // isTableDirty checks if a single table has deltas, tombstones, or schema diffs.
 func (rh *ReadHandler) isTableDirty(table string) bool {
 	if rh.deltaMap != nil && rh.deltaMap.CountForTable(table) > 0 {
@@ -383,6 +470,12 @@ func rewriteTableRefsInNode(node *pg_query.Node, tableMap map[string]string) {
 			name = s + "." + name
 		}
 		if utilName, ok := tableMap[name]; ok {
+			// Preserve the original table name as an alias so that qualified
+			// column references (e.g. tags.color) still resolve after the
+			// RangeVar is rewritten to the temp table name.
+			if rv.GetAlias() == nil || rv.GetAlias().GetAliasname() == "" {
+				rv.Alias = &pg_query.Alias{Aliasname: rv.GetRelname()}
+			}
 			rv.Relname = utilName
 			rv.Schemaname = "" // Temp tables have no schema prefix.
 		}
