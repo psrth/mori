@@ -256,8 +256,8 @@ func (w *WriteHandler) handleUpsert(
 			affectedPKs = append(affectedPKs, prodResult.RowValues[0][pkIdx])
 		}
 
-		// Hydrate: insert the Prod row into Shadow.
-		insertSQL := buildInsertSQL(table, prodResult.Columns, prodResult.RowValues[0], prodResult.RowNulls[0])
+		// Hydrate: insert the Prod row into Shadow, skipping generated columns.
+		insertSQL := buildInsertSQL(table, prodResult.Columns, prodResult.RowValues[0], prodResult.RowNulls[0], toSkipSet(meta.GeneratedCols))
 		shadowInsertResult, err := execQuery(w.shadowConn, insertSQL)
 		if err != nil {
 			if w.verbose {

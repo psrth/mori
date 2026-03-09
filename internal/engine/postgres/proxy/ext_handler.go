@@ -394,11 +394,12 @@ func (eh *ExtHandler) handleExtUpdate(clientConn net.Conn, batchRaw []byte, cl *
 		}
 	}
 
-	// Bulk update (no extractable PKs): delegate to WriteHandler's bulk path.
+	// Bulk update (no extractable PKs): use ext-specific bulk path that
+	// reconstructs full SQL (resolving $N parameters) before hydration.
 	if len(cl.PKs) == 0 {
 		if !cl.IsJoin && len(cl.Tables) == 1 {
 			if meta, ok := eh.tables[cl.Tables[0]]; ok && len(meta.PKColumns) > 0 {
-				return eh.writeHandler.handleBulkUpdate(clientConn, batchRaw, cl)
+				return eh.handleExtBulkUpdate(clientConn, batchRaw, cl)
 			}
 		}
 		// Fallback: forward to Shadow without hydration.
@@ -440,6 +441,182 @@ func (eh *ExtHandler) handleExtUpdate(clientConn net.Conn, batchRaw []byte, cl *
 			}
 		}
 	}
+	return nil
+}
+
+// handleExtBulkUpdate handles UPDATE with no extractable PKs in the extended
+// query protocol. Unlike the simple protocol path (handleBulkUpdate), this
+// method reconstructs the full SQL (resolving $N parameter placeholders) before
+// building the hydration query. Without this, the hydration query sent to Prod
+// contains unresolved $N placeholders, Prod rejects it, and the fallback
+// shadow-only execution sees 0 matching rows because the data was never hydrated.
+//
+// After hydration, the UPDATE is rewritten with concrete PK values (WHERE id IN (...))
+// and executed on Shadow. The response is wrapped in proper extended protocol
+// framing (ParseComplete + BindComplete + CommandComplete + ReadyForQuery).
+func (eh *ExtHandler) handleExtBulkUpdate(clientConn net.Conn, batchRaw []byte, cl *core.Classification) error {
+	table := cl.Tables[0]
+	meta := eh.tables[table]
+	pkCol := meta.PKColumns[0]
+
+	// Reconstruct full SQL with parameters resolved.
+	fullSQL := eh.batchSQL
+	if len(eh.batchParams) > 0 {
+		fullSQL = reconstructSQL(eh.batchSQL, eh.batchParams, eh.batchFormatCodes)
+	}
+
+	// Build hydration query from the parameter-resolved SQL.
+	selectSQL, err := buildBulkHydrationQuery(fullSQL)
+	if err != nil {
+		if eh.verbose {
+			log.Printf("[conn %d] ext bulk UPDATE: failed to build hydration query: %v", eh.connID, err)
+		}
+		return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+	}
+
+	// Rewrite hydration query for Prod compatibility (strip shadow-only columns).
+	if eh.schemaRegistry != nil {
+		rewritten, skipProd := rewriteSQLForProd(selectSQL, eh.schemaRegistry, cl.Tables)
+		if skipProd {
+			if eh.verbose {
+				log.Printf("[conn %d] ext bulk UPDATE: hydration query irrelevant for Prod, Shadow-only", eh.connID)
+			}
+			return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+		}
+		selectSQL = rewritten
+	}
+
+	// Execute hydration query on Prod.
+	result, err := execQuery(eh.prodConn, selectSQL)
+	if err != nil {
+		if eh.verbose {
+			log.Printf("[conn %d] ext bulk UPDATE: Prod query failed: %v", eh.connID, err)
+		}
+		return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+	}
+	if result.Error != "" {
+		if eh.verbose {
+			log.Printf("[conn %d] ext bulk UPDATE: Prod query error: %s", eh.connID, result.Error)
+		}
+		return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+	}
+
+	// Find PK column index in results.
+	pkIdx := -1
+	for i, col := range result.Columns {
+		if col.Name == pkCol {
+			pkIdx = i
+			break
+		}
+	}
+	if pkIdx == -1 {
+		return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+	}
+
+	// Hydrate each matching row into Shadow.
+	skipCols := toSkipSet(meta.GeneratedCols)
+	var affectedPKs []string
+	for i, row := range result.RowValues {
+		if result.RowNulls[i][pkIdx] {
+			continue
+		}
+		pk := row[pkIdx]
+
+		if eh.deltaMap != nil && eh.deltaMap.IsDelta(table, pk) {
+			affectedPKs = append(affectedPKs, pk)
+			continue
+		}
+
+		insertSQL := buildInsertSQL(table, result.Columns, row, result.RowNulls[i], skipCols)
+		shadowResult, sErr := execQuery(eh.shadowConn, insertSQL)
+		if sErr != nil {
+			if eh.verbose {
+				log.Printf("[conn %d] ext bulk UPDATE: hydration INSERT failed for PK %s: %v", eh.connID, pk, sErr)
+			}
+			continue
+		}
+		if shadowResult.Error != "" {
+			if eh.verbose {
+				log.Printf("[conn %d] ext bulk UPDATE: hydration INSERT for PK %s: %s", eh.connID, pk, shadowResult.Error)
+			}
+			continue
+		}
+		affectedPKs = append(affectedPKs, pk)
+	}
+
+	// Hydrate cross-table references (subqueries in SET/WHERE).
+	eh.writeHandler.hydrateReferencedTables(fullSQL, table)
+
+	// Rewrite UPDATE with concrete PKs and execute on Shadow.
+	// Use execQuery (simple query) internally, then wrap in ext protocol response.
+	var cmdTag string
+	if len(affectedPKs) > 0 {
+		rewrittenSQL, rewriteErr := buildRewrittenUpdateWithPKs(fullSQL, pkCol, affectedPKs)
+		if rewriteErr != nil {
+			if eh.verbose {
+				log.Printf("[conn %d] ext bulk UPDATE: rewrite failed, forwarding original: %v", eh.connID, rewriteErr)
+			}
+			return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+		}
+
+		if eh.verbose {
+			log.Printf("[conn %d] ext bulk UPDATE: rewritten with %d PKs: %s", eh.connID, len(affectedPKs), truncateSQL(rewrittenSQL, 200))
+		}
+
+		shadowResult, execErr := execQuery(eh.shadowConn, rewrittenSQL)
+		if execErr != nil {
+			return forwardAndRelay(batchRaw, eh.shadowConn, clientConn)
+		}
+		if shadowResult.Error != "" {
+			// Relay the error in ext protocol framing.
+			var resp []byte
+			if eh.batchHasParse {
+				resp = append(resp, buildParseCompleteMsg()...)
+			}
+			if eh.batchHasBind {
+				resp = append(resp, buildBindCompleteMsg()...)
+			}
+			resp = append(resp, shadowResult.RawMsgs...)
+			_, writeErr := clientConn.Write(resp)
+			return writeErr
+		}
+		cmdTag = shadowResult.CommandTag
+	} else {
+		cmdTag = "UPDATE 0"
+	}
+
+	// Build extended protocol response.
+	var resp []byte
+	if eh.batchHasParse {
+		resp = append(resp, buildParseCompleteMsg()...)
+	}
+	if eh.batchHasBind {
+		resp = append(resp, buildBindCompleteMsg()...)
+	}
+	resp = append(resp, buildCommandCompleteMsg(cmdTag)...)
+	resp = append(resp, buildReadyForQueryMsg()...)
+	if _, writeErr := clientConn.Write(resp); writeErr != nil {
+		return fmt.Errorf("relaying ext bulk UPDATE response: %w", writeErr)
+	}
+
+	// Track all affected PKs in the delta map.
+	if eh.deltaMap != nil {
+		for _, pk := range affectedPKs {
+			if eh.inTxn() {
+				eh.deltaMap.Stage(table, pk)
+			} else {
+				eh.deltaMap.Add(table, pk)
+			}
+		}
+		if !eh.inTxn() {
+			if err := delta.WriteDeltaMap(eh.moriDir, eh.deltaMap); err != nil {
+				if eh.verbose {
+					log.Printf("[conn %d] ext: failed to persist delta map: %v", eh.connID, err)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 

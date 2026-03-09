@@ -167,6 +167,7 @@ func (w *WriteHandler) handleBulkUpdate(
 	}
 
 	// 4. Hydrate each matching row into Shadow.
+	skipCols := toSkipSet(meta.GeneratedCols)
 	var affectedPKs []string
 	hydratedCount := 0
 	for i, row := range result.RowValues {
@@ -174,13 +175,13 @@ func (w *WriteHandler) handleBulkUpdate(
 			continue // NULL PK, skip.
 		}
 		pk := row[pkIdx]
-		affectedPKs = append(affectedPKs, pk)
 
 		if w.deltaMap.IsDelta(table, pk) {
+			affectedPKs = append(affectedPKs, pk)
 			continue // Already in Shadow.
 		}
 
-		insertSQL := buildInsertSQL(table, result.Columns, row, result.RowNulls[i])
+		insertSQL := buildInsertSQL(table, result.Columns, row, result.RowNulls[i], skipCols)
 		shadowResult, err := execQuery(w.shadowConn, insertSQL)
 		if err != nil {
 			if w.verbose {
@@ -188,9 +189,13 @@ func (w *WriteHandler) handleBulkUpdate(
 			}
 			continue
 		}
-		if shadowResult.Error != "" && w.verbose {
-			log.Printf("[conn %d] bulk UPDATE: hydration INSERT for PK %s: %s", w.connID, pk, shadowResult.Error)
+		if shadowResult.Error != "" {
+			if w.verbose {
+				log.Printf("[conn %d] bulk UPDATE: hydration INSERT for PK %s: %s", w.connID, pk, shadowResult.Error)
+			}
+			continue
 		}
+		affectedPKs = append(affectedPKs, pk)
 		hydratedCount++
 	}
 
@@ -201,12 +206,36 @@ func (w *WriteHandler) handleBulkUpdate(
 	// 5. Hydrate cross-table references (subqueries in SET/WHERE) from Prod.
 	w.hydrateReferencedTables(cl.RawSQL, table)
 
-	// 6. Execute the original UPDATE on Shadow.
-	if err := forwardAndRelay(rawMsg, w.shadowConn, clientConn); err != nil {
-		return err
+	// 6. Execute UPDATE on Shadow. If we discovered concrete PKs, rewrite the WHERE
+	// clause to use pk IN (...) instead of the original WHERE (which may contain
+	// subqueries that reference tables not fully available in Shadow). This mirrors
+	// the bulk DELETE pattern — resolve PKs on Prod, execute with concrete values on Shadow.
+	if len(affectedPKs) > 0 {
+		rewrittenSQL, rewriteErr := buildRewrittenUpdateWithPKs(cl.RawSQL, pkCol, affectedPKs)
+		if rewriteErr != nil {
+			if w.verbose {
+				log.Printf("[conn %d] bulk UPDATE: rewrite failed, using original: %v", w.connID, rewriteErr)
+			}
+			if err := forwardAndRelay(rawMsg, w.shadowConn, clientConn); err != nil {
+				return err
+			}
+		} else {
+			if w.verbose {
+				log.Printf("[conn %d] bulk UPDATE: rewritten with %d PKs: %s", w.connID, len(affectedPKs), truncateSQL(rewrittenSQL, 200))
+			}
+			rewrittenMsg := buildQueryMsg(rewrittenSQL)
+			if err := forwardAndRelay(rewrittenMsg, w.shadowConn, clientConn); err != nil {
+				return err
+			}
+		}
+	} else {
+		// No matching rows — forward original (will return 0 rows).
+		if err := forwardAndRelay(rawMsg, w.shadowConn, clientConn); err != nil {
+			return err
+		}
 	}
 
-	// 6. Track all affected PKs in the delta map.
+	// 7. Track all affected PKs in the delta map.
 	for _, pk := range affectedPKs {
 		if w.inTxn() {
 			w.deltaMap.Stage(table, pk)
@@ -435,8 +464,9 @@ func (w *WriteHandler) hydrateRow(table, pk string) error {
 		return nil // Row doesn't exist in Prod; nothing to hydrate.
 	}
 
-	// Build and execute INSERT into Shadow.
-	insertSQL := buildInsertSQL(table, result.Columns, result.RowValues[0], result.RowNulls[0])
+	// Build and execute INSERT into Shadow, skipping generated columns.
+	skipCols := toSkipSet(meta.GeneratedCols)
+	insertSQL := buildInsertSQL(table, result.Columns, result.RowValues[0], result.RowNulls[0], skipCols)
 
 	shadowResult, err := execQuery(w.shadowConn, insertSQL)
 	if err != nil {
@@ -509,9 +539,10 @@ func (w *WriteHandler) hydrateReferencedTables(rawSQL string, targetTable string
 			continue
 		}
 
+		refSkipCols := toSkipSet(w.tables[refTable].GeneratedCols)
 		inserted := 0
 		for i, row := range result.RowValues {
-			insertSQL := buildInsertSQL(refTable, result.Columns, row, result.RowNulls[i])
+			insertSQL := buildInsertSQL(refTable, result.Columns, row, result.RowNulls[i], refSkipCols)
 			shadowResult, err := execQuery(w.shadowConn, insertSQL)
 			if err != nil {
 				continue
@@ -877,4 +908,63 @@ func collectRangeVarsFromSelectStmt(sel *pg_query.SelectStmt, seen map[string]bo
 	}
 	// Recurse into WHERE for nested subqueries.
 	collectRangeVarsFromNode(sel.GetWhereClause(), seen)
+}
+
+// buildRewrittenUpdateWithPKs takes an UPDATE statement and replaces its WHERE
+// clause with `pk_col IN (v1, v2, ...)` using concrete PK values discovered
+// from Prod. This avoids re-evaluating subqueries in the WHERE clause on Shadow,
+// where referenced tables may not have the correct data.
+//
+// The SET clause, FROM clause, and RETURNING clause are preserved from the original.
+func buildRewrittenUpdateWithPKs(rawSQL string, pkCol string, pkValues []string) (string, error) {
+	parseResult, err := pg_query.Parse(rawSQL)
+	if err != nil {
+		return "", fmt.Errorf("parse: %w", err)
+	}
+	stmts := parseResult.GetStmts()
+	if len(stmts) == 0 {
+		return "", fmt.Errorf("no statements found")
+	}
+	upd := stmts[0].GetStmt().GetUpdateStmt()
+	if upd == nil {
+		return "", fmt.Errorf("not an UPDATE statement")
+	}
+
+	// Build IN list values.
+	inValues := make([]*pg_query.Node, len(pkValues))
+	for i, pk := range pkValues {
+		inValues[i] = &pg_query.Node{
+			Node: &pg_query.Node_AConst{AConst: &pg_query.A_Const{
+				Val: &pg_query.A_Const_Sval{Sval: &pg_query.String{Sval: pk}},
+			}},
+		}
+	}
+
+	// Replace WHERE clause with pk_col IN (v1, v2, ...).
+	upd.WhereClause = &pg_query.Node{
+		Node: &pg_query.Node_AExpr{AExpr: &pg_query.A_Expr{
+			Kind: pg_query.A_Expr_Kind_AEXPR_IN,
+			Name: []*pg_query.Node{
+				{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: "="}}},
+			},
+			Lexpr: &pg_query.Node{
+				Node: &pg_query.Node_ColumnRef{ColumnRef: &pg_query.ColumnRef{
+					Fields: []*pg_query.Node{
+						{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: pkCol}}},
+					},
+				}},
+			},
+			Rexpr: &pg_query.Node{
+				Node: &pg_query.Node_List{List: &pg_query.List{
+					Items: inValues,
+				}},
+			},
+		}},
+	}
+
+	sql, err := pg_query.Deparse(parseResult)
+	if err != nil {
+		return "", fmt.Errorf("deparse: %w", err)
+	}
+	return sql, nil
 }

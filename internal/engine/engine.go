@@ -13,8 +13,9 @@ import (
 
 // TableMeta holds engine-agnostic table metadata.
 type TableMeta struct {
-	PKColumns []string
-	PKType    string // "serial", "bigserial", "uuid", "composite", "none"
+	PKColumns     []string
+	PKType        string // "serial", "bigserial", "uuid", "composite", "none"
+	GeneratedCols []string
 }
 
 // ConnInfo holds parsed connection string components.
