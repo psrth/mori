@@ -87,6 +87,9 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 	ui.StepDone(fmt.Sprintf("%d tables detected", len(tables)))
 
+	// 7b. Detect generated columns.
+	tables, _ = schema.DetectGeneratedColumns(ctx, prodDB, tables)
+
 	// 8. Detect auto-increment offsets.
 	offsets, err := schema.DetectSequenceOffsets(ctx, prodDB, tables)
 	if err != nil {

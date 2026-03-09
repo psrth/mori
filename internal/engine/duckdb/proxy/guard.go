@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -63,7 +64,7 @@ func looksLikeWrite(sql string) bool {
 	}
 
 	writePrefixes := []string{
-		"INSERT", "UPDATE", "DELETE",
+		"INSERT", "UPDATE", "DELETE", "TRUNCATE",
 		"CREATE", "ALTER", "DROP",
 		"COPY", "EXPORT", "IMPORT",
 	}
@@ -82,6 +83,26 @@ func looksLikeWrite(sql string) bool {
 	}
 
 	return false
+}
+
+// safeProdExec wraps a prod database query execution with an L2 write guard.
+// It checks whether the SQL looks like a write and blocks it if so.
+func safeProdExec(_ *sql.DB, sqlStr string, connID int64, logger *logging.Logger, _ bool) ([]byte, bool) {
+	if looksLikeWrite(sqlStr) {
+		msg := fmt.Sprintf("[CRITICAL] [conn %d] WRITE GUARD L2: write detected in Prod path — BLOCKED: %s",
+			connID, truncateSQL(sqlStr, 80))
+		log.Printf("%s", msg)
+		if logger != nil {
+			logger.Log(logging.LogEntry{
+				Level:  "critical",
+				ConnID: connID,
+				Event:  "write_guard_l2",
+				Detail: msg,
+			})
+		}
+		return buildErrorResponse("mori: write operation blocked by L2 guard"), true
+	}
+	return nil, false
 }
 
 func truncateSQL(sql string, maxLen int) string {

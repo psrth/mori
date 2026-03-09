@@ -66,23 +66,48 @@ func (c *DuckDBClassifier) Classify(query string) (*core.Classification, error) 
 		cl.SubType = core.SubCommit
 	case hasPrefix(upper, "ROLLBACK"):
 		cl.OpType = core.OpTransaction
-		cl.SubType = core.SubRollback
-	case hasPrefix(upper, "SAVEPOINT"),
-		hasPrefix(upper, "RELEASE"):
+		// Distinguish full ROLLBACK from ROLLBACK TO SAVEPOINT.
+		if strings.Contains(upper, " TO ") {
+			cl.SubType = core.SubRollback // Handled specially in TxnHandler
+		} else {
+			cl.SubType = core.SubRollback
+		}
+	case hasPrefix(upper, "SAVEPOINT"):
 		cl.OpType = core.OpTransaction
-		cl.SubType = core.SubOther
-	case hasPrefix(upper, "EXPLAIN"),
-		hasPrefix(upper, "DESCRIBE"),
-		hasPrefix(upper, "SHOW"),
+		cl.SubType = core.SubSavepoint
+	case hasPrefix(upper, "RELEASE"):
+		cl.OpType = core.OpTransaction
+		cl.SubType = core.SubRelease
+	case hasPrefix(upper, "TRUNCATE"):
+		c.classifyTruncate(upper, cl)
+	case hasPrefix(upper, "EXPLAIN"):
+		cl.OpType = core.OpOther
+		// EXPLAIN ANALYZE is a write operation (it executes the query).
+		if strings.Contains(upper, "ANALYZE") {
+			cl.SubType = core.SubNotSupported
+			cl.NotSupportedMsg = "mori: EXPLAIN ANALYZE is not supported (it executes the query)"
+		} else {
+			cl.SubType = core.SubExplain
+			cl.Tables = extractFromTables(upper)
+		}
+	case hasPrefix(upper, "SET"),
+		hasPrefix(upper, "RESET"):
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubSet
+	case hasPrefix(upper, "SHOW"):
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubShow
+	case hasPrefix(upper, "COPY"),
+		hasPrefix(upper, "EXPORT"),
+		hasPrefix(upper, "IMPORT"):
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "mori: COPY/EXPORT/IMPORT operations are not supported through the proxy"
+	case hasPrefix(upper, "DESCRIBE"),
 		hasPrefix(upper, "PRAGMA"),
 		hasPrefix(upper, "CALL"),
-		hasPrefix(upper, "SET"),
-		hasPrefix(upper, "RESET"),
 		hasPrefix(upper, "INSTALL"),
 		hasPrefix(upper, "LOAD"),
-		hasPrefix(upper, "COPY"),
-		hasPrefix(upper, "EXPORT"),
-		hasPrefix(upper, "IMPORT"),
 		hasPrefix(upper, "ATTACH"),
 		hasPrefix(upper, "DETACH"):
 		cl.OpType = core.OpOther
@@ -135,6 +160,16 @@ func (c *DuckDBClassifier) classifySelect(raw, upper string, cl *core.Classifica
 
 	cl.HasAggregate = reAggregate.MatchString(upper) || strings.Contains(upper, "GROUP BY")
 	cl.HasSetOp = reSetOp.MatchString(upper)
+	cl.HasWindowFunc = reWindowFunc.MatchString(upper)
+
+	// Detect DISTINCT.
+	selectIdx := strings.Index(upper, "SELECT")
+	if selectIdx >= 0 {
+		afterSelect := strings.TrimSpace(upper[selectIdx+6:])
+		if strings.HasPrefix(afterSelect, "DISTINCT") {
+			cl.HasDistinct = true
+		}
+	}
 
 	if reSubqueryFrom.MatchString(upper) {
 		cl.IsComplexRead = true
@@ -151,12 +186,31 @@ func (c *DuckDBClassifier) classifyInsert(raw, upper string, cl *core.Classifica
 		cl.Tables = appendUnique(cl.Tables, cleanTableName(m[1]))
 	}
 
+	// Detect ON CONFLICT (upsert) — DuckDB supports ON CONFLICT DO UPDATE/NOTHING.
+	if reOnConflict.MatchString(upper) {
+		cl.HasOnConflict = true
+	}
+	// Also detect INSERT OR REPLACE / INSERT OR IGNORE (DuckDB-specific syntax).
+	if reInsertOrReplace.MatchString(upper) {
+		cl.HasOnConflict = true
+	}
+
+	// Detect RETURNING clause.
+	if reReturning.MatchString(upper) {
+		cl.HasReturning = true
+	}
+
 	if idx := strings.Index(upper, "SELECT"); idx > 0 {
 		selectPart := upper[idx:]
 		selectTables := extractFromTables(selectPart)
 		for _, t := range selectTables {
 			cl.Tables = appendUnique(cl.Tables, t)
 		}
+	}
+
+	// For upserts, also extract PKs from the WHERE-like context.
+	if cl.HasOnConflict {
+		cl.PKs = c.extractPKs(raw, cl.Tables)
 	}
 }
 
@@ -167,6 +221,7 @@ func (c *DuckDBClassifier) classifyUpdate(raw, upper string, cl *core.Classifica
 	cl.Tables = extractUpdateTables(upper)
 	cl.IsJoin = len(cl.Tables) > 1
 	cl.PKs = c.extractPKs(raw, cl.Tables)
+	cl.HasReturning = reReturning.MatchString(upper)
 }
 
 func (c *DuckDBClassifier) classifyDelete(raw, upper string, cl *core.Classification) {
@@ -176,6 +231,7 @@ func (c *DuckDBClassifier) classifyDelete(raw, upper string, cl *core.Classifica
 	cl.Tables = extractDeleteTables(upper)
 	cl.IsJoin = len(cl.Tables) > 1
 	cl.PKs = c.extractPKs(raw, cl.Tables)
+	cl.HasReturning = reReturning.MatchString(upper)
 }
 
 func (c *DuckDBClassifier) classifyCreate(upper string, cl *core.Classification) {
@@ -207,7 +263,16 @@ func (c *DuckDBClassifier) classifyDrop(upper string, cl *core.Classification) {
 	}
 }
 
-func (c *DuckDBClassifier) classifyCTE(raw, upper string, cl *core.Classification) {
+func (c *DuckDBClassifier) classifyTruncate(upper string, cl *core.Classification) {
+	cl.OpType = core.OpWrite
+	cl.SubType = core.SubTruncate
+
+	if m := reTruncate.FindStringSubmatch(upper); len(m) > 1 {
+		cl.Tables = appendUnique(cl.Tables, cleanTableName(m[1]))
+	}
+}
+
+func (c *DuckDBClassifier) classifyCTE(_, upper string, cl *core.Classification) {
 	if strings.Contains(upper, "INSERT") ||
 		strings.Contains(upper, "UPDATE") ||
 		strings.Contains(upper, "DELETE") {
@@ -240,26 +305,75 @@ func (c *DuckDBClassifier) extractPKs(raw string, tables []string) []core.TableP
 			continue
 		}
 		for _, pkCol := range meta.PKColumns {
-			// Support both $N (PG-style) and ? (generic) parameter placeholders.
-			pattern := fmt.Sprintf(`(?i)\b%s\s*=\s*(?:'([^']*)'|(\d+)|(\$\d+)|(\?))`, regexp.QuoteMeta(pkCol))
-			re := regexp.MustCompile(pattern)
-			if m := re.FindStringSubmatch(whereClause); len(m) > 0 {
-				val := m[1]
-				if val == "" {
-					val = m[2]
-				}
-				if val == "" {
-					val = m[3]
-				}
-				if val == "" {
-					val = m[4]
-				}
+			val := extractPKValue(whereClause, pkCol)
+			if val != "" {
 				pks = append(pks, core.TablePK{Table: table, PK: val})
 			}
 		}
 	}
 
 	return pks
+}
+
+// extractPKValue extracts the PK value from a WHERE clause for a given column.
+// Supports:
+//   - column = value (and value = column reversal)
+//   - CAST(value AS type) and value::type unwrapping
+//   - Negative numbers, UUID literals, quoted strings
+//   - $N and ? parameter placeholders
+//   - IN clause with single value: column IN ('value')
+func extractPKValue(whereClause, pkCol string) string {
+	quotedCol := regexp.QuoteMeta(pkCol)
+
+	// Pattern: column = value (normal order).
+	// Supports: 'string', negative numbers, positive numbers, $N, ?, CAST(...), value::type, UUID
+	normalPattern := fmt.Sprintf(`(?i)\b%s\s*=\s*(?:`+
+		`'([^']*)'`+ // group 1: quoted string
+		`|(-?\d+(?:\.\d+)?)`+ // group 2: number (possibly negative)
+		`|(\$\d+)`+ // group 3: $N param
+		`|(\?)`+ // group 4: ? param
+		`|CAST\s*\(\s*'([^']*)'\s+AS\s+\w+\s*\)`+ // group 5: CAST('val' AS type)
+		`|'([^']*)'::[\w]+`+ // group 6: 'val'::type
+		`|([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`+ // group 7: UUID literal
+		`)`, quotedCol)
+	reNormal := regexp.MustCompile(normalPattern)
+	if m := reNormal.FindStringSubmatch(whereClause); len(m) > 0 {
+		return firstNonEmpty(m[1], m[2], m[3], m[4], m[5], m[6], m[7])
+	}
+
+	// Pattern: value = column (reversed order).
+	reversedPattern := fmt.Sprintf(`(?i)(?:`+
+		`'([^']*)'`+ // group 1: quoted string
+		`|(-?\d+(?:\.\d+)?)`+ // group 2: number
+		`|(\$\d+)`+ // group 3: $N param
+		`|(\?)`+ // group 4: ? param
+		`|CAST\s*\(\s*'([^']*)'\s+AS\s+\w+\s*\)`+ // group 5: CAST
+		`|'([^']*)'::[\w]+`+ // group 6: ::type
+		`|([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})`+ // group 7: UUID
+		`)\s*=\s*\b%s\b`, quotedCol)
+	reReversed := regexp.MustCompile(reversedPattern)
+	if m := reReversed.FindStringSubmatch(whereClause); len(m) > 0 {
+		return firstNonEmpty(m[1], m[2], m[3], m[4], m[5], m[6], m[7])
+	}
+
+	// Pattern: column IN ('singleValue') — extract if only one value.
+	inPattern := fmt.Sprintf(`(?i)\b%s\s+IN\s*\(\s*'([^']*)'\s*\)`, quotedCol)
+	reIn := regexp.MustCompile(inPattern)
+	if m := reIn.FindStringSubmatch(whereClause); len(m) > 1 {
+		return m[1]
+	}
+
+	return ""
+}
+
+// firstNonEmpty returns the first non-empty string from the arguments.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -272,6 +386,11 @@ var (
 	reAggregate    = regexp.MustCompile(`(?i)\b(COUNT|SUM|AVG|MIN|MAX|STRING_AGG|LIST|ARRAY_AGG|GROUP_CONCAT)\s*\(`)
 	reSetOp        = regexp.MustCompile(`(?i)\b(UNION|INTERSECT|EXCEPT)\b`)
 	reSubqueryFrom = regexp.MustCompile(`(?i)\bFROM\s*\(`)
+	reWindowFunc   = regexp.MustCompile(`(?i)\b\w+\s*\(\s*[^)]*\)\s+OVER\s*\(`)
+	reOnConflict   = regexp.MustCompile(`(?i)\bON\s+CONFLICT\b`)
+	reInsertOrReplace = regexp.MustCompile(`(?i)\bINSERT\s+OR\s+REPLACE\b`)
+	reReturning    = regexp.MustCompile(`(?i)\bRETURNING\b`)
+	reTruncate     = regexp.MustCompile(`(?i)TRUNCATE\s+(?:TABLE\s+)?` + tablePattern)
 
 	reInsertTable  = regexp.MustCompile(`(?i)INSERT\s+(?:OR\s+(?:REPLACE|IGNORE)\s+)?INTO\s+` + tablePattern)
 	reCreateTable  = regexp.MustCompile(`(?i)CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?` + tablePattern)
@@ -302,8 +421,7 @@ func extractFromTables(upper string) []string {
 				fromPart = fromPart[:idx]
 			}
 		}
-		parts := strings.Split(fromPart, ",")
-		for _, part := range parts {
+		for part := range strings.SplitSeq(fromPart, ",") {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
@@ -332,8 +450,7 @@ func extractUpdateTables(upper string) []string {
 		return nil
 	}
 	tablePart := upper[len("UPDATE"):setIdx]
-	parts := strings.Split(tablePart, ",")
-	for _, part := range parts {
+	for part := range strings.SplitSeq(tablePart, ",") {
 		part = strings.TrimSpace(part)
 		tokens := strings.Fields(part)
 		if len(tokens) > 0 {
@@ -357,8 +474,7 @@ func extractDeleteTables(upper string) []string {
 		}
 	}
 
-	parts := strings.Split(rest, ",")
-	for _, part := range parts {
+	for part := range strings.SplitSeq(rest, ",") {
 		part = strings.TrimSpace(part)
 		tokens := strings.Fields(part)
 		if len(tokens) > 0 {
@@ -412,14 +528,14 @@ func stripLeadingComments(s string) string {
 	for {
 		s = strings.TrimSpace(s)
 		if strings.HasPrefix(s, "--") {
-			if idx := strings.Index(s, "\n"); idx >= 0 {
-				s = s[idx+1:]
+			if _, after, found := strings.Cut(s, "\n"); found {
+				s = after
 			} else {
 				return ""
 			}
 		} else if strings.HasPrefix(s, "/*") {
-			if idx := strings.Index(s, "*/"); idx >= 0 {
-				s = s[idx+2:]
+			if _, after, found := strings.Cut(s, "*/"); found {
+				s = after
 			} else {
 				return ""
 			}

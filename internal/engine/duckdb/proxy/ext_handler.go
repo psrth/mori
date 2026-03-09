@@ -15,12 +15,14 @@ import (
 // It accumulates Parse/Bind/Describe/Execute messages until Sync, then classifies,
 // routes, and dispatches using database/sql.
 type ExtHandler struct {
-	proxy  *Proxy
-	connID int64
-	txh    *TxnHandler
+	proxy      *Proxy
+	connID     int64
+	txh        *TxnHandler
+	fkEnforcer *FKEnforcer
 
-	// stmtCache maps statement names to SQL text, persisting across batches.
-	stmtCache map[string]string
+	// stmtCache maps statement names to SQL text and classification, persisting across batches.
+	stmtCache    map[string]string
+	stmtClCache  map[string]*core.Classification
 
 	// Batch accumulator, cleared after each Sync.
 	batch         []*pgMsg
@@ -30,10 +32,26 @@ type ExtHandler struct {
 	batchHasBind  bool
 	batchHasDesc  bool
 	batchHasExec  bool
+	describeType  byte // 'S' for statement, 'P' for portal
+
+	// drainError: when true, discard messages until next Sync, then send error.
+	drainError    bool
+	drainErrorMsg string
+}
+
+// DrainUntilSync discards accumulated messages (called after an error in the pipeline).
+// After calling this, the next Sync will send ErrorResponse + ReadyForQuery.
+func (eh *ExtHandler) DrainUntilSync() {
+	eh.drainError = true
 }
 
 // Accumulate adds an extended protocol message to the current batch.
 func (eh *ExtHandler) Accumulate(msg *pgMsg) {
+	// If draining after error, discard until Sync.
+	if eh.drainError && msg.Type != 'S' {
+		return
+	}
+
 	eh.batch = append(eh.batch, msg)
 
 	switch msg.Type {
@@ -67,6 +85,10 @@ func (eh *ExtHandler) Accumulate(msg *pgMsg) {
 
 	case 'D':
 		eh.batchHasDesc = true
+		// Capture describe target type for Describe response.
+		if len(msg.Payload) >= 1 {
+			eh.describeType = msg.Payload[0] // 'S' for statement, 'P' for portal
+		}
 
 	case 'E':
 		eh.batchHasExec = true
@@ -74,6 +96,10 @@ func (eh *ExtHandler) Accumulate(msg *pgMsg) {
 	case 'C':
 		closeType, name, err := parseCloseMsgPayload(msg.Payload)
 		if err == nil && closeType == 'S' {
+			// Clean up both SQL and classification caches.
+			if sql, ok := eh.stmtCache[name]; ok {
+				delete(eh.stmtClCache, sql)
+			}
 			delete(eh.stmtCache, name)
 		}
 	}
@@ -86,6 +112,25 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 
 	p := eh.proxy
 
+	// If draining after an error, send ErrorResponse + ReadyForQuery and reset.
+	if eh.drainError {
+		errMsg := eh.drainErrorMsg
+		if errMsg == "" {
+			errMsg = "mori: previous error in extended protocol pipeline"
+		}
+		var resp []byte
+		resp = append(resp, buildSQLErrorResponseBytes(errMsg)...)
+		state := byte('I')
+		if eh.txh != nil {
+			state = eh.txh.TxnState()
+		}
+		resp = append(resp, buildReadyForQueryMsgState(state)...)
+		clientConn.Write(resp)
+		eh.drainError = false
+		eh.drainErrorMsg = ""
+		return
+	}
+
 	// If no SQL found or no Execute, handle as passthrough.
 	if eh.batchSQL == "" || !eh.batchHasExec {
 		if eh.batchHasParse {
@@ -95,7 +140,16 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 			clientConn.Write(buildBindCompleteMsg())
 		}
 		if eh.batchHasDesc {
-			clientConn.Write(buildNoDataMsg())
+			// Try to provide a proper RowDescription by running LIMIT 0 on Shadow.
+			if eh.batchSQL != "" && p.shadowDB != nil {
+				if desc := eh.buildDescribeResponse(p.shadowDB, eh.batchSQL); desc != nil {
+					clientConn.Write(desc)
+				} else {
+					clientConn.Write(buildNoDataMsg())
+				}
+			} else {
+				clientConn.Write(buildNoDataMsg())
+			}
 		}
 		clientConn.Write(buildReadyForQueryMsg())
 		return
@@ -111,7 +165,7 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 	var cl *core.Classification
 	var err error
 	if len(eh.batchParams) > 0 {
-		iparams := make([]interface{}, len(eh.batchParams))
+		iparams := make([]any, len(eh.batchParams))
 		for i, v := range eh.batchParams {
 			iparams[i] = v
 		}
@@ -127,7 +181,24 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 		return
 	}
 
+	// Cache the classification for future Bind-only batches.
+	if eh.batchHasParse && eh.batchSQL != "" {
+		eh.stmtClCache[eh.batchSQL] = cl
+	}
+
 	strategy := p.router.Route(cl)
+
+	// Shadow-dirty promotion: if this is a cached statement (Bind-only, no Parse)
+	// routed to ProdDirect, check if any of its tables have deltas/tombstones.
+	// If so, promote to MergedRead for correctness.
+	if strategy == core.StrategyProdDirect && !eh.batchHasParse && cl.OpType == core.OpRead {
+		if eh.tablesTouchedAreDirty(cl.Tables) {
+			strategy = core.StrategyMergedRead
+			if p.verbose {
+				log.Printf("[conn %d] ext: promoting cached statement to MergedRead (dirty tables)", eh.connID)
+			}
+		}
+	}
 
 	// WRITE GUARD L1.
 	if err := validateRouteDecision(cl, strategy, eh.connID, p.logger); err != nil {
@@ -147,6 +218,22 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 		eh.extExecOnProd(clientConn, fullSQL)
 
 	case core.StrategyShadowWrite:
+		// FK enforcement before shadow writes.
+		if eh.fkEnforcer != nil {
+			if errMsg := eh.fkEnforcer.CheckWriteFK(cl, fullSQL); errMsg != "" {
+				var resp []byte
+				if eh.batchHasParse {
+					resp = append(resp, buildParseCompleteMsg()...)
+				}
+				if eh.batchHasBind {
+					resp = append(resp, buildBindCompleteMsg()...)
+				}
+				resp = append(resp, buildSQLErrorResponseBytes(errMsg)...)
+				resp = append(resp, buildReadyForQueryMsg()...)
+				clientConn.Write(resp)
+				return
+			}
+		}
 		eh.extExecOnShadow(clientConn, fullSQL)
 		if p.deltaMap != nil {
 			for _, table := range cl.Tables {
@@ -155,6 +242,36 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 		}
 
 	case core.StrategyHydrateAndWrite:
+		// FK enforcement before hydrate-and-write.
+		if eh.fkEnforcer != nil {
+			if errMsg := eh.fkEnforcer.CheckWriteFK(cl, fullSQL); errMsg != "" {
+				var resp []byte
+				if eh.batchHasParse {
+					resp = append(resp, buildParseCompleteMsg()...)
+				}
+				if eh.batchHasBind {
+					resp = append(resp, buildBindCompleteMsg()...)
+				}
+				resp = append(resp, buildSQLErrorResponseBytes(errMsg)...)
+				resp = append(resp, buildReadyForQueryMsg()...)
+				clientConn.Write(resp)
+				return
+			}
+		}
+		// Handle bulk UPDATE (no PKs) via handleBulkUpdate.
+		if len(cl.PKs) == 0 && cl.SubType == core.SubUpdate && len(cl.Tables) > 0 {
+			resp := p.handleBulkUpdate(fullSQL, cl, eh.connID, eh.txh)
+			var result []byte
+			if eh.batchHasParse {
+				result = append(result, buildParseCompleteMsg()...)
+			}
+			if eh.batchHasBind {
+				result = append(result, buildBindCompleteMsg()...)
+			}
+			result = append(result, resp...)
+			clientConn.Write(result)
+			return
+		}
 		if len(cl.PKs) > 0 {
 			p.hydrateBeforeUpdate(cl, eh.connID)
 		}
@@ -174,6 +291,22 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 		}
 
 	case core.StrategyShadowDelete:
+		// Handle bulk DELETE (no PKs) via handleBulkDelete.
+		if len(cl.PKs) == 0 && !cl.IsJoin && len(cl.Tables) == 1 {
+			if meta, ok := p.tables[cl.Tables[0]]; ok && len(meta.PKColumns) > 0 {
+				resp := p.handleBulkDelete(fullSQL, cl, eh.connID, eh.txh)
+				var result []byte
+				if eh.batchHasParse {
+					result = append(result, buildParseCompleteMsg()...)
+				}
+				if eh.batchHasBind {
+					result = append(result, buildBindCompleteMsg()...)
+				}
+				result = append(result, resp...)
+				clientConn.Write(result)
+				return
+			}
+		}
 		eh.extExecOnShadow(clientConn, fullSQL)
 		if p.tombstones != nil {
 			inTxn := eh.txh != nil && eh.txh.InTxn()
@@ -196,11 +329,66 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 		}
 
 	case core.StrategyMergedRead, core.StrategyJoinPatch:
+		// Dispatch to specialized handlers for complex patterns.
+		var advancedResp []byte
+		switch {
+		case cl.HasWindowFunc:
+			advancedResp = p.executeWindowRead(fullSQL, cl, eh.connID)
+		case cl.HasSetOp:
+			advancedResp = p.executeSetOpRead(fullSQL, cl, eh.connID)
+		case cl.IsComplexRead:
+			advancedResp = p.executeComplexRead(fullSQL, cl, eh.connID)
+		}
+		if advancedResp != nil {
+			var result []byte
+			if eh.batchHasParse {
+				result = append(result, buildParseCompleteMsg()...)
+			}
+			if eh.batchHasBind {
+				result = append(result, buildBindCompleteMsg()...)
+			}
+			result = append(result, advancedResp...)
+			clientConn.Write(result)
+			return
+		}
 		eh.extMergedRead(clientConn, fullSQL, cl)
 
 	case core.StrategyShadowDDL:
 		eh.extExecOnShadow(clientConn, fullSQL)
 		p.trackDDLEffects(cl, eh.connID)
+
+	case core.StrategyTruncate:
+		resp := p.handleTruncate(fullSQL, cl, eh.connID)
+		var result []byte
+		if eh.batchHasParse {
+			result = append(result, buildParseCompleteMsg()...)
+		}
+		if eh.batchHasBind {
+			result = append(result, buildBindCompleteMsg()...)
+		}
+		result = append(result, resp...)
+		clientConn.Write(result)
+
+	case core.StrategyNotSupported:
+		msg := "mori: operation not supported"
+		if cl.NotSupportedMsg != "" {
+			msg = cl.NotSupportedMsg
+		}
+		var resp []byte
+		if eh.batchHasParse {
+			resp = append(resp, buildParseCompleteMsg()...)
+		}
+		if eh.batchHasBind {
+			resp = append(resp, buildBindCompleteMsg()...)
+		}
+		resp = append(resp, buildSQLErrorResponseBytes(msg)...)
+		resp = append(resp, buildReadyForQueryMsg()...)
+		clientConn.Write(resp)
+
+	case core.StrategyForwardBoth:
+		eh.extExecOnShadow(clientConn, fullSQL)
+		// Also execute on prod (discard result).
+		p.prodDB.Exec(fullSQL)
 
 	case core.StrategyTransaction:
 		if eh.txh != nil {
@@ -215,8 +403,23 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 }
 
 // extExecOnProd executes a query on prod and sends the extended protocol response.
+// Includes L2 write guard check.
 func (eh *ExtHandler) extExecOnProd(clientConn net.Conn, sqlStr string) {
-	eh.extExecOn(clientConn, eh.proxy.prodDB, sqlStr)
+	p := eh.proxy
+	// WRITE GUARD L2: block writes to Prod.
+	if blocked, ok := safeProdExec(p.prodDB, sqlStr, eh.connID, p.logger, p.verbose); ok {
+		var resp []byte
+		if eh.batchHasParse {
+			resp = append(resp, buildParseCompleteMsg()...)
+		}
+		if eh.batchHasBind {
+			resp = append(resp, buildBindCompleteMsg()...)
+		}
+		resp = append(resp, blocked...)
+		clientConn.Write(resp)
+		return
+	}
+	eh.extExecOn(clientConn, p.prodDB, sqlStr)
 }
 
 // extExecOnShadow executes a query on shadow and sends the extended protocol response.
@@ -266,15 +469,13 @@ func (eh *ExtHandler) extSelectQuery(db *sql.DB, sqlStr string) []byte {
 		return buildSQLErrorResponseBytes(err.Error())
 	}
 
-	colOIDs := make([]uint32, len(columns))
-	for i := range colOIDs {
-		colOIDs[i] = 25 // text
-	}
+	// Map DuckDB column types to PostgreSQL OIDs.
+	colOIDs := resolveColumnOIDs(rows)
 	var resp []byte
 	resp = append(resp, buildRowDescMsg(columns, colOIDs)...)
 
 	rowCount := 0
-	scanDest := make([]interface{}, len(columns))
+	scanDest := make([]any, len(columns))
 	for i := range scanDest {
 		scanDest[i] = new(sql.NullString)
 	}
@@ -325,6 +526,8 @@ func (eh *ExtHandler) extExecQuery(db *sql.DB, sqlStr string) []byte {
 		tag = "ALTER TABLE"
 	case strings.HasPrefix(upper, "DROP"):
 		tag = "DROP TABLE"
+	case strings.HasPrefix(upper, "TRUNCATE"):
+		tag = "TRUNCATE TABLE"
 	case strings.HasPrefix(upper, "BEGIN"), strings.HasPrefix(upper, "START"):
 		tag = "BEGIN"
 	case strings.HasPrefix(upper, "COMMIT"), strings.HasPrefix(upper, "END"):
@@ -386,6 +589,59 @@ func buildSQLErrorResponseBytes(message string) []byte {
 	return buildPGMsg('E', errPayload)
 }
 
+// buildDescribeResponse runs a LIMIT 0 query on the given database to obtain
+// column metadata and returns a RowDescription message, or nil on failure.
+func (eh *ExtHandler) buildDescribeResponse(db *sql.DB, sqlStr string) []byte {
+	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
+	isSelect := strings.HasPrefix(upper, "SELECT") ||
+		(strings.HasPrefix(upper, "WITH") && !strings.Contains(upper, "INSERT") &&
+			!strings.Contains(upper, "UPDATE") && !strings.Contains(upper, "DELETE"))
+	if !isSelect {
+		// Non-SELECT statements: return ParameterDescription (empty) + NoData.
+		return buildNoDataMsg()
+	}
+
+	// Run with LIMIT 0 to get column metadata without data.
+	limitSQL := sqlStr + " LIMIT 0"
+	rows, err := db.Query(limitSQL)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil || len(columns) == 0 {
+		return nil
+	}
+
+	colOIDs := resolveColumnOIDs(rows)
+	return buildRowDescMsg(columns, colOIDs)
+}
+
+// tablesTouchedAreDirty checks if any of the given tables have deltas or tombstones,
+// meaning reads from Prod alone would return stale data.
+func (eh *ExtHandler) tablesTouchedAreDirty(tables []string) bool {
+	p := eh.proxy
+	if p.deltaMap == nil && p.tombstones == nil {
+		return false
+	}
+	for _, table := range tables {
+		if p.deltaMap != nil && (p.deltaMap.CountForTable(table) > 0 || p.deltaMap.InsertCountForTable(table) > 0) {
+			return true
+		}
+		if p.tombstones != nil && p.tombstones.CountForTable(table) > 0 {
+			return true
+		}
+		if p.schemaRegistry != nil && p.schemaRegistry.HasDiff(table) {
+			return true
+		}
+		if p.schemaRegistry != nil && p.schemaRegistry.IsFullyShadowed(table) {
+			return true
+		}
+	}
+	return false
+}
+
 // clearBatch resets the batch accumulator for the next Sync cycle.
 func (eh *ExtHandler) clearBatch() {
 	eh.batch = nil
@@ -395,4 +651,7 @@ func (eh *ExtHandler) clearBatch() {
 	eh.batchHasBind = false
 	eh.batchHasDesc = false
 	eh.batchHasExec = false
+	eh.describeType = 0
+	eh.drainError = false
+	eh.drainErrorMsg = ""
 }

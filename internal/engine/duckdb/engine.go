@@ -87,6 +87,7 @@ func (e *duckdbEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.
 		deps.MoriDir,
 		deps.SchemaReg,
 		deps.Logger,
+		deps.MaxRowsHydrate,
 	)
 }
 
@@ -94,8 +95,9 @@ func convertTablesFromDuckDB(duckdbTables map[string]schema.TableMeta) map[strin
 	out := make(map[string]engine.TableMeta, len(duckdbTables))
 	for name, t := range duckdbTables {
 		out[name] = engine.TableMeta{
-			PKColumns: t.PKColumns,
-			PKType:    t.PKType,
+			PKColumns:     t.PKColumns,
+			PKType:        t.PKType,
+			GeneratedCols: t.GeneratedCols,
 		}
 	}
 	return out
@@ -105,8 +107,9 @@ func convertTablesToDuckDB(tables map[string]engine.TableMeta) map[string]schema
 	out := make(map[string]schema.TableMeta, len(tables))
 	for name, t := range tables {
 		out[name] = schema.TableMeta{
-			PKColumns: t.PKColumns,
-			PKType:    t.PKType,
+			PKColumns:     t.PKColumns,
+			PKType:        t.PKType,
+			GeneratedCols: t.GeneratedCols,
 		}
 	}
 	return out

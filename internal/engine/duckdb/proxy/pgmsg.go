@@ -154,13 +154,24 @@ func buildCommandCompleteMsg(tag string) []byte {
 	return buildPGMsg('C', payload)
 }
 
-// buildReadyForQueryMsg constructs a ReadyForQuery ('Z') message with idle status.
+// buildReadyForQueryMsg constructs a ReadyForQuery ('Z') message with the given
+// transaction state: 'I' (idle), 'T' (in-transaction), 'E' (error-in-transaction).
 func buildReadyForQueryMsg() []byte {
 	return buildPGMsg('Z', []byte{'I'})
 }
 
-// buildErrorResponse constructs an ErrorResponse ('E') followed by ReadyForQuery.
+// buildReadyForQueryMsgState constructs a ReadyForQuery ('Z') message with an explicit state.
+func buildReadyForQueryMsgState(state byte) []byte {
+	return buildPGMsg('Z', []byte{state})
+}
+
+// buildErrorResponse constructs an ErrorResponse ('E') followed by ReadyForQuery (idle).
 func buildErrorResponse(message string) []byte {
+	return buildErrorResponseState(message, 'I')
+}
+
+// buildErrorResponseState constructs an ErrorResponse ('E') followed by ReadyForQuery with state.
+func buildErrorResponseState(message string, state byte) []byte {
 	var errPayload []byte
 	errPayload = append(errPayload, 'S')
 	errPayload = append(errPayload, []byte("ERROR")...)
@@ -175,12 +186,17 @@ func buildErrorResponse(message string) []byte {
 
 	var result []byte
 	result = append(result, buildPGMsg('E', errPayload)...)
-	result = append(result, buildReadyForQueryMsg()...)
+	result = append(result, buildReadyForQueryMsgState(state)...)
 	return result
 }
 
-// buildSQLErrorResponse constructs an ErrorResponse for a SQL error with proper SQLSTATE.
+// buildSQLErrorResponse constructs an ErrorResponse for a SQL error with proper SQLSTATE (idle state).
 func buildSQLErrorResponse(message string) []byte {
+	return buildSQLErrorResponseState(message, 'I')
+}
+
+// buildSQLErrorResponseState constructs an ErrorResponse with proper SQLSTATE and explicit state.
+func buildSQLErrorResponseState(message string, state byte) []byte {
 	var errPayload []byte
 	errPayload = append(errPayload, 'S')
 	errPayload = append(errPayload, []byte("ERROR")...)
@@ -195,7 +211,7 @@ func buildSQLErrorResponse(message string) []byte {
 
 	var result []byte
 	result = append(result, buildPGMsg('E', errPayload)...)
-	result = append(result, buildReadyForQueryMsg()...)
+	result = append(result, buildReadyForQueryMsgState(state)...)
 	return result
 }
 
@@ -249,6 +265,7 @@ func parseParseMsgPayload(payload []byte) (stmtName, sql string, err error) {
 }
 
 // parseBindMsgPayload extracts the statement name and parameter values from a Bind ('B') payload.
+// Supports both text (format code 0) and binary (format code 1) parameter formats.
 func parseBindMsgPayload(payload []byte) (stmtName string, params []string, err error) {
 	if len(payload) == 0 {
 		return "", nil, fmt.Errorf("empty Bind payload")
@@ -264,19 +281,27 @@ func parseBindMsgPayload(payload []byte) (stmtName string, params []string, err 
 	if err != nil {
 		return "", nil, fmt.Errorf("reading statement name: %w", err)
 	}
-	// Skip format codes.
+	// Read format codes.
 	if pos+2 > len(payload) {
 		return stmtName, nil, nil
 	}
 	fmtCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-	pos += 2 + fmtCount*2
+	pos += 2
+	fmtCodes := make([]int16, fmtCount)
+	for i := range fmtCount {
+		if pos+2 > len(payload) {
+			break
+		}
+		fmtCodes[i] = int16(binary.BigEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+	}
 	// Read parameter values.
 	if pos+2 > len(payload) {
 		return stmtName, nil, nil
 	}
 	paramCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 	pos += 2
-	for i := 0; i < paramCount; i++ {
+	for i := range paramCount {
 		if pos+4 > len(payload) {
 			break
 		}
@@ -289,10 +314,58 @@ func parseBindMsgPayload(payload []byte) (stmtName string, params []string, err 
 		if pos+paramLen > len(payload) {
 			break
 		}
-		params = append(params, string(payload[pos:pos+paramLen]))
+
+		// Determine format code for this parameter.
+		isBinary := false
+		if len(fmtCodes) == 1 {
+			// Single format code applies to all parameters.
+			isBinary = fmtCodes[0] == 1
+		} else if i < len(fmtCodes) {
+			isBinary = fmtCodes[i] == 1
+		}
+
+		paramData := payload[pos : pos+paramLen]
+		if isBinary {
+			params = append(params, decodeBinaryParam(paramData))
+		} else {
+			params = append(params, string(paramData))
+		}
 		pos += paramLen
 	}
 	return stmtName, params, nil
+}
+
+// decodeBinaryParam converts binary-encoded parameter data to a text string.
+// Supports common PostgreSQL binary formats: bool (1b), int16 (2b), int32 (4b),
+// int64 (8b), float32 (4b as IEEE754), float64 (8b as IEEE754), UUID (16b).
+func decodeBinaryParam(data []byte) string {
+	switch len(data) {
+	case 1:
+		// bool
+		if data[0] == 0 {
+			return "false"
+		}
+		return "true"
+	case 2:
+		// int16
+		v := int16(binary.BigEndian.Uint16(data))
+		return fmt.Sprintf("%d", v)
+	case 4:
+		// int32 (or float32 — we assume int32 as it's more common for PK params)
+		v := int32(binary.BigEndian.Uint32(data))
+		return fmt.Sprintf("%d", v)
+	case 8:
+		// int64
+		v := int64(binary.BigEndian.Uint64(data))
+		return fmt.Sprintf("%d", v)
+	case 16:
+		// UUID: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			data[0:4], data[4:6], data[6:8], data[8:10], data[10:16])
+	default:
+		// Fallback: treat as text.
+		return string(data)
+	}
 }
 
 // parseCloseMsgPayload extracts the close target type and name from a Close ('C') payload.
@@ -316,6 +389,46 @@ func readNullTerminatedString(payload []byte, pos int) (string, int, error) {
 		}
 	}
 	return "", pos, fmt.Errorf("unterminated string at offset %d", pos)
+}
+
+// duckDBTypeToOID maps DuckDB column type names (from sql.ColumnType) to PostgreSQL OIDs.
+func duckDBTypeToOID(typeName string) uint32 {
+	switch strings.ToUpper(typeName) {
+	case "BOOLEAN", "BOOL":
+		return 16
+	case "TINYINT", "SMALLINT", "INT2":
+		return 21 // int2
+	case "INTEGER", "INT", "INT4":
+		return 23 // int4
+	case "BIGINT", "INT8":
+		return 20 // int8
+	case "FLOAT", "REAL", "FLOAT4":
+		return 700 // float4
+	case "DOUBLE", "FLOAT8":
+		return 701 // float8
+	case "DECIMAL", "NUMERIC":
+		return 1700 // numeric
+	case "VARCHAR", "TEXT", "STRING":
+		return 25 // text
+	case "BLOB", "BYTEA":
+		return 17 // bytea
+	case "DATE":
+		return 1082 // date
+	case "TIME":
+		return 1083 // time
+	case "TIMESTAMP", "DATETIME":
+		return 1114 // timestamp
+	case "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ":
+		return 1184 // timestamptz
+	case "INTERVAL":
+		return 1186 // interval
+	case "UUID":
+		return 2950 // uuid
+	case "JSON":
+		return 114 // json
+	default:
+		return 25 // text fallback
+	}
 }
 
 // reconstructSQL substitutes parameter placeholders ($1, $2, ...) in SQL with quoted literal values.
