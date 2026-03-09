@@ -60,12 +60,8 @@ func (c *MSSQLClassifier) Classify(query string) (*core.Classification, error) {
 		c.classifyDrop(upper, cl)
 	case hasPrefix(upper, "TRUNCATE"):
 		cl.OpType = core.OpWrite
-		cl.SubType = core.SubOther
+		cl.SubType = core.SubTruncate
 		cl.Tables = extractTableAfterKeyword(upper, "TRUNCATE")
-	case hasPrefix(upper, "BULK INSERT"):
-		cl.OpType = core.OpWrite
-		cl.SubType = core.SubInsert
-		cl.Tables = extractTableAfterKeyword(upper, "BULK INSERT")
 	case hasPrefix(upper, "BEGIN TRAN"), hasPrefix(upper, "BEGIN TRANSACTION"):
 		cl.OpType = core.OpTransaction
 		cl.SubType = core.SubBegin
@@ -76,9 +72,31 @@ func (c *MSSQLClassifier) Classify(query string) (*core.Classification, error) {
 	case hasPrefix(upper, "COMMIT"):
 		cl.OpType = core.OpTransaction
 		cl.SubType = core.SubCommit
+	case hasPrefix(upper, "SAVE TRAN"), hasPrefix(upper, "SAVE TRANSACTION"):
+		cl.OpType = core.OpTransaction
+		cl.SubType = core.SubSavepoint
+	case hasPrefix(upper, "ROLLBACK TRAN"), hasPrefix(upper, "ROLLBACK TRANSACTION"):
+		// Distinguish full ROLLBACK from partial ROLLBACK TO savepoint.
+		// "ROLLBACK TRAN[SACTION] name" (with a name) is a partial rollback to savepoint.
+		cl.OpType = core.OpTransaction
+		cl.SubType = c.classifyRollbackSub(trimmed, upper)
 	case hasPrefix(upper, "ROLLBACK"):
 		cl.OpType = core.OpTransaction
 		cl.SubType = core.SubRollback
+	case hasPrefix(upper, "SET SHOWPLAN_ALL"), hasPrefix(upper, "SET SHOWPLAN_XML"),
+		hasPrefix(upper, "SET STATISTICS PROFILE"), hasPrefix(upper, "SET STATISTICS XML"):
+		// P3 §4.1: MSSQL's EXPLAIN equivalents.
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubExplain
+	case hasPrefix(upper, "BULK INSERT"):
+		cl.OpType = core.OpWrite
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "BULK INSERT is not supported through the Mori proxy"
+		cl.Tables = extractTableAfterKeyword(upper, "BULK INSERT")
+	case c.isSpRenameColumn(trimmed, upper):
+		// P1 §2.7: sp_rename for column renaming → classify as DDL.
+		cl.OpType = core.OpDDL
+		cl.SubType = core.SubAlter
 	case hasPrefix(upper, "SET"), hasPrefix(upper, "PRINT"),
 		hasPrefix(upper, "EXEC"), hasPrefix(upper, "EXECUTE"),
 		hasPrefix(upper, "DECLARE"), hasPrefix(upper, "USE"),
@@ -103,7 +121,7 @@ func (c *MSSQLClassifier) Classify(query string) (*core.Classification, error) {
 
 // ClassifyWithParams classifies a parameterized query with bound values.
 // For MSSQL, parameters use @p1, @p2 style named placeholders.
-func (c *MSSQLClassifier) ClassifyWithParams(query string, params []interface{}) (*core.Classification, error) {
+func (c *MSSQLClassifier) ClassifyWithParams(query string, params []any) (*core.Classification, error) {
 	cl, err := c.Classify(query)
 	if err != nil {
 		return nil, err
@@ -158,9 +176,25 @@ func (c *MSSQLClassifier) classifySelect(raw, upper string, cl *core.Classificat
 	// Detect set operations.
 	cl.HasSetOp = reSetOp.MatchString(upper)
 
-	// Detect window functions (ROW_NUMBER, RANK, etc.).
+	// P3 §4.1: Detect window functions.
 	if reWindowFunc.MatchString(upper) {
 		cl.IsComplexRead = true
+		cl.HasWindowFunc = true
+	}
+
+	// P3 §4.1: Detect DISTINCT.
+	if reDistinct.MatchString(upper) {
+		cl.HasDistinct = true
+	}
+
+	// P3 §4.1: Detect complex aggregates (STRING_AGG, etc.).
+	if reComplexAgg.MatchString(upper) {
+		cl.HasComplexAgg = true
+	}
+
+	// P3 §4.1: Detect metadata queries against sys.* or INFORMATION_SCHEMA.*.
+	if reMetadataQuery.MatchString(upper) {
+		cl.IsMetadataQuery = true
 	}
 
 	// Detect complex reads (subqueries in FROM, PIVOT, UNPIVOT, APPLY).
@@ -179,12 +213,17 @@ func (c *MSSQLClassifier) classifySelect(raw, upper string, cl *core.Classificat
 	cl.PKs = c.extractPKs(raw, cl.Tables)
 }
 
-func (c *MSSQLClassifier) classifyInsert(raw, upper string, cl *core.Classification) {
+func (c *MSSQLClassifier) classifyInsert(_raw, upper string, cl *core.Classification) {
 	cl.OpType = core.OpWrite
 	cl.SubType = core.SubInsert
 
 	if m := reInsertTable.FindStringSubmatch(upper); len(m) > 1 {
 		cl.Tables = appendUnique(cl.Tables, cleanTableName(m[1]))
+	}
+
+	// P3 §4.1: Detect OUTPUT clause (MSSQL's RETURNING equivalent).
+	if reOutput.MatchString(upper) {
+		cl.HasReturning = true
 	}
 
 	// INSERT ... SELECT: extract tables from the SELECT portion.
@@ -204,6 +243,11 @@ func (c *MSSQLClassifier) classifyUpdate(raw, upper string, cl *core.Classificat
 	cl.Tables = extractUpdateTables(upper)
 	cl.IsJoin = len(cl.Tables) > 1
 
+	// P3 §4.1: Detect OUTPUT clause.
+	if reOutput.MatchString(upper) {
+		cl.HasReturning = true
+	}
+
 	cl.PKs = c.extractPKs(raw, cl.Tables)
 }
 
@@ -213,6 +257,11 @@ func (c *MSSQLClassifier) classifyDelete(raw, upper string, cl *core.Classificat
 
 	cl.Tables = extractDeleteTables(upper)
 	cl.IsJoin = len(cl.Tables) > 1
+
+	// P3 §4.1: Detect OUTPUT clause.
+	if reOutput.MatchString(upper) {
+		cl.HasReturning = true
+	}
 
 	cl.PKs = c.extractPKs(raw, cl.Tables)
 }
@@ -229,6 +278,11 @@ func (c *MSSQLClassifier) classifyMerge(upper string, cl *core.Classification) {
 	// ... USING source ...
 	if m := reMergeUsing.FindStringSubmatch(upper); len(m) > 1 {
 		cl.Tables = appendUnique(cl.Tables, cleanTableName(m[1]))
+	}
+
+	// P0 §1.5 / P3 §4.1: Detect MERGE-as-upsert pattern.
+	if strings.Contains(upper, "WHEN MATCHED") || strings.Contains(upper, "WHEN NOT MATCHED") {
+		cl.HasOnConflict = true
 	}
 }
 
@@ -261,7 +315,7 @@ func (c *MSSQLClassifier) classifyDrop(upper string, cl *core.Classification) {
 	}
 }
 
-func (c *MSSQLClassifier) classifyCTE(raw, upper string, cl *core.Classification) {
+func (c *MSSQLClassifier) classifyCTE(_raw, upper string, cl *core.Classification) {
 	// Check for write keywords after the CTE definition.
 	if strings.Contains(upper, "INSERT") ||
 		strings.Contains(upper, "UPDATE") ||
@@ -280,7 +334,33 @@ func (c *MSSQLClassifier) classifyCTE(raw, upper string, cl *core.Classification
 	cl.IsComplexRead = true
 }
 
-func (c *MSSQLClassifier) classifyConditional(raw, upper string, cl *core.Classification) {
+// isSpRenameColumn detects EXEC sp_rename 't.old', 'new', 'COLUMN' patterns.
+func (c *MSSQLClassifier) isSpRenameColumn(_raw, upper string) bool {
+	return reSpRenameColumn.MatchString(upper)
+}
+
+// reSpRenameColumn matches sp_rename with 'COLUMN' as the third arg.
+var reSpRenameColumn = regexp.MustCompile(`(?i)(?:EXEC(?:UTE)?\s+)?SP_RENAME\s+.*,\s*.*,\s*'COLUMN'`)
+
+// classifyRollbackSub distinguishes full ROLLBACK TRAN from partial
+// ROLLBACK TRAN <name> (savepoint rollback) in T-SQL.
+func (c *MSSQLClassifier) classifyRollbackSub(raw, _upper string) core.SubType {
+	fields := strings.Fields(raw)
+	// "ROLLBACK TRAN" or "ROLLBACK TRANSACTION" with no extra name → full rollback.
+	// "ROLLBACK TRAN sp1" → partial rollback to savepoint.
+	if len(fields) <= 2 {
+		return core.SubRollback
+	}
+	// fields[0] = ROLLBACK, fields[1] = TRAN/TRANSACTION, fields[2] = <name>
+	name := fields[2]
+	// If name is a keyword (like semicolon), treat as full rollback.
+	if name == ";" || name == "" {
+		return core.SubRollback
+	}
+	return core.SubSavepoint
+}
+
+func (c *MSSQLClassifier) classifyConditional(_raw, upper string, cl *core.Classification) {
 	// T-SQL IF ... can wrap any statement. Detect writes within the body.
 	if strings.Contains(upper, "INSERT") ||
 		strings.Contains(upper, "UPDATE") ||
@@ -316,18 +396,54 @@ func (c *MSSQLClassifier) extractPKs(raw string, tables []string) []core.TablePK
 			continue
 		}
 		for _, pkCol := range meta.PKColumns {
-			// Match both unquoted and bracket-quoted column names, and @p params.
-			pattern := fmt.Sprintf(`(?i)\b\[?%s\]?\s*=\s*(?:'([^']*)'|(\d+)|(@p\d+))`, regexp.QuoteMeta(pkCol))
+			// P3 §4.2: Support multiple PK value patterns:
+			// 1. col = 'value', col = 123, col = @p1 (standard)
+			// 2. 'value' = col, 123 = col (reversed)
+			// 3. col = CAST(value AS type) / col = CONVERT(type, value)
+			// 4. Negative numbers: col = -123
+			// 5. GUID literals: col = '{...}'
+			escaped := regexp.QuoteMeta(pkCol)
+			// Standard: col = value
+			pattern := fmt.Sprintf(`(?i)\b\[?%s\]?\s*=\s*(?:'([^']*)'|(-?\d+)|(@p\d+)|\{([0-9A-Fa-f-]+)\})`, escaped)
 			re := regexp.MustCompile(pattern)
 			if m := re.FindStringSubmatch(whereClause); len(m) > 0 {
-				val := m[1]
-				if val == "" {
-					val = m[2]
+				val := firstNonEmpty(m[1], m[2], m[3], m[4])
+				if val != "" {
+					pks = append(pks, core.TablePK{Table: table, PK: val})
+					continue
 				}
-				if val == "" {
-					val = m[3]
+			}
+
+			// P3 §4.2: Reversed form: value = col
+			patternReversed := fmt.Sprintf(`(?i)(?:'([^']*)'|(-?\d+))\s*=\s*\[?%s\]?`, escaped)
+			reReversed := regexp.MustCompile(patternReversed)
+			if m := reReversed.FindStringSubmatch(whereClause); len(m) > 0 {
+				val := firstNonEmpty(m[1], m[2])
+				if val != "" {
+					pks = append(pks, core.TablePK{Table: table, PK: val})
+					continue
 				}
-				pks = append(pks, core.TablePK{Table: table, PK: val})
+			}
+
+			// P3 §4.2: CAST/CONVERT unwrapping: col = CAST(value AS type)
+			patternCast := fmt.Sprintf(`(?i)\b\[?%s\]?\s*=\s*CAST\s*\(\s*'?([^')]+)'?\s+AS\s+`, escaped)
+			reCast := regexp.MustCompile(patternCast)
+			if m := reCast.FindStringSubmatch(whereClause); len(m) > 1 {
+				val := strings.TrimSpace(m[1])
+				if val != "" {
+					pks = append(pks, core.TablePK{Table: table, PK: val})
+					continue
+				}
+			}
+
+			// P3 §4.2: CONVERT unwrapping: col = CONVERT(type, value)
+			patternConvert := fmt.Sprintf(`(?i)\b\[?%s\]?\s*=\s*CONVERT\s*\(\s*\w+\s*,\s*'?([^')]+)'?\s*\)`, escaped)
+			reConvert := regexp.MustCompile(patternConvert)
+			if m := reConvert.FindStringSubmatch(whereClause); len(m) > 1 {
+				val := strings.TrimSpace(m[1])
+				if val != "" {
+					pks = append(pks, core.TablePK{Table: table, PK: val})
+				}
 			}
 		}
 	}
@@ -350,6 +466,12 @@ var (
 	rePivot        = regexp.MustCompile(`(?i)\b(PIVOT|UNPIVOT)\b`)
 	reApply        = regexp.MustCompile(`(?i)\b(CROSS|OUTER)\s+APPLY\b`)
 
+	// P3 §4.1: Feature flag patterns.
+	reDistinct      = regexp.MustCompile(`(?i)\bSELECT\s+DISTINCT\b`)
+	reComplexAgg    = regexp.MustCompile(`(?i)\b(STRING_AGG|GROUPING|GROUPING_ID)\s*\(`)
+	reMetadataQuery = regexp.MustCompile(`(?i)\b(SYS\.|INFORMATION_SCHEMA\.)`)
+	reOutput        = regexp.MustCompile(`(?i)\bOUTPUT\s+(INSERTED|DELETED)\.`)
+
 	reInsertTable  = regexp.MustCompile(`(?i)INSERT\s+INTO\s+` + tablePattern)
 	reMergeTable   = regexp.MustCompile(`(?i)MERGE\s+(?:INTO\s+)?` + tablePattern)
 	reMergeUsing   = regexp.MustCompile(`(?i)USING\s+` + tablePattern)
@@ -368,8 +490,6 @@ const (
 	// tableListPattern matches a comma-separated list of table names.
 	tableListPattern = `(?:` + tablePattern + `(?:\s+(?:AS\s+)?[a-zA-Z_]\w*)?\s*(?:,\s*` + tablePattern + `(?:\s+(?:AS\s+)?[a-zA-Z_]\w*)?\s*)*)`
 )
-
-var reTableInList = regexp.MustCompile(`(?i)` + tablePattern)
 
 // ---------------------------------------------------------------------------
 // Table extraction helpers
@@ -390,8 +510,7 @@ func extractFromTables(upper string) []string {
 			}
 		}
 		// Split by comma and extract table names.
-		parts := strings.Split(fromPart, ",")
-		for _, part := range parts {
+		for part := range strings.SplitSeq(fromPart, ",") {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
@@ -452,11 +571,10 @@ func extractUpdateTables(upper string) []string {
 func extractDeleteTables(upper string) []string {
 	var tables []string
 
-	fromIdx := strings.Index(upper, "FROM")
-	if fromIdx < 0 {
+	_, rest, found := strings.Cut(upper, "FROM")
+	if !found {
 		return nil
 	}
-	rest := upper[fromIdx+4:]
 
 	// Cut at WHERE, ORDER, OPTION.
 	for _, kw := range []string{"WHERE", "ORDER", "OPTION"} {
@@ -465,8 +583,7 @@ func extractDeleteTables(upper string) []string {
 		}
 	}
 
-	parts := strings.Split(rest, ",")
-	for _, part := range parts {
+	for part := range strings.SplitSeq(rest, ",") {
 		part = strings.TrimSpace(part)
 		tokens := strings.Fields(part)
 		if len(tokens) > 0 {
@@ -597,6 +714,16 @@ func indexKeyword(s, kw string) int {
 		}
 		return absIdx
 	}
+}
+
+// firstNonEmpty returns the first non-empty string from the arguments.
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func hasPrefix(upper, prefix string) bool {

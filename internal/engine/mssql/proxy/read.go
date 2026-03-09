@@ -39,17 +39,62 @@ func (rh *ReadHandler) HandleRead(
 ) error {
 	switch strategy {
 	case core.StrategyMergedRead:
+		// P2 §3.3: Window functions → materialize + re-execute.
+		if cl.HasWindowFunc {
+			return rh.handleWindowFunctionRead(clientConn, fullPayload, cl)
+		}
+		// P2 §3.4: Set operations → decompose + merge + re-execute.
+		if cl.HasSetOp {
+			return rh.handleSetOpRead(clientConn, fullPayload, cl)
+		}
+		// P2 §3.5: Complex reads (CTEs, derived tables, APPLY).
+		if cl.IsComplexRead {
+			return rh.handleComplexRead(clientConn, fullPayload, cl)
+		}
 		return rh.handleMergedRead(clientConn, fullPayload, cl)
 	case core.StrategyJoinPatch:
-		// For JOINs, fall back to prod for now (same as Postgres v1).
-		return forwardAndRelay(rawMsg, rh.prodConn, clientConn)
+		// P2 §3.6: Full JOIN patch — materialize dirty tables, rewrite.
+		return rh.handleJoinPatch(clientConn, rawMsg, fullPayload, cl)
 	default:
 		return fmt.Errorf("unsupported read strategy: %s", strategy)
 	}
 }
 
+// handleJoinPatch implements the JOIN patch strategy (P2 §3.6).
+// For JOINs involving dirty tables, materializes them into temp tables
+// and rewrites the query to reference them.
+func (rh *ReadHandler) handleJoinPatch(
+	clientConn net.Conn,
+	rawMsg []byte,
+	fullPayload []byte,
+	cl *core.Classification,
+) error {
+	if len(cl.Tables) == 0 {
+		return forwardAndRelay(rawMsg, rh.prodConn, clientConn)
+	}
+
+	// Check if any joined tables are dirty.
+	var dirtyTables []string
+	for _, table := range cl.Tables {
+		if rh.isTableDirty(table) {
+			dirtyTables = append(dirtyTables, table)
+		}
+	}
+
+	if len(dirtyTables) == 0 {
+		// No dirty tables — safe to forward to Prod.
+		return forwardAndRelay(rawMsg, rh.prodConn, clientConn)
+	}
+
+	// Materialize dirty tables and rewrite the query.
+	return rh.handleComplexRead(clientConn, fullPayload, cl)
+}
+
 // handleMergedRead implements the merged read algorithm for MSSQL.
 // fullPayload is the client's original SQL_BATCH payload containing ALL_HEADERS + SQL.
+// P3 §4.6: Uses buildTDSSelectResponse for direct TDS emission instead of
+// building a synthetic VALUES query through Prod. This preserves column types
+// and avoids a round-trip through the Prod backend.
 func (rh *ReadHandler) handleMergedRead(clientConn net.Conn, fullPayload []byte, cl *core.Classification) error {
 	columns, values, nulls, err := rh.mergedReadCore(cl, cl.RawSQL)
 	if err != nil {
@@ -61,20 +106,11 @@ func (rh *ReadHandler) handleMergedRead(clientConn net.Conn, fullPayload []byte,
 		return err
 	}
 
-	// Build a synthetic SELECT that returns the merged data.
-	// Reuse the client's original ALL_HEADERS (which include the MARS
-	// transaction descriptor) so the server responds with matching
-	// MARS session headers that the client driver expects.
-	syntheticSQL := buildSyntheticSelect(columns, values, nulls)
-
-	allHeaders := extractAllHeaders(fullPayload)
-	var batchMsg []byte
-	if allHeaders != nil {
-		batchMsg = buildSQLBatchWithHeaders(allHeaders, syntheticSQL)
-	} else {
-		batchMsg = buildSQLBatchMessage(syntheticSQL)
-	}
-	return forwardAndRelay(batchMsg, rh.prodConn, clientConn)
+	// P3 §4.6: Build a raw TDS response directly (COLMETADATA + ROW tokens + DONE).
+	// This avoids the round-trip through Prod that buildSyntheticSelect required.
+	response := buildTDSSelectResponse(columns, values, nulls)
+	_, err = clientConn.Write(response)
+	return err
 }
 
 // relayError wraps raw backend response bytes for errors that should be
@@ -122,13 +158,22 @@ func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) 
 		return nil, nil, nil, &relayError{rawMsgs: shadowResult.RawMsgs, msg: shadowResult.Error}
 	}
 
-	// Step 1.5: Check if table only exists in Shadow (DDL CREATE TABLE).
+	// Step 1.5: Rewrite Prod query for schema diffs (DDL changes).
+	// P1 §2.6: Full rewriting handles added, dropped, and renamed columns.
 	skipProd := false
 	prodSQL := effectiveSQL
 	if rh.schemaRegistry != nil {
-		if _, exists := rh.tables[table]; !exists {
+		rewritten, shadowOnly := rh.rewriteForProd(effectiveSQL, table)
+		if shadowOnly {
 			skipProd = true
+		} else {
+			prodSQL = rewritten
 		}
+	}
+
+	// Check if table is fully shadowed (e.g., after TRUNCATE) — skip Prod entirely.
+	if !skipProd && rh.schemaRegistry != nil && rh.schemaRegistry.IsFullyShadowed(table) {
+		skipProd = true
 	}
 
 	// Step 2: Execute query on Prod.
@@ -207,10 +252,16 @@ func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) 
 			mergedColumns, mergedValues, mergedNulls, injectedPK)
 	}
 
+	// Step 9: Apply DISTINCT if requested.
+	if cl != nil && cl.HasDistinct {
+		mergedValues, mergedNulls = deduplicateByFullRow(mergedValues, mergedNulls)
+	}
+
 	return mergedColumns, mergedValues, mergedNulls, nil
 }
 
 // aggregateReadCore handles aggregate queries by converting to row-level merge.
+// P2 §3.2: Supports COUNT, SUM, AVG, MIN, MAX, and GROUP BY with re-aggregation.
 func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL string) (
 	columns []TDSColumnInfo, values [][]string, nulls [][]bool, err error,
 ) {
@@ -219,10 +270,20 @@ func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL strin
 	}
 	table := cl.Tables[0]
 
+	// For complex aggregates (STRING_AGG, HAVING with subqueries, GROUP BY with complex expressions),
+	// or if there's a HasComplexAgg flag, materialize into temp table and re-execute.
+	if cl.HasComplexAgg {
+		return rh.aggregateViaTempTable(cl, querySQL, table)
+	}
+
 	baseSQL := rh.buildAggregateBaseQuery(querySQL, table)
 	if baseSQL == "" {
-		// Complex aggregate — fall back to Prod and relay the raw response
-		// directly to preserve native column types (INT, DECIMAL, etc.).
+		// Complex aggregate — try temp table materialization first.
+		cols, vals, nls, mErr := rh.aggregateViaTempTable(cl, querySQL, table)
+		if mErr == nil {
+			return cols, vals, nls, nil
+		}
+		// Fall back to Prod.
 		prodResult, err := execTDSQuery(rh.prodConn, querySQL)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("prod aggregate query: %w", err)
@@ -239,8 +300,6 @@ func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL strin
 	_, baseValues, _, mergeErr := rh.mergedReadCore(&baseCl, baseSQL)
 	if mergeErr != nil {
 		if _, ok := mergeErr.(*relayError); ok {
-			// Base query failed on shadow — fall back to prod and relay raw
-			// response to preserve native types.
 			prodResult, pErr := execTDSQuery(rh.prodConn, querySQL)
 			if pErr != nil {
 				return nil, nil, nil, mergeErr
@@ -257,6 +316,51 @@ func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL strin
 		[][]string{{countStr}},
 		[][]bool{{false}},
 		nil
+}
+
+// aggregateViaTempTable handles complex aggregates by materializing merged data
+// into a temp table and re-executing the original aggregate query against it.
+func (rh *ReadHandler) aggregateViaTempTable(cl *core.Classification, querySQL, table string) (
+	columns []TDSColumnInfo, values [][]string, nulls [][]bool, err error,
+) {
+	// Get the base data via merged read.
+	baseSQL := "SELECT * FROM " + quoteIdentMSSQL(table)
+	baseCl := &core.Classification{
+		OpType:  core.OpRead,
+		SubType: core.SubSelect,
+		RawSQL:  baseSQL,
+		Tables:  []string{table},
+	}
+
+	baseCols, baseValues, baseNulls, mergeErr := rh.mergedReadCore(baseCl, baseSQL)
+	if mergeErr != nil {
+		return nil, nil, nil, mergeErr
+	}
+
+	if len(baseCols) == 0 {
+		return nil, nil, nil, fmt.Errorf("no columns from base query")
+	}
+
+	// Materialize into temp table.
+	tempName, mErr := materializeToTempTable(rh.shadowConn, querySQL, baseCols, baseValues, baseNulls)
+	if mErr != nil {
+		return nil, nil, nil, mErr
+	}
+	defer dropUtilTable(rh.shadowConn, tempName)
+
+	// Rewrite the original query to reference the temp table.
+	rewrittenSQL := rewriteTableReference(querySQL, table, tempName)
+
+	// Execute on Shadow.
+	result, err := execTDSQuery(rh.shadowConn, rewrittenSQL)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("aggregate on temp table: %w", err)
+	}
+	if result.Error != "" {
+		return nil, nil, nil, fmt.Errorf("aggregate error: %s", result.Error)
+	}
+
+	return result.Columns, result.RowValues, result.RowNulls, nil
 }
 
 // buildAggregateBaseQuery converts a COUNT(*) to SELECT pk FROM table [WHERE ...].
@@ -361,6 +465,214 @@ func (rh *ReadHandler) stripNewColumnsFromQuery(sql string, tables []string) str
 	return sql[:selectIdx+6] + " " + strings.Join(kept, ", ") + sql[fromIdx:]
 }
 
+// ---------------------------------------------------------------------------
+// P1 §2.6 — Full Prod Query Rewriting
+// ---------------------------------------------------------------------------
+
+// rewriteForProd rewrites a SQL query to be compatible with the Prod schema,
+// handling added, dropped, and renamed columns. Returns the rewritten SQL and
+// a boolean indicating whether the table is Shadow-only (skip Prod entirely).
+func (rh *ReadHandler) rewriteForProd(sql, table string) (string, bool) {
+	if rh.schemaRegistry == nil {
+		return sql, false
+	}
+
+	diff := rh.schemaRegistry.GetDiff(table)
+	if diff == nil {
+		return sql, false
+	}
+
+	// If the table is new (only in Shadow), skip Prod.
+	if diff.IsNewTable {
+		return sql, true
+	}
+
+	// If the table only exists in our table metadata as a new table, skip Prod.
+	if _, exists := rh.tables[table]; !exists {
+		return sql, true
+	}
+
+	// If the table is fully shadowed (after TRUNCATE), skip Prod.
+	if diff.IsFullyShadowed {
+		return sql, true
+	}
+
+	result := sql
+
+	// 1. Handle dropped columns: remove references from all clauses.
+	for _, droppedCol := range diff.Dropped {
+		result = removeColumnReferences(result, droppedCol)
+	}
+
+	// 2. Handle renamed columns: revert to Prod names.
+	for oldName, newName := range diff.Renamed {
+		result = replaceColumnNameMSSQL(result, newName, oldName)
+	}
+
+	// 3. Handle added columns: strip from SELECT list if present.
+	strippedSQL := rh.stripNewColumnsFromQuery(result, []string{table})
+	if strippedSQL != "" {
+		result = strippedSQL
+	}
+
+	return result, false
+}
+
+// removeColumnReferences removes references to a dropped column from SQL clauses.
+// Handles SELECT list, WHERE, ORDER BY, GROUP BY, and HAVING clauses.
+func removeColumnReferences(sql, colName string) string {
+	lower := strings.ToLower(colName)
+	result := sql
+
+	// Remove from SELECT list.
+	upper := strings.ToUpper(result)
+	selectIdx := strings.Index(upper, "SELECT")
+	fromIdx := strings.Index(upper, " FROM ")
+	if selectIdx >= 0 && fromIdx > selectIdx {
+		selectPart := result[selectIdx+6 : fromIdx]
+		parts := strings.Split(selectPart, ",")
+		var kept []string
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			cn := trimmed
+			if asIdx := strings.Index(strings.ToUpper(cn), " AS "); asIdx >= 0 {
+				cn = strings.TrimSpace(cn[:asIdx])
+			}
+			if dotIdx := strings.LastIndex(cn, "."); dotIdx >= 0 {
+				cn = cn[dotIdx+1:]
+			}
+			cn = strings.Trim(cn, "[]`\"")
+			if strings.EqualFold(cn, lower) {
+				continue
+			}
+			kept = append(kept, part)
+		}
+		if len(kept) > 0 && len(kept) < len(parts) {
+			result = result[:selectIdx+6] + strings.Join(kept, ",") + result[fromIdx:]
+		}
+	}
+
+	// Remove from ORDER BY clause.
+	result = removeColumnFromClause(result, colName, "ORDER BY")
+
+	// Remove from GROUP BY clause.
+	result = removeColumnFromClause(result, colName, "GROUP BY")
+
+	return result
+}
+
+// removeColumnFromClause removes references to a column from a specific SQL clause.
+func removeColumnFromClause(sql, colName, clause string) string {
+	upper := strings.ToUpper(sql)
+	clauseIdx := strings.Index(upper, clause)
+	if clauseIdx < 0 {
+		return sql
+	}
+
+	// Find the end of the clause.
+	afterClause := sql[clauseIdx+len(clause):]
+	clauseEnd := len(sql)
+
+	// The clause ends at the next major keyword.
+	for _, kw := range []string{"HAVING", "ORDER BY", "GROUP BY", "OFFSET", "FETCH", "OPTION", "FOR", "UNION", "INTERSECT", "EXCEPT"} {
+		if kw == clause {
+			continue
+		}
+		if idx := indexKeywordInSQL(strings.ToUpper(afterClause), kw); idx >= 0 {
+			if clauseIdx+len(clause)+idx < clauseEnd {
+				clauseEnd = clauseIdx + len(clause) + idx
+			}
+		}
+	}
+
+	clauseContent := sql[clauseIdx+len(clause) : clauseEnd]
+	parts := strings.Split(clauseContent, ",")
+	var kept []string
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		cn := trimmed
+		// Strip direction (ASC/DESC).
+		fields := strings.Fields(cn)
+		if len(fields) > 0 {
+			cn = fields[0]
+		}
+		if dotIdx := strings.LastIndex(cn, "."); dotIdx >= 0 {
+			cn = cn[dotIdx+1:]
+		}
+		cn = strings.Trim(cn, "[]`\"")
+		if strings.EqualFold(cn, colName) {
+			continue
+		}
+		kept = append(kept, part)
+	}
+
+	if len(kept) == 0 {
+		// Entire clause was removed — remove the clause keyword too.
+		return sql[:clauseIdx] + sql[clauseEnd:]
+	}
+	if len(kept) < len(parts) {
+		return sql[:clauseIdx+len(clause)] + strings.Join(kept, ",") + sql[clauseEnd:]
+	}
+	return sql
+}
+
+// indexKeywordInSQL finds a keyword at a word boundary in SQL.
+func indexKeywordInSQL(upper, kw string) int {
+	off := 0
+	for {
+		idx := strings.Index(upper[off:], kw)
+		if idx < 0 {
+			return -1
+		}
+		absIdx := off + idx
+		end := absIdx + len(kw)
+		beforeOK := absIdx == 0 || !isIdentCharMSSQL(upper[absIdx-1])
+		afterOK := end >= len(upper) || !isIdentCharMSSQL(upper[end])
+		if beforeOK && afterOK {
+			return absIdx
+		}
+		off = absIdx + 1
+	}
+}
+
+// isIdentCharMSSQL returns true if the byte is a valid SQL identifier character.
+func isIdentCharMSSQL(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') || b == '_'
+}
+
+// replaceColumnNameMSSQL replaces occurrences of a column name in SQL,
+// handling word boundaries to avoid replacing substrings.
+// Uses bracket-quoting awareness for MSSQL identifiers.
+func replaceColumnNameMSSQL(sql, oldCol, newCol string) string {
+	result := sql
+	offset := 0
+	for {
+		idx := strings.Index(strings.ToLower(result[offset:]), strings.ToLower(oldCol))
+		if idx < 0 {
+			break
+		}
+		pos := offset + idx
+		// Check word boundaries.
+		before := pos == 0 || !isIdentCharMSSQL(result[pos-1])
+		after := pos+len(oldCol) >= len(result) || !isIdentCharMSSQL(result[pos+len(oldCol)])
+		// Also handle bracket-quoted form.
+		if pos > 0 && result[pos-1] == '[' {
+			before = true
+		}
+		if pos+len(oldCol) < len(result) && result[pos+len(oldCol)] == ']' {
+			after = true
+		}
+		if before && after {
+			result = result[:pos] + newCol + result[pos+len(oldCol):]
+			offset = pos + len(newCol)
+		} else {
+			offset = pos + len(oldCol)
+		}
+	}
+	return result
+}
+
 // filterProdRows removes rows where the PK is in the delta map or tombstone set.
 func (rh *ReadHandler) filterProdRows(table string, result *TDSQueryResult) ([][]string, [][]bool) {
 	pkIdx := rh.findPKColumnIndex(table, result.Columns)
@@ -405,6 +717,7 @@ func (rh *ReadHandler) findPKColumnIndex(table string, columns []TDSColumnInfo) 
 }
 
 // dedup removes duplicate rows by PK, keeping the first occurrence.
+// P3 §4.9: For PK-less tables, falls back to full-row hash dedup.
 func (rh *ReadHandler) dedup(
 	table string,
 	columns []TDSColumnInfo,
@@ -413,7 +726,8 @@ func (rh *ReadHandler) dedup(
 ) ([][]string, [][]bool) {
 	meta, ok := rh.tables[table]
 	if !ok || len(meta.PKColumns) == 0 {
-		return values, nulls
+		// P3 §4.9: PK-less table — use full-row hash for dedup.
+		return deduplicateByFullRow(values, nulls)
 	}
 
 	pkCol := strings.ToLower(meta.PKColumns[0])
@@ -425,7 +739,8 @@ func (rh *ReadHandler) dedup(
 		}
 	}
 	if pkIdx < 0 {
-		return values, nulls
+		// PK column not in result — fall back to full-row hash dedup.
+		return deduplicateByFullRow(values, nulls)
 	}
 
 	seen := make(map[string]bool)
@@ -446,6 +761,49 @@ func (rh *ReadHandler) dedup(
 	}
 
 	return dedupValues, dedupNulls
+}
+
+// deduplicateByFullRow removes duplicate rows by hashing all column values.
+// P3 §4.9: Used for PK-less tables (MSSQL has no ctid equivalent).
+// Also used for DISTINCT support.
+// Shadow rows come first in the merged set, so they win on collision.
+func deduplicateByFullRow(values [][]string, nulls [][]bool) ([][]string, [][]bool) {
+	if len(values) == 0 {
+		return values, nulls
+	}
+
+	seen := make(map[string]bool)
+	var dedupValues [][]string
+	var dedupNulls [][]bool
+
+	for i, row := range values {
+		key := fullRowKey(row, nulls[i])
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		dedupValues = append(dedupValues, row)
+		dedupNulls = append(dedupNulls, nulls[i])
+	}
+
+	return dedupValues, dedupNulls
+}
+
+// fullRowKey builds a string key from all column values for dedup/hashing.
+func fullRowKey(row []string, rowNulls []bool) string {
+	var b strings.Builder
+	for j, val := range row {
+		if j > 0 {
+			b.WriteByte(0)
+		}
+		isNull := len(rowNulls) > j && rowNulls[j]
+		if isNull {
+			b.WriteString("\x00NULL\x00")
+		} else {
+			b.WriteString(val)
+		}
+	}
+	return b.String()
 }
 
 // mergeResultsMSSQL combines Shadow and filtered Prod results.

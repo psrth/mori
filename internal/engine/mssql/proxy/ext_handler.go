@@ -72,6 +72,24 @@ func (eh *ExtHandler) HandleRPC(
 		// Still forward to prod — sp_unprepare must reach the server.
 		return false, nil
 
+	// P2 §3.8: Cursor operations — forward to both backends.
+	case "SP_CURSOROPEN", "SP_CURSORPREPARE", "SP_CURSORPREPEXEC":
+		return true, eh.handleCursorOpen(clientConn, allRaw, fullPayload, sqlText)
+
+	case "SP_CURSORFETCH":
+		// Cursor fetch — forward to prod (cursor state lives there).
+		return false, nil
+
+	case "SP_CURSORCLOSE", "SP_CURSORUNPREPARE":
+		// Forward to both backends to clean up cursor state.
+		eh.shadowConn.Write(allRaw) //nolint: errcheck
+		drainTDSResponse(eh.shadowConn)
+		return false, nil
+
+	case "SP_CURSOREXECUTE":
+		// Forward to prod for cursor execution.
+		return false, nil
+
 	default:
 		return false, nil
 	}
@@ -145,13 +163,13 @@ func (eh *ExtHandler) handleSpPrepare(
 
 // handleSpExecute looks up the cached SQL for the handle, classifies it,
 // and routes accordingly. If the handle is not found, passes through to prod.
+// P3 §4.8: Extracts parameters from the RPC payload for PK substitution.
 func (eh *ExtHandler) handleSpExecute(
 	clientConn net.Conn,
 	allRaw []byte,
 	fullPayload []byte,
 	handleStr string,
 ) error {
-	// handleStr from parseRPCPayload is the handle value as a string.
 	handle := parseHandleFromParam(handleStr)
 
 	eh.stmtMu.RLock()
@@ -159,11 +177,18 @@ func (eh *ExtHandler) handleSpExecute(
 	eh.stmtMu.RUnlock()
 
 	if !found {
-		// Unknown handle — pass through to prod.
 		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
 	}
 
-	classification, err := eh.classifier.Classify(sqlText)
+	// P3 §4.8: Extract parameters from the RPC payload for PK substitution.
+	params := extractExecuteParams(fullPayload)
+	var classification *core.Classification
+	var err error
+	if len(params) > 0 {
+		classification, err = eh.classifier.ClassifyWithParams(sqlText, params)
+	} else {
+		classification, err = eh.classifier.Classify(sqlText)
+	}
 	if err != nil {
 		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
 	}
@@ -178,6 +203,223 @@ func (eh *ExtHandler) handleSpExecute(
 	eh.logger.Query(eh.connID, sqlText, classification, strategy, 0)
 
 	return eh.dispatchByStrategy(clientConn, allRaw, fullPayload, classification, strategy)
+}
+
+// extractExecuteParams extracts parameter values from an sp_execute RPC payload.
+// The first parameter is the handle (int), followed by the bound values.
+func extractExecuteParams(payload []byte) []interface{} {
+	if len(payload) < 4 {
+		return nil
+	}
+
+	// Skip ALL_HEADERS.
+	allHeadersLen := int(binary.LittleEndian.Uint32(payload[0:4]))
+	if allHeadersLen < 4 || allHeadersLen > len(payload) {
+		allHeadersLen = 0
+	}
+	pos := allHeadersLen
+
+	// Skip proc name/ID.
+	if pos+2 > len(payload) {
+		return nil
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+	pos += 2
+	if nameLen == 0xFFFF {
+		pos += 2 // proc ID
+	} else {
+		pos += nameLen * 2
+	}
+
+	// Skip OptionFlags.
+	if pos+2 > len(payload) {
+		return nil
+	}
+	pos += 2
+
+	// Skip the first parameter (the handle).
+	pos = skipRPCParam(payload, pos)
+
+	// Extract remaining parameters.
+	var params []interface{}
+	for pos < len(payload) {
+		val, newPos := extractRPCParamValue(payload, pos)
+		if newPos <= pos {
+			break
+		}
+		params = append(params, val)
+		pos = newPos
+	}
+
+	return params
+}
+
+// skipRPCParam skips over a single RPC parameter and returns the new position.
+func skipRPCParam(payload []byte, pos int) int {
+	if pos >= len(payload) {
+		return pos
+	}
+	// Parameter name: 1-byte length in chars.
+	nameLen := int(payload[pos])
+	pos++
+	pos += nameLen * 2
+	if pos >= len(payload) {
+		return pos
+	}
+	// StatusFlags.
+	pos++
+	if pos >= len(payload) {
+		return pos
+	}
+	// TYPE_INFO + value (simplified skip).
+	typeID := payload[pos]
+	pos++
+	switch typeID {
+	case 0x26: // INTN
+		if pos >= len(payload) {
+			return pos
+		}
+		pos++ // max length
+		if pos >= len(payload) {
+			return pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		pos += dataLen
+	case 0xE7: // NVARCHAR
+		if pos+7 > len(payload) {
+			return pos
+		}
+		maxLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2 + 5 // max length + collation
+		if maxLen == 0xFFFF {
+			// PLP encoding — skip chunks.
+			if pos+8 > len(payload) {
+				return pos
+			}
+			pos += 8 // total length
+			for {
+				if pos+4 > len(payload) {
+					return pos
+				}
+				chunkLen := int(binary.LittleEndian.Uint32(payload[pos : pos+4]))
+				pos += 4
+				if chunkLen == 0 {
+					break
+				}
+				pos += chunkLen
+			}
+		} else {
+			if pos+2 > len(payload) {
+				return pos
+			}
+			dataLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+			pos += 2
+			if dataLen != 0xFFFF {
+				pos += dataLen
+			}
+		}
+	default:
+		// Unknown type — can't skip reliably, return current position.
+		return len(payload)
+	}
+	return pos
+}
+
+// extractRPCParamValue extracts the string value of an RPC parameter at the given position.
+func extractRPCParamValue(payload []byte, pos int) (interface{}, int) {
+	if pos >= len(payload) {
+		return nil, pos
+	}
+	// Parameter name.
+	nameLen := int(payload[pos])
+	pos++
+	pos += nameLen * 2
+	if pos >= len(payload) {
+		return nil, pos
+	}
+	// StatusFlags.
+	pos++
+	if pos >= len(payload) {
+		return nil, pos
+	}
+	// TYPE_INFO.
+	typeID := payload[pos]
+	pos++
+	switch typeID {
+	case 0x26: // INTN
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		pos++ // max length
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		switch dataLen {
+		case 4:
+			val := int32(binary.LittleEndian.Uint32(payload[pos : pos+4]))
+			pos += 4
+			return val, pos
+		case 2:
+			val := int16(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+			pos += 2
+			return val, pos
+		case 8:
+			val := int64(binary.LittleEndian.Uint64(payload[pos : pos+8]))
+			pos += 8
+			return val, pos
+		default:
+			pos += dataLen
+			return nil, pos
+		}
+	case 0xE7: // NVARCHAR
+		if pos+7 > len(payload) {
+			return nil, pos
+		}
+		maxLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2 + 5
+		if maxLen == 0xFFFF {
+			str := readPLPString(payload, pos)
+			// Skip PLP data.
+			if pos+8 > len(payload) {
+				return str, pos
+			}
+			pos += 8
+			for {
+				if pos+4 > len(payload) {
+					break
+				}
+				chunkLen := int(binary.LittleEndian.Uint32(payload[pos : pos+4]))
+				pos += 4
+				if chunkLen == 0 {
+					break
+				}
+				pos += chunkLen
+			}
+			return str, pos
+		}
+		if pos+2 > len(payload) {
+			return nil, pos
+		}
+		dataLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+		if dataLen == 0xFFFF {
+			return nil, pos
+		}
+		if pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		str := decodeUTF16LE(payload[pos : pos+dataLen])
+		pos += dataLen
+		return str, pos
+	default:
+		return nil, len(payload)
+	}
 }
 
 // handleSpUnprepare evicts a handle from the cache.
@@ -221,6 +463,33 @@ func (eh *ExtHandler) dispatchByStrategy(
 		eh.shadowConn.Write(allRaw) //nolint: errcheck
 		drainTDSResponse(eh.shadowConn)
 		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
+
+	case core.StrategyNotSupported:
+		msg := cl.NotSupportedMsg
+		if msg == "" {
+			msg = "this operation is not supported through the Mori proxy"
+		}
+		errPkt := buildErrorResponse(msg)
+		_, err := clientConn.Write(errPkt)
+		return err
+
+	case core.StrategyTruncate:
+		// Forward to Shadow, mark table fully shadowed.
+		if err := forwardAndRelay(allRaw, eh.shadowConn, clientConn); err != nil {
+			return err
+		}
+		for _, table := range cl.Tables {
+			if eh.schemaRegistry != nil {
+				eh.schemaRegistry.MarkFullyShadowed(table)
+			}
+			if eh.deltaMap != nil {
+				eh.deltaMap.ClearTable(table)
+			}
+			if eh.tombstones != nil {
+				eh.tombstones.ClearTable(table)
+			}
+		}
+		return nil
 
 	default:
 		// ProdDirect or unknown — forward to prod.
@@ -477,6 +746,24 @@ func readPLPString(payload []byte, pos int) string {
 	}
 
 	return decodeUTF16LE(allData)
+}
+
+// handleCursorOpen processes cursor open RPCs by classifying the inner query.
+// If the query affects dirty tables, the cursor is opened on prod (as fallback).
+// Full cursor materialization via temp tables is a future enhancement.
+func (eh *ExtHandler) handleCursorOpen(
+	clientConn net.Conn,
+	allRaw []byte,
+	_ []byte,
+	sqlText string,
+) error {
+	// For now, forward cursor opens to prod.
+	// Future: classify inner query, if dirty tables → materialize via merged read.
+	if eh.verbose && sqlText != "" {
+		log.Printf("[conn %d] ext: cursor open, forwarding to prod: %s",
+			eh.connID, truncateSQL(sqlText, 80))
+	}
+	return forwardAndRelay(allRaw, eh.prodConn, clientConn)
 }
 
 // parseHandleFromParam parses a string-encoded int32 handle.

@@ -51,9 +51,9 @@ func TestClassify_Writes(t *testing.T) {
 		{"insert", "INSERT INTO users (name) VALUES ('alice')", core.OpWrite, core.SubInsert},
 		{"update", "UPDATE users SET name = 'bob' WHERE id = 1", core.OpWrite, core.SubUpdate},
 		{"delete", "DELETE FROM users WHERE id = 1", core.OpWrite, core.SubDelete},
-		{"truncate", "TRUNCATE TABLE users", core.OpWrite, core.SubOther},
+		{"truncate", "TRUNCATE TABLE users", core.OpWrite, core.SubTruncate},
 		{"merge", "MERGE INTO users USING source ON users.id = source.id WHEN MATCHED THEN UPDATE SET name = source.name", core.OpWrite, core.SubOther},
-		{"bulk insert", "BULK INSERT users FROM 'data.csv'", core.OpWrite, core.SubInsert},
+		{"bulk insert", "BULK INSERT users FROM 'data.csv'", core.OpWrite, core.SubNotSupported},
 	}
 
 	for _, tt := range tests {
@@ -362,7 +362,7 @@ func TestClassifyWithParams(t *testing.T) {
 	}
 	c := New(tables)
 
-	cl, err := c.ClassifyWithParams("SELECT * FROM users WHERE id = @p1", []interface{}{42})
+	cl, err := c.ClassifyWithParams("SELECT * FROM users WHERE id = @p1", []any{42})
 	if err != nil {
 		t.Fatalf("ClassifyWithParams error: %v", err)
 	}

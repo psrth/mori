@@ -68,10 +68,10 @@ func NewSafeProdConn(inner net.Conn, connID int64, verbose bool, logger *logging
 	}
 }
 
-// Write inspects outgoing data for SQL_BATCH messages containing write SQL.
+// Write inspects outgoing data for SQL_BATCH and RPC messages containing write SQL.
+// P3 §4.7: Extended to also inspect RPC (sp_executesql) packets.
 func (s *SafeProdConn) Write(b []byte) (int, error) {
 	// TDS packet: 8-byte header + payload.
-	// Check if this is a SQL_BATCH packet (type 0x01).
 	if len(b) >= tdsHeaderSize+4 {
 		pktType := b[0]
 		if pktType == typeSQLBatch {
@@ -92,6 +92,28 @@ func (s *SafeProdConn) Write(b []byte) (int, error) {
 				}
 
 				return 0, fmt.Errorf("write guard: write query blocked from reaching production")
+			}
+		}
+
+		// P3 §4.7: Inspect RPC packets for sp_executesql containing writes.
+		if pktType == typeRPC {
+			payload := b[tdsHeaderSize:]
+			_, sqlText, ok := parseRPCPayload(payload)
+			if ok && sqlText != "" && looksLikeWrite(sqlText) {
+				msg := fmt.Sprintf("[CRITICAL] [conn %d] WRITE GUARD L2 (RPC): blocked write to prod: %s",
+					s.connID, truncateSQL(sqlText, 120))
+				log.Printf("%s", msg)
+
+				if s.logger != nil {
+					s.logger.Log(logging.LogEntry{
+						Level:  "critical",
+						ConnID: s.connID,
+						Event:  "write_guard_l2_rpc",
+						Detail: msg,
+					})
+				}
+
+				return 0, fmt.Errorf("write guard: write RPC blocked from reaching production")
 			}
 		}
 	}
