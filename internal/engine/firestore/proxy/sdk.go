@@ -75,7 +75,7 @@ func dialSDKProd(ctx context.Context, prodAddr, credentialsFile string) (*firest
 }
 
 // dialSDKShadow creates an SDK client connecting to the local emulator.
-func dialSDKShadow(ctx context.Context, shadowAddr, projectID string) (*firestore.Client, error) {
+func dialSDKShadow(ctx context.Context, shadowAddr, _ string) (*firestore.Client, error) {
 	// Set the emulator host environment variable for the SDK.
 	os.Setenv("FIRESTORE_EMULATOR_HOST", shadowAddr)
 

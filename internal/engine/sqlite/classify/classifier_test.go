@@ -118,8 +118,8 @@ func TestClassify_Transactions(t *testing.T) {
 		{"commit", "COMMIT", core.SubCommit},
 		{"end", "END", core.SubCommit},
 		{"rollback", "ROLLBACK", core.SubRollback},
-		{"savepoint", "SAVEPOINT sp1", core.SubOther},
-		{"release", "RELEASE SAVEPOINT sp1", core.SubOther},
+		{"savepoint", "SAVEPOINT sp1", core.SubSavepoint},
+		{"release", "RELEASE SAVEPOINT sp1", core.SubRelease},
 	}
 
 	for _, tt := range tests {

@@ -32,6 +32,7 @@ type Proxy struct {
 	schemaRegistry *coreSchema.Registry
 	moriDir        string
 	logger         *logging.Logger
+	maxRowsHydrate int
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -49,8 +50,9 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	tables map[string]schema.TableMeta, moriDir string,
 	schemaRegistry *coreSchema.Registry,
 	logger *logging.Logger,
+	maxRowsHydrate ...int,
 ) *Proxy {
-	return &Proxy{
+	p := &Proxy{
 		prodAddr:       prodAddr,
 		shadowAddr:     shadowAddr,
 		shadowDBName:   shadowDBName,
@@ -66,6 +68,10 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		logger:         logger,
 		shutdownCh:     make(chan struct{}),
 	}
+	if len(maxRowsHydrate) > 0 {
+		p.maxRowsHydrate = maxRowsHydrate[0]
+	}
+	return p
 }
 
 // ListenAndServe binds the TCP listener and enters the accept loop.

@@ -163,6 +163,12 @@ func buildReadyForQueryMsg() []byte {
 	return buildPGMsg('Z', []byte{'I'})
 }
 
+// buildReadyForQueryMsgState constructs a ReadyForQuery ('Z') message with the given state.
+// Valid states: 'I' (idle), 'T' (in transaction), 'E' (failed transaction).
+func buildReadyForQueryMsgState(state byte) []byte {
+	return buildPGMsg('Z', []byte{state})
+}
+
 // buildErrorResponse constructs an ErrorResponse ('E') followed by ReadyForQuery.
 func buildErrorResponse(message string) []byte {
 	var errPayload []byte
@@ -253,6 +259,7 @@ func parseParseMsgPayload(payload []byte) (stmtName, sql string, err error) {
 }
 
 // parseBindMsgPayload extracts the statement name and parameter values from a Bind ('B') payload.
+// P3 4.6: Handles both text-format and binary-format parameters.
 func parseBindMsgPayload(payload []byte) (stmtName string, params []string, err error) {
 	if len(payload) == 0 {
 		return "", nil, fmt.Errorf("empty Bind payload")
@@ -268,19 +275,27 @@ func parseBindMsgPayload(payload []byte) (stmtName string, params []string, err 
 	if err != nil {
 		return "", nil, fmt.Errorf("reading statement name: %w", err)
 	}
-	// Skip format codes.
+	// Read format codes (0=text, 1=binary).
 	if pos+2 > len(payload) {
 		return stmtName, nil, nil
 	}
 	fmtCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-	pos += 2 + fmtCount*2
+	pos += 2
+	fmtCodes := make([]int16, fmtCount)
+	for i := range fmtCount {
+		if pos+2 > len(payload) {
+			break
+		}
+		fmtCodes[i] = int16(binary.BigEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+	}
 	// Read parameter values.
 	if pos+2 > len(payload) {
 		return stmtName, nil, nil
 	}
 	paramCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
 	pos += 2
-	for i := 0; i < paramCount; i++ {
+	for i := range paramCount {
 		if pos+4 > len(payload) {
 			break
 		}
@@ -293,10 +308,76 @@ func parseBindMsgPayload(payload []byte) (stmtName string, params []string, err 
 		if pos+paramLen > len(payload) {
 			break
 		}
-		params = append(params, string(payload[pos:pos+paramLen]))
+
+		// Determine format for this parameter.
+		isBinary := false
+		if len(fmtCodes) == 1 {
+			isBinary = fmtCodes[0] == 1 // Single format code applies to all
+		} else if i < len(fmtCodes) {
+			isBinary = fmtCodes[i] == 1
+		}
+
+		if isBinary {
+			// P3 4.6: Decode binary-format parameters.
+			params = append(params, decodeBinaryParam(payload[pos:pos+paramLen]))
+		} else {
+			params = append(params, string(payload[pos:pos+paramLen]))
+		}
 		pos += paramLen
 	}
 	return stmtName, params, nil
+}
+
+// decodeBinaryParam decodes a binary-format parameter value to its text representation.
+// Handles common PostgreSQL binary types based on byte length.
+func decodeBinaryParam(data []byte) string {
+	switch len(data) {
+	case 1:
+		// bool: 0 = false, 1 = true
+		if data[0] == 0 {
+			return "false"
+		}
+		return "true"
+	case 2:
+		// int16
+		val := int16(binary.BigEndian.Uint16(data))
+		return fmt.Sprintf("%d", val)
+	case 4:
+		// int32
+		val := int32(binary.BigEndian.Uint32(data))
+		return fmt.Sprintf("%d", val)
+	case 8:
+		// int64
+		val := int64(binary.BigEndian.Uint64(data))
+		return fmt.Sprintf("%d", val)
+	case 16:
+		// UUID: format as 8-4-4-4-12
+		return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+			data[0:4], data[4:6], data[6:8], data[8:10], data[10:16])
+	default:
+		// Fall back to text representation.
+		return string(data)
+	}
+}
+
+// parseExecuteMsgPayload extracts the portal name and max rows from an Execute ('E') payload.
+// Format: portal\0 + int32(maxRows). maxRows of 0 means "return all rows".
+func parseExecuteMsgPayload(payload []byte) (portal string, maxRows int32, err error) {
+	if len(payload) == 0 {
+		return "", 0, fmt.Errorf("empty Execute payload")
+	}
+
+	pos := 0
+	portal, pos, err = readNullTerminatedString(payload, pos)
+	if err != nil {
+		return "", 0, fmt.Errorf("reading portal name: %w", err)
+	}
+
+	if pos+4 > len(payload) {
+		return portal, 0, nil // maxRows defaults to 0 (unlimited)
+	}
+	maxRows = int32(binary.BigEndian.Uint32(payload[pos : pos+4]))
+	return portal, maxRows, nil
 }
 
 // parseCloseMsgPayload extracts the close target type and name from a Close ('C') payload.

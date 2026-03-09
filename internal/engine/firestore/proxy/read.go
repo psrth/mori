@@ -14,17 +14,19 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 // readHandler implements document-level merged reads for Firestore.
 type readHandler struct {
-	prodClient   *firestore.Client
-	shadowClient *firestore.Client
-	deltaMap     *delta.Map
-	tombstones   *delta.TombstoneSet
-	projectID    string
-	databaseID   string
-	verbose      bool
+	prodClient          *firestore.Client
+	shadowClient        *firestore.Client
+	deltaMap            *delta.Map
+	tombstones          *delta.TombstoneSet
+	projectID           string
+	databaseID          string
+	verbose             bool
+	activeTransactionFn func(string) bool // checks if a txn ID is active
 }
 
 // getDocument performs a merged GetDocument: if the doc path is in the delta map,
@@ -126,6 +128,7 @@ func (h *readHandler) batchGetDocuments(ctx context.Context, req *firestorepb.Ba
 // by document path (shadow wins on conflicts), filters tombstoned docs.
 func (h *readHandler) listDocuments(ctx context.Context, req *firestorepb.ListDocumentsRequest) (*firestorepb.ListDocumentsResponse, error) {
 	collection := extractCollectionFromParent(req.GetParent(), req.GetCollectionId())
+	origPageSize := req.GetPageSize()
 
 	// If no deltas or inserts for this collection, just query prod and filter tombstones.
 	if !h.deltaMap.AnyTableDelta([]string{collection}) && !h.deltaMap.HasInserts(collection) {
@@ -134,11 +137,30 @@ func (h *readHandler) listDocuments(ctx context.Context, req *firestorepb.ListDo
 			return nil, err
 		}
 		filtered := filterTombstoned(prodDocs, collection, h.tombstones)
+		if origPageSize > 0 && int32(len(filtered)) > origPageSize {
+			nextToken := ""
+			if len(filtered) > int(origPageSize) {
+				nextToken = filtered[origPageSize].GetName()
+			}
+			return &firestorepb.ListDocumentsResponse{
+				Documents:     filtered[:origPageSize],
+				NextPageToken: nextToken,
+			}, nil
+		}
 		return &firestorepb.ListDocumentsResponse{Documents: filtered}, nil
 	}
 
+	// Over-fetch from prod if there's a page_size limit.
+	prodReq := req
+	if origPageSize > 0 {
+		deltaCount := h.deltaMap.CountForTable(collection)
+		tombstoneCount := h.tombstones.CountForTable(collection)
+		overFetch := origPageSize + int32(deltaCount) + int32(tombstoneCount)
+		prodReq = cloneListDocumentsRequestWithPageSize(req, overFetch)
+	}
+
 	// Query both backends via iterators.
-	prodDocs, prodErr := collectListDocuments(ctx, h.prodClient, req)
+	prodDocs, prodErr := collectListDocuments(ctx, h.prodClient, prodReq)
 	shadowDocs, shadowErr := collectListDocuments(ctx, h.shadowClient, req)
 
 	if prodErr != nil && shadowErr != nil {
@@ -147,7 +169,18 @@ func (h *readHandler) listDocuments(ctx context.Context, req *firestorepb.ListDo
 
 	merged := mergeDocuments(prodDocs, shadowDocs, collection, h.deltaMap, h.tombstones)
 
-	return &firestorepb.ListDocumentsResponse{Documents: merged}, nil
+	// Apply original page_size after merge.
+	resp := &firestorepb.ListDocumentsResponse{}
+	if origPageSize > 0 && int32(len(merged)) > origPageSize {
+		resp.Documents = merged[:origPageSize]
+		if len(merged) > int(origPageSize) {
+			resp.NextPageToken = merged[origPageSize].GetName()
+		}
+	} else {
+		resp.Documents = merged
+	}
+
+	return resp, nil
 }
 
 // collectListDocuments iterates through a ListDocuments result and collects all documents.
@@ -172,24 +205,237 @@ func collectListDocuments(ctx context.Context, client *firestore.Client, req *fi
 func (h *readHandler) runQuery(ctx context.Context, req *firestorepb.RunQueryRequest) ([]*firestorepb.RunQueryResponse, error) {
 	collection := extractCollectionFromQuery(req)
 
+	// Extract ORDER BY and LIMIT from the structured query for post-merge application.
+	sq := req.GetStructuredQuery()
+	var orderBy []*firestorepb.StructuredQuery_Order
+	var origLimit int32
+	isCollectionGroup := false
+	if sq != nil {
+		orderBy = sq.GetOrderBy()
+		if sq.GetLimit() != nil {
+			origLimit = sq.GetLimit().GetValue()
+		}
+		// Check if this is a collection group query (allDescendants).
+		if from := sq.GetFrom(); len(from) > 0 && from[0].GetAllDescendants() {
+			isCollectionGroup = true
+		}
+	}
+
+	// For collection group queries, use the full document path for dedup
+	// since the same collection ID can appear under different parent paths.
+	_ = isCollectionGroup // Used in merge logic below.
+
 	// If no deltas for this collection, just query prod and filter tombstones.
 	if !h.deltaMap.AnyTableDelta([]string{collection}) && !h.deltaMap.HasInserts(collection) {
 		results, err := collectQueryResults(ctx, h.prodClient, req)
 		if err != nil {
 			return nil, err
 		}
-		return filterTombstonedQueryResults(results, collection, h.tombstones), nil
+		filtered := filterTombstonedQueryResults(results, collection, h.tombstones)
+		// Re-sort and apply limit if needed (tombstone removal may affect ordering).
+		if len(orderBy) > 0 {
+			sortQueryResults(filtered, orderBy)
+		}
+		if origLimit > 0 && int32(len(filtered)) > origLimit {
+			filtered = filtered[:origLimit]
+		}
+		return filtered, nil
+	}
+
+	// Over-fetch from prod if there's a limit: request more to compensate for
+	// merged/tombstoned documents.
+	prodReq := req
+	if origLimit > 0 {
+		deltaCount := h.deltaMap.CountForTable(collection)
+		tombstoneCount := h.tombstones.CountForTable(collection)
+		overFetch := origLimit + int32(deltaCount) + int32(tombstoneCount)
+		prodReq = cloneRunQueryRequestWithLimit(req, overFetch)
 	}
 
 	// Query both backends.
-	prodResults, prodErr := collectQueryResults(ctx, h.prodClient, req)
+	prodResults, prodErr := collectQueryResults(ctx, h.prodClient, prodReq)
 	shadowResults, shadowErr := collectQueryResults(ctx, h.shadowClient, req)
 
 	if prodErr != nil && shadowErr != nil {
 		return nil, fmt.Errorf("both backends failed: prod=%v, shadow=%v", prodErr, shadowErr)
 	}
 
-	return mergeQueryResults(prodResults, shadowResults, collection, h.deltaMap, h.tombstones), nil
+	merged := mergeQueryResults(prodResults, shadowResults, collection, h.deltaMap, h.tombstones)
+
+	// Re-evaluate WHERE filter on merged results: shadow documents may no longer
+	// match the original query's filter after being updated.
+	if sq != nil && sq.GetWhere() != nil {
+		merged = filterByQuery(merged, sq.GetWhere())
+	}
+
+	// Re-sort merged results according to original ORDER BY.
+	if len(orderBy) > 0 {
+		sortQueryResults(merged, orderBy)
+	}
+
+	// Apply original LIMIT after merge.
+	if origLimit > 0 && int32(len(merged)) > origLimit {
+		merged = merged[:origLimit]
+	}
+
+	return merged, nil
+}
+
+// runAggregationQuery performs a merged RunAggregationQuery by running the base
+// query through the merged read pipeline and re-computing aggregations in memory.
+func (h *readHandler) runAggregationQuery(ctx context.Context, req *firestorepb.RunAggregationQueryRequest) ([]*firestorepb.RunAggregationQueryResponse, error) {
+	aggQuery := req.GetStructuredAggregationQuery()
+	if aggQuery == nil {
+		// No structured aggregation query — forward to prod directly.
+		return collectAggregationResults(ctx, h.prodClient, req)
+	}
+
+	baseQuery := aggQuery.GetStructuredQuery()
+	if baseQuery == nil {
+		return collectAggregationResults(ctx, h.prodClient, req)
+	}
+
+	// Build a RunQueryRequest from the base query.
+	runReq := &firestorepb.RunQueryRequest{
+		Parent:    req.GetParent(),
+		QueryType: &firestorepb.RunQueryRequest_StructuredQuery{StructuredQuery: baseQuery},
+	}
+
+	// Run through the merged query pipeline.
+	queryResults, err := h.runQuery(ctx, runReq)
+	if err != nil {
+		return nil, err
+	}
+
+	// Compute aggregations in memory.
+	aggResults := computeAggregations(queryResults, aggQuery.GetAggregations())
+
+	return []*firestorepb.RunAggregationQueryResponse{
+		{
+			Result: aggResults,
+		},
+	}, nil
+}
+
+// collectAggregationResults runs an aggregation query and collects results.
+func collectAggregationResults(ctx context.Context, client *firestore.Client, req *firestorepb.RunAggregationQueryRequest) ([]*firestorepb.RunAggregationQueryResponse, error) {
+	stream, err := client.RunAggregationQuery(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	var results []*firestorepb.RunAggregationQueryResponse
+	for {
+		resp, err := stream.Recv()
+		if err != nil {
+			if isStreamDone(err) {
+				break
+			}
+			return results, err
+		}
+		if resp != nil {
+			results = append(results, resp)
+		}
+	}
+	return results, nil
+}
+
+// computeAggregations applies aggregation operations over merged query results.
+func computeAggregations(results []*firestorepb.RunQueryResponse, aggregations []*firestorepb.StructuredAggregationQuery_Aggregation) *firestorepb.AggregationResult {
+	fields := make(map[string]*firestorepb.Value)
+
+	for i, agg := range aggregations {
+		alias := agg.GetAlias()
+		if alias == "" {
+			alias = fmt.Sprintf("field_%d", i)
+		}
+
+		switch agg.GetOperator().(type) {
+		case *firestorepb.StructuredAggregationQuery_Aggregation_Count_:
+			// COUNT: count the number of documents.
+			count := int64(0)
+			for _, r := range results {
+				if r.GetDocument() != nil {
+					count++
+				}
+			}
+			fields[alias] = &firestorepb.Value{
+				ValueType: &firestorepb.Value_IntegerValue{IntegerValue: count},
+			}
+
+		case *firestorepb.StructuredAggregationQuery_Aggregation_Sum_:
+			// SUM: sum the specified field.
+			sumAgg := agg.GetSum()
+			fieldPath := sumAgg.GetField().GetFieldPath()
+			sum := 0.0
+			hasValues := false
+			for _, r := range results {
+				doc := r.GetDocument()
+				if doc == nil {
+					continue
+				}
+				val := doc.GetFields()[fieldPath]
+				if val == nil {
+					continue
+				}
+				switch v := val.GetValueType().(type) {
+				case *firestorepb.Value_IntegerValue:
+					sum += float64(v.IntegerValue)
+					hasValues = true
+				case *firestorepb.Value_DoubleValue:
+					sum += v.DoubleValue
+					hasValues = true
+				}
+			}
+			if hasValues {
+				fields[alias] = &firestorepb.Value{
+					ValueType: &firestorepb.Value_DoubleValue{DoubleValue: sum},
+				}
+			} else {
+				fields[alias] = &firestorepb.Value{
+					ValueType: &firestorepb.Value_IntegerValue{IntegerValue: 0},
+				}
+			}
+
+		case *firestorepb.StructuredAggregationQuery_Aggregation_Avg_:
+			// AVG: average the specified field.
+			avgAgg := agg.GetAvg()
+			fieldPath := avgAgg.GetField().GetFieldPath()
+			sum := 0.0
+			count := 0
+			for _, r := range results {
+				doc := r.GetDocument()
+				if doc == nil {
+					continue
+				}
+				val := doc.GetFields()[fieldPath]
+				if val == nil {
+					continue
+				}
+				switch v := val.GetValueType().(type) {
+				case *firestorepb.Value_IntegerValue:
+					sum += float64(v.IntegerValue)
+					count++
+				case *firestorepb.Value_DoubleValue:
+					sum += v.DoubleValue
+					count++
+				}
+			}
+			if count > 0 {
+				fields[alias] = &firestorepb.Value{
+					ValueType: &firestorepb.Value_DoubleValue{DoubleValue: sum / float64(count)},
+				}
+			} else {
+				fields[alias] = &firestorepb.Value{
+					ValueType: &firestorepb.Value_NullValue{},
+				}
+			}
+		}
+	}
+
+	return &firestorepb.AggregationResult{
+		AggregateFields: fields,
+	}
 }
 
 // collectQueryResults runs a query and collects all streaming results.
@@ -373,11 +619,10 @@ func filterTombstonedQueryResults(results []*firestorepb.RunQueryResponse, colle
 // e.g. "projects/p/databases/d/documents/users/abc123" → ("users", "abc123")
 func splitDocPath(path string) (collection, docID string) {
 	const marker = "/documents/"
-	idx := strings.Index(path, marker)
-	if idx < 0 {
+	_, rest, found := strings.Cut(path, marker)
+	if !found {
 		return "", ""
 	}
-	rest := path[idx+len(marker):]
 	// rest is e.g. "users/abc123" or "users/abc123/subcol/doc2"
 	// We extract the last collection/docID pair.
 	parts := strings.Split(rest, "/")
@@ -396,11 +641,10 @@ func extractCollectionFromParent(parent, collectionID string) string {
 	}
 	// Fallback: try to extract from parent path.
 	const marker = "/documents/"
-	idx := strings.Index(parent, marker)
-	if idx < 0 {
+	_, rest, found := strings.Cut(parent, marker)
+	if !found {
 		return ""
 	}
-	rest := parent[idx+len(marker):]
 	parts := strings.Split(rest, "/")
 	if len(parts) > 0 {
 		return parts[0]
@@ -420,4 +664,475 @@ func extractCollectionFromQuery(req *firestorepb.RunQueryRequest) string {
 		return from[0].GetCollectionId()
 	}
 	return extractCollectionFromParent(req.GetParent(), "")
+}
+
+// sortQueryResults sorts RunQuery results according to the given ORDER BY clauses.
+func sortQueryResults(results []*firestorepb.RunQueryResponse, orderBy []*firestorepb.StructuredQuery_Order) {
+	if len(orderBy) == 0 || len(results) < 2 {
+		return
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		docI := results[i].GetDocument()
+		docJ := results[j].GetDocument()
+		if docI == nil || docJ == nil {
+			return docI != nil
+		}
+
+		for _, order := range orderBy {
+			fieldPath := order.GetField().GetFieldPath()
+			dir := order.GetDirection()
+
+			var valI, valJ *firestorepb.Value
+			if fieldPath == "__name__" {
+				// Sort by document path.
+				valI = &firestorepb.Value{ValueType: &firestorepb.Value_StringValue{StringValue: docI.GetName()}}
+				valJ = &firestorepb.Value{ValueType: &firestorepb.Value_StringValue{StringValue: docJ.GetName()}}
+			} else {
+				valI = docI.GetFields()[fieldPath]
+				valJ = docJ.GetFields()[fieldPath]
+			}
+
+			cmp := compareValues(valI, valJ)
+			if cmp == 0 {
+				continue
+			}
+
+			ascending := dir != firestorepb.StructuredQuery_DESCENDING
+			if ascending {
+				return cmp < 0
+			}
+			return cmp > 0
+		}
+		return false
+	})
+}
+
+// compareValues compares two Firestore values. Returns -1, 0, or 1.
+// Follows Firestore's value type ordering: null < bool < number < timestamp < string < bytes < ref < geo < array < map.
+func compareValues(a, b *firestorepb.Value) int {
+	if a == nil && b == nil {
+		return 0
+	}
+	if a == nil {
+		return -1
+	}
+	if b == nil {
+		return 1
+	}
+
+	typeOrderA := valueTypeOrder(a)
+	typeOrderB := valueTypeOrder(b)
+	if typeOrderA != typeOrderB {
+		if typeOrderA < typeOrderB {
+			return -1
+		}
+		return 1
+	}
+
+	// Same type — compare within type.
+	switch a.GetValueType().(type) {
+	case *firestorepb.Value_NullValue:
+		return 0
+
+	case *firestorepb.Value_BooleanValue:
+		aB := a.GetBooleanValue()
+		bB := b.GetBooleanValue()
+		if aB == bB {
+			return 0
+		}
+		if !aB {
+			return -1 // false < true
+		}
+		return 1
+
+	case *firestorepb.Value_IntegerValue:
+		aI := a.GetIntegerValue()
+		bVal := b
+		// Handle comparison with double.
+		if _, ok := bVal.GetValueType().(*firestorepb.Value_DoubleValue); ok {
+			aF := float64(aI)
+			bF := bVal.GetDoubleValue()
+			return compareFloat(aF, bF)
+		}
+		bI := bVal.GetIntegerValue()
+		if aI < bI {
+			return -1
+		}
+		if aI > bI {
+			return 1
+		}
+		return 0
+
+	case *firestorepb.Value_DoubleValue:
+		aF := a.GetDoubleValue()
+		bVal := b
+		if _, ok := bVal.GetValueType().(*firestorepb.Value_IntegerValue); ok {
+			bF := float64(bVal.GetIntegerValue())
+			return compareFloat(aF, bF)
+		}
+		bF := bVal.GetDoubleValue()
+		return compareFloat(aF, bF)
+
+	case *firestorepb.Value_TimestampValue:
+		aT := a.GetTimestampValue()
+		bT := b.GetTimestampValue()
+		if aT.GetSeconds() != bT.GetSeconds() {
+			if aT.GetSeconds() < bT.GetSeconds() {
+				return -1
+			}
+			return 1
+		}
+		if aT.GetNanos() < bT.GetNanos() {
+			return -1
+		}
+		if aT.GetNanos() > bT.GetNanos() {
+			return 1
+		}
+		return 0
+
+	case *firestorepb.Value_StringValue:
+		aS := a.GetStringValue()
+		bS := b.GetStringValue()
+		if aS < bS {
+			return -1
+		}
+		if aS > bS {
+			return 1
+		}
+		return 0
+
+	case *firestorepb.Value_BytesValue:
+		aB := a.GetBytesValue()
+		bB := b.GetBytesValue()
+		aStr := string(aB)
+		bStr := string(bB)
+		if aStr < bStr {
+			return -1
+		}
+		if aStr > bStr {
+			return 1
+		}
+		return 0
+
+	case *firestorepb.Value_ReferenceValue:
+		aR := a.GetReferenceValue()
+		bR := b.GetReferenceValue()
+		if aR < bR {
+			return -1
+		}
+		if aR > bR {
+			return 1
+		}
+		return 0
+
+	default:
+		// For arrays, maps, geopoints — fall back to string comparison of document name.
+		return 0
+	}
+}
+
+// valueTypeOrder returns the Firestore ordering rank for a value type.
+func valueTypeOrder(v *firestorepb.Value) int {
+	switch v.GetValueType().(type) {
+	case *firestorepb.Value_NullValue:
+		return 0
+	case *firestorepb.Value_BooleanValue:
+		return 1
+	case *firestorepb.Value_IntegerValue:
+		return 2
+	case *firestorepb.Value_DoubleValue:
+		return 2 // numbers share the same rank
+	case *firestorepb.Value_TimestampValue:
+		return 3
+	case *firestorepb.Value_StringValue:
+		return 4
+	case *firestorepb.Value_BytesValue:
+		return 5
+	case *firestorepb.Value_ReferenceValue:
+		return 6
+	case *firestorepb.Value_GeoPointValue:
+		return 7
+	case *firestorepb.Value_ArrayValue:
+		return 8
+	case *firestorepb.Value_MapValue:
+		return 9
+	default:
+		return 10
+	}
+}
+
+// compareFloat compares two float64 values. Returns -1, 0, or 1.
+func compareFloat(a, b float64) int {
+	if a < b {
+		return -1
+	}
+	if a > b {
+		return 1
+	}
+	return 0
+}
+
+// filterByQuery re-evaluates the WHERE filter against each merged document,
+// removing documents that no longer match the filter.
+func filterByQuery(results []*firestorepb.RunQueryResponse, where *firestorepb.StructuredQuery_Filter) []*firestorepb.RunQueryResponse {
+	if where == nil {
+		return results
+	}
+	var filtered []*firestorepb.RunQueryResponse
+	for _, r := range results {
+		doc := r.GetDocument()
+		if doc == nil {
+			// Non-document responses (e.g., stats) are passed through.
+			filtered = append(filtered, r)
+			continue
+		}
+		if evaluateFilter(doc, where) {
+			filtered = append(filtered, r)
+		}
+	}
+	return filtered
+}
+
+// evaluateFilter evaluates a StructuredQuery filter against a document.
+func evaluateFilter(doc *firestorepb.Document, filter *firestorepb.StructuredQuery_Filter) bool {
+	switch ft := filter.GetFilterType().(type) {
+	case *firestorepb.StructuredQuery_Filter_CompositeFilter:
+		return evaluateCompositeFilter(doc, ft.CompositeFilter)
+	case *firestorepb.StructuredQuery_Filter_FieldFilter:
+		return evaluateFieldFilter(doc, ft.FieldFilter)
+	case *firestorepb.StructuredQuery_Filter_UnaryFilter:
+		return evaluateUnaryFilter(doc, ft.UnaryFilter)
+	default:
+		// Unknown filter type — include the document (conservative).
+		return true
+	}
+}
+
+// evaluateCompositeFilter evaluates a composite (AND/OR) filter.
+func evaluateCompositeFilter(doc *firestorepb.Document, cf *firestorepb.StructuredQuery_CompositeFilter) bool {
+	if cf == nil {
+		return true
+	}
+
+	switch cf.GetOp() {
+	case firestorepb.StructuredQuery_CompositeFilter_AND:
+		for _, sub := range cf.GetFilters() {
+			if !evaluateFilter(doc, sub) {
+				return false
+			}
+		}
+		return true
+	case firestorepb.StructuredQuery_CompositeFilter_OR:
+		for _, sub := range cf.GetFilters() {
+			if evaluateFilter(doc, sub) {
+				return true
+			}
+		}
+		return len(cf.GetFilters()) == 0
+	default:
+		return true
+	}
+}
+
+// evaluateFieldFilter evaluates a field comparison filter.
+func evaluateFieldFilter(doc *firestorepb.Document, ff *firestorepb.StructuredQuery_FieldFilter) bool {
+	if ff == nil {
+		return true
+	}
+
+	fieldPath := ff.GetField().GetFieldPath()
+	var docValue *firestorepb.Value
+
+	if fieldPath == "__name__" {
+		docValue = &firestorepb.Value{
+			ValueType: &firestorepb.Value_ReferenceValue{ReferenceValue: doc.GetName()},
+		}
+	} else {
+		docValue = doc.GetFields()[fieldPath]
+	}
+
+	filterValue := ff.GetValue()
+
+	switch ff.GetOp() {
+	case firestorepb.StructuredQuery_FieldFilter_EQUAL:
+		return compareValues(docValue, filterValue) == 0
+
+	case firestorepb.StructuredQuery_FieldFilter_NOT_EQUAL:
+		return compareValues(docValue, filterValue) != 0
+
+	case firestorepb.StructuredQuery_FieldFilter_LESS_THAN:
+		return compareValues(docValue, filterValue) < 0
+
+	case firestorepb.StructuredQuery_FieldFilter_LESS_THAN_OR_EQUAL:
+		return compareValues(docValue, filterValue) <= 0
+
+	case firestorepb.StructuredQuery_FieldFilter_GREATER_THAN:
+		return compareValues(docValue, filterValue) > 0
+
+	case firestorepb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL:
+		return compareValues(docValue, filterValue) >= 0
+
+	case firestorepb.StructuredQuery_FieldFilter_ARRAY_CONTAINS:
+		return arrayContains(docValue, filterValue)
+
+	case firestorepb.StructuredQuery_FieldFilter_IN:
+		return valueInArray(docValue, filterValue)
+
+	case firestorepb.StructuredQuery_FieldFilter_NOT_IN:
+		return !valueInArray(docValue, filterValue)
+
+	case firestorepb.StructuredQuery_FieldFilter_ARRAY_CONTAINS_ANY:
+		return arrayContainsAny(docValue, filterValue)
+
+	default:
+		return true // Unknown operator — include (conservative).
+	}
+}
+
+// evaluateUnaryFilter evaluates a unary filter (IS NULL, IS NOT NULL, IS NAN, IS NOT NAN).
+func evaluateUnaryFilter(doc *firestorepb.Document, uf *firestorepb.StructuredQuery_UnaryFilter) bool {
+	if uf == nil {
+		return true
+	}
+
+	fieldRef := uf.GetField()
+	if fieldRef == nil {
+		return true
+	}
+	fieldPath := fieldRef.GetFieldPath()
+	docValue := doc.GetFields()[fieldPath]
+
+	switch uf.GetOp() {
+	case firestorepb.StructuredQuery_UnaryFilter_IS_NAN:
+		if docValue == nil {
+			return false
+		}
+		if dv, ok := docValue.GetValueType().(*firestorepb.Value_DoubleValue); ok {
+			return dv.DoubleValue != dv.DoubleValue // NaN check
+		}
+		return false
+
+	case firestorepb.StructuredQuery_UnaryFilter_IS_NULL:
+		if docValue == nil {
+			return true
+		}
+		_, isNull := docValue.GetValueType().(*firestorepb.Value_NullValue)
+		return isNull
+
+	case firestorepb.StructuredQuery_UnaryFilter_IS_NOT_NAN:
+		if docValue == nil {
+			return true
+		}
+		if dv, ok := docValue.GetValueType().(*firestorepb.Value_DoubleValue); ok {
+			return dv.DoubleValue == dv.DoubleValue // Not NaN
+		}
+		return true
+
+	case firestorepb.StructuredQuery_UnaryFilter_IS_NOT_NULL:
+		if docValue == nil {
+			return false
+		}
+		_, isNull := docValue.GetValueType().(*firestorepb.Value_NullValue)
+		return !isNull
+
+	default:
+		return true
+	}
+}
+
+// arrayContains checks if a document field (which should be an array) contains the given value.
+func arrayContains(docValue, searchValue *firestorepb.Value) bool {
+	if docValue == nil {
+		return false
+	}
+	arr, ok := docValue.GetValueType().(*firestorepb.Value_ArrayValue)
+	if !ok || arr.ArrayValue == nil {
+		return false
+	}
+	for _, elem := range arr.ArrayValue.GetValues() {
+		if compareValues(elem, searchValue) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// valueInArray checks if a value is contained in a filter array.
+func valueInArray(docValue, filterArray *firestorepb.Value) bool {
+	if filterArray == nil {
+		return false
+	}
+	arr, ok := filterArray.GetValueType().(*firestorepb.Value_ArrayValue)
+	if !ok || arr.ArrayValue == nil {
+		return false
+	}
+	for _, elem := range arr.ArrayValue.GetValues() {
+		if compareValues(docValue, elem) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// arrayContainsAny checks if a document array contains any of the values in the filter array.
+func arrayContainsAny(docValue, filterArray *firestorepb.Value) bool {
+	if docValue == nil || filterArray == nil {
+		return false
+	}
+	docArr, ok := docValue.GetValueType().(*firestorepb.Value_ArrayValue)
+	if !ok || docArr.ArrayValue == nil {
+		return false
+	}
+	filterArr, ok := filterArray.GetValueType().(*firestorepb.Value_ArrayValue)
+	if !ok || filterArr.ArrayValue == nil {
+		return false
+	}
+	for _, docElem := range docArr.ArrayValue.GetValues() {
+		for _, filterElem := range filterArr.ArrayValue.GetValues() {
+			if compareValues(docElem, filterElem) == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cloneListDocumentsRequestWithPageSize creates a copy of the ListDocuments request with a modified page_size.
+func cloneListDocumentsRequestWithPageSize(req *firestorepb.ListDocumentsRequest, newPageSize int32) *firestorepb.ListDocumentsRequest {
+	return &firestorepb.ListDocumentsRequest{
+		Parent:       req.GetParent(),
+		CollectionId: req.GetCollectionId(),
+		PageSize:     newPageSize,
+		PageToken:    req.GetPageToken(),
+		OrderBy:      req.GetOrderBy(),
+		Mask:         req.GetMask(),
+		ShowMissing:  req.GetShowMissing(),
+	}
+}
+
+// cloneRunQueryRequestWithLimit creates a copy of the RunQuery request with a modified limit.
+func cloneRunQueryRequestWithLimit(req *firestorepb.RunQueryRequest, newLimit int32) *firestorepb.RunQueryRequest {
+	// We need to clone the structured query with the new limit.
+	sq := req.GetStructuredQuery()
+	if sq == nil {
+		return req
+	}
+
+	// Clone the structured query.
+	newSQ := &firestorepb.StructuredQuery{
+		Select:  sq.GetSelect(),
+		From:    sq.GetFrom(),
+		Where:   sq.GetWhere(),
+		OrderBy: sq.GetOrderBy(),
+		StartAt: sq.GetStartAt(),
+		EndAt:   sq.GetEndAt(),
+		Offset:  sq.GetOffset(),
+		Limit:   &wrapperspb.Int32Value{Value: newLimit},
+	}
+
+	return &firestorepb.RunQueryRequest{
+		Parent:    req.GetParent(),
+		QueryType: &firestorepb.RunQueryRequest_StructuredQuery{StructuredQuery: newSQ},
+	}
 }

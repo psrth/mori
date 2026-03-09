@@ -93,15 +93,17 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	var wh *WriteHandler
 	if p.deltaMap != nil && p.tombstones != nil {
 		wh = &WriteHandler{
-			prodConn:   prodConn,
-			shadowConn: shadowConn,
-			deltaMap:   p.deltaMap,
-			tombstones: p.tombstones,
-			tables:     p.tables,
-			moriDir:    p.moriDir,
-			connID:     connID,
-			verbose:    p.verbose,
-			logger:     p.logger,
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+			maxRowsHydrate: p.maxRowsHydrate,
 		}
 	}
 
@@ -125,14 +127,35 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	var txh *TxnHandler
 	if p.deltaMap != nil && p.tombstones != nil {
 		txh = &TxnHandler{
-			prodConn:   prodConn,
-			shadowConn: shadowConn,
-			deltaMap:   p.deltaMap,
-			tombstones: p.tombstones,
-			moriDir:    p.moriDir,
-			connID:     connID,
-			verbose:    p.verbose,
-			logger:     p.logger,
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			schemaRegistry: p.schemaRegistry,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+		}
+	}
+
+	// Link WriteHandler to TxnHandler for inTxn() checks.
+	if wh != nil && txh != nil {
+		wh.txnHandler = txh
+	}
+
+	// Create FKEnforcer if schema registry is available.
+	if wh != nil && p.schemaRegistry != nil {
+		wh.fkEnforcer = &FKEnforcer{
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
 		}
 	}
 
@@ -210,27 +233,61 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 				continue
 			}
 
+			// P3 §4.5: StrategyNotSupported — return error to client.
+			if decision.strategy == core.StrategyNotSupported && decision.classification != nil {
+				msg := decision.classification.NotSupportedMsg
+				if msg == "" {
+					msg = "this operation is not supported through the Mori proxy"
+				}
+				errPkt := buildErrorResponse(msg)
+				clientConn.Write(errPkt)
+				continue
+			}
+
+			// P1 §2.1: StrategyTruncate — forward to Shadow, mark table fully shadowed.
+			if decision.strategy == core.StrategyTruncate && decision.classification != nil {
+				if err := forwardAndRelay(allRaw, shadowConn, clientConn); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] truncate handler error: %v", connID, err)
+					}
+					return
+				}
+				for _, table := range decision.classification.Tables {
+					if p.schemaRegistry != nil {
+						p.schemaRegistry.MarkFullyShadowed(table)
+					}
+					if p.deltaMap != nil {
+						p.deltaMap.ClearTable(table)
+					}
+					if p.tombstones != nil {
+						p.tombstones.ClearTable(table)
+					}
+					if p.verbose {
+						log.Printf("[conn %d] TRUNCATE: %s marked fully shadowed", connID, table)
+					}
+				}
+				if p.schemaRegistry != nil {
+					if err := coreSchema.WriteRegistry(p.moriDir, p.schemaRegistry); err != nil {
+						if p.verbose {
+							log.Printf("[conn %d] failed to persist schema registry after TRUNCATE: %v", connID, err)
+						}
+					}
+				}
+				continue
+			}
+
 			// Dispatch write strategies to WriteHandler.
-			// Inside a transaction, use Stage instead of Add for delta tracking.
+			// The WriteHandler itself handles inTxn() staging via its txnHandler reference.
 			if wh != nil && decision.classification != nil {
 				switch decision.strategy {
 				case core.StrategyShadowWrite,
 					core.StrategyHydrateAndWrite,
 					core.StrategyShadowDelete:
-					if txh != nil && txh.InTxn() {
-						if err := handleTxnWrite(wh, clientConn, allRaw, decision.classification, decision.strategy); err != nil {
-							if p.verbose {
-								log.Printf("[conn %d] txn write handler error: %v", connID, err)
-							}
-							return
+					if err := wh.HandleWrite(clientConn, allRaw, decision.classification, decision.strategy); err != nil {
+						if p.verbose {
+							log.Printf("[conn %d] write handler error: %v", connID, err)
 						}
-					} else {
-						if err := wh.HandleWrite(clientConn, allRaw, decision.classification, decision.strategy); err != nil {
-							if p.verbose {
-								log.Printf("[conn %d] write handler error: %v", connID, err)
-							}
-							return
-						}
+						return
 					}
 					continue
 				}
@@ -371,61 +428,6 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	}
 }
 
-// handleTxnWrite wraps WriteHandler to use staging (Stage) instead of Add
-// when inside a transaction. The staged deltas are promoted on COMMIT or
-// discarded on ROLLBACK by TxnHandler.
-func handleTxnWrite(
-	wh *WriteHandler,
-	clientConn net.Conn,
-	rawMsg []byte,
-	cl *core.Classification,
-	strategy core.RoutingStrategy,
-) error {
-	// For inserts: forward to shadow, mark inserted (inserts don't need staging).
-	if strategy == core.StrategyShadowWrite {
-		if err := forwardAndRelay(rawMsg, wh.shadowConn, clientConn); err != nil {
-			return err
-		}
-		for _, table := range cl.Tables {
-			wh.deltaMap.MarkInserted(table)
-		}
-		return nil
-	}
-
-	// For updates: hydrate, forward, then stage.
-	if strategy == core.StrategyHydrateAndWrite {
-		for _, pk := range cl.PKs {
-			if wh.deltaMap.IsDelta(pk.Table, pk.PK) {
-				continue
-			}
-			if err := wh.hydrateRow(pk.Table, pk.PK); err != nil {
-				if wh.verbose {
-					log.Printf("[conn %d] txn hydration failed for (%s, %s): %v", wh.connID, pk.Table, pk.PK, err)
-				}
-			}
-		}
-		if err := forwardAndRelay(rawMsg, wh.shadowConn, clientConn); err != nil {
-			return err
-		}
-		for _, pk := range cl.PKs {
-			wh.deltaMap.Stage(pk.Table, pk.PK)
-		}
-		return nil
-	}
-
-	// For deletes: forward, then stage tombstones.
-	if strategy == core.StrategyShadowDelete {
-		if err := forwardAndRelay(rawMsg, wh.shadowConn, clientConn); err != nil {
-			return err
-		}
-		for _, pk := range cl.PKs {
-			wh.tombstones.Stage(pk.Table, pk.PK)
-		}
-		return nil
-	}
-
-	return wh.HandleWrite(clientConn, rawMsg, cl, strategy)
-}
 
 // classifyAndRoute determines which backend should handle a query.
 func (p *Proxy) classifyAndRoute(sql string, connID int64) routeDecision {
@@ -483,6 +485,20 @@ func (p *Proxy) classifyAndRoute(sql string, connID int64) routeDecision {
 	case core.StrategyMergedRead, core.StrategyJoinPatch:
 		return routeDecision{
 			target:         targetProd, // fallback if ReadHandler is nil
+			classification: classification,
+			strategy:       strategy,
+		}
+
+	case core.StrategyTruncate:
+		return routeDecision{
+			target:         targetShadow,
+			classification: classification,
+			strategy:       strategy,
+		}
+
+	case core.StrategyNotSupported:
+		return routeDecision{
+			target:         targetShadow, // won't actually be sent — handled before dispatch
 			classification: classification,
 			strategy:       strategy,
 		}
@@ -583,7 +599,32 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 				log.Printf("[conn %d] schema registry: DROP TABLE %s", connID, table)
 			}
 		}
+
+	// P1 §2.7: sp_rename column tracking.
+	case reSpRename.MatchString(sqlStr):
+		table, oldName, newName := parseMSSQLSpRename(sqlStr)
+		if table != "" && oldName != "" && newName != "" {
+			p.schemaRegistry.RecordRenameColumn(table, oldName, newName)
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: RENAME COLUMN %s.%s -> %s", connID, table, oldName, newName)
+			}
+		}
+
+	// P3 §4.3: ALTER TYPE tracking.
+	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "ALTER COLUMN"):
+		table, col, newType := parseMSSQLAlterColumn(sqlStr)
+		if table != "" && col != "" {
+			p.schemaRegistry.RecordTypeChange(table, col, "", newType)
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: ALTER COLUMN %s.%s -> %s", connID, table, col, newType)
+			}
+		}
 	}
+
+	// P3 §4.4: Extract FK constraints from DDL before persisting.
+	// When DDL contains ADD CONSTRAINT ... FOREIGN KEY ... REFERENCES,
+	// extract the FK metadata and store in schema registry.
+	p.extractFKFromDDL(cl, connID)
 
 	// Persist the registry.
 	if err := coreSchema.WriteRegistry(p.moriDir, p.schemaRegistry); err != nil {
@@ -624,4 +665,178 @@ func parseMSSQLAlterDropColumn(sql string) (table, col string) {
 		return "", ""
 	}
 	return strings.ToLower(strings.Trim(m[1], "[]")), strings.ToLower(strings.Trim(m[2], "[]"))
+}
+
+// Regex for sp_rename 't.old_col', 'new_col', 'COLUMN'
+var reSpRename = regexp.MustCompile(`(?i)(?:EXEC(?:UTE)?\s+)?SP_RENAME\s+'([^']+)'\s*,\s*'([^']+)'\s*,\s*'COLUMN'`)
+
+// parseMSSQLSpRename parses "EXEC sp_rename 't.old', 'new', 'COLUMN'" for column renaming.
+func parseMSSQLSpRename(sql string) (table, oldName, newName string) {
+	m := reSpRename.FindStringSubmatch(sql)
+	if len(m) < 3 {
+		return "", "", ""
+	}
+	// First arg is "table.old_col" or "schema.table.old_col".
+	parts := strings.Split(m[1], ".")
+	if len(parts) == 2 {
+		table = strings.ToLower(strings.Trim(parts[0], "[]"))
+		oldName = strings.ToLower(strings.Trim(parts[1], "[]"))
+	} else if len(parts) == 3 {
+		table = strings.ToLower(strings.Trim(parts[1], "[]"))
+		oldName = strings.ToLower(strings.Trim(parts[2], "[]"))
+	} else {
+		return "", "", ""
+	}
+	newName = strings.ToLower(strings.Trim(m[2], "[]"))
+	return table, oldName, newName
+}
+
+// Regex for ALTER TABLE ... ALTER COLUMN col newtype
+var reAlterColumn = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+\[?(\w+)\]?\s+ALTER\s+COLUMN\s+\[?(\w+)\]?\s+(\w[\w\(\),\s]*)`)
+
+// P3 §4.4: Regex for ADD CONSTRAINT ... FOREIGN KEY (...) REFERENCES ... (...)
+var reAddForeignKey = regexp.MustCompile(`(?i)ALTER\s+TABLE\s+\[?(\w+)\]?\s+ADD\s+CONSTRAINT\s+\[?(\w+)\]?\s+FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+\[?(\w+)\]?\s*\(([^)]+)\)`)
+
+// Regex for ON DELETE / ON UPDATE actions in FK DDL.
+var reOnDelete = regexp.MustCompile(`(?i)\bON\s+DELETE\s+(CASCADE|SET\s+NULL|SET\s+DEFAULT|NO\s+ACTION|RESTRICT)`)
+var reOnUpdate = regexp.MustCompile(`(?i)\bON\s+UPDATE\s+(CASCADE|SET\s+NULL|SET\s+DEFAULT|NO\s+ACTION|RESTRICT)`)
+
+// P3 §4.4: Regex for CREATE TABLE inline FK constraints.
+var reInlineForeignKey = regexp.MustCompile(`(?i)CONSTRAINT\s+\[?(\w+)\]?\s+FOREIGN\s+KEY\s*\(([^)]+)\)\s*REFERENCES\s+\[?(\w+)\]?\s*\(([^)]+)\)`)
+
+// parseMSSQLAlterColumn parses "ALTER TABLE t ALTER COLUMN c newtype" for type changes.
+func parseMSSQLAlterColumn(sql string) (table, col, newType string) {
+	m := reAlterColumn.FindStringSubmatch(sql)
+	if len(m) < 4 {
+		return "", "", ""
+	}
+	table = strings.ToLower(strings.Trim(m[1], "[]"))
+	col = strings.ToLower(strings.Trim(m[2], "[]"))
+	newType = strings.TrimSpace(m[3])
+	// Trim trailing keywords.
+	for _, kw := range []string{"NOT NULL", "NULL", "COLLATE"} {
+		if idx := strings.Index(strings.ToUpper(newType), kw); idx > 0 {
+			newType = strings.TrimSpace(newType[:idx])
+		}
+	}
+	return table, col, newType
+}
+
+// ---------------------------------------------------------------------------
+// P3 §4.4 — FK Extraction from DDL
+// ---------------------------------------------------------------------------
+
+// extractFKFromDDL extracts foreign key constraints from DDL statements and
+// stores them in the schema registry. This handles:
+// - ALTER TABLE t ADD CONSTRAINT c FOREIGN KEY (cols) REFERENCES parent(cols)
+// - CREATE TABLE with inline CONSTRAINT ... FOREIGN KEY ... REFERENCES
+func (p *Proxy) extractFKFromDDL(cl *core.Classification, connID int64) {
+	if p.schemaRegistry == nil {
+		return
+	}
+
+	sqlStr := cl.RawSQL
+	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
+
+	// Handle ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... REFERENCES.
+	if strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "FOREIGN KEY") {
+		if m := reAddForeignKey.FindStringSubmatch(sqlStr); len(m) >= 6 {
+			childTable := strings.ToLower(strings.Trim(m[1], "[]"))
+			constraintName := strings.ToLower(strings.Trim(m[2], "[]"))
+			childCols := parseColumnList(m[3])
+			parentTable := strings.ToLower(strings.Trim(m[4], "[]"))
+			parentCols := parseColumnList(m[5])
+
+			onDelete := "NO ACTION"
+			if dm := reOnDelete.FindStringSubmatch(sqlStr); len(dm) > 1 {
+				onDelete = strings.ToUpper(strings.TrimSpace(dm[1]))
+			}
+			onUpdate := "NO ACTION"
+			if um := reOnUpdate.FindStringSubmatch(sqlStr); len(um) > 1 {
+				onUpdate = strings.ToUpper(strings.TrimSpace(um[1]))
+			}
+
+			fk := coreSchema.ForeignKey{
+				ConstraintName: constraintName,
+				ChildTable:     childTable,
+				ChildColumns:   childCols,
+				ParentTable:    parentTable,
+				ParentColumns:  parentCols,
+				OnDelete:       onDelete,
+				OnUpdate:       onUpdate,
+			}
+			p.schemaRegistry.RecordForeignKey(childTable, fk)
+
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: FK %s on %s(%v) -> %s(%v) [DELETE=%s UPDATE=%s]",
+					connID, constraintName, childTable, childCols, parentTable, parentCols, onDelete, onUpdate)
+			}
+		}
+	}
+
+	// Handle CREATE TABLE with inline FK constraints.
+	if strings.HasPrefix(upper, "CREATE TABLE") && strings.Contains(upper, "FOREIGN KEY") {
+		childTable := ""
+		if len(cl.Tables) > 0 {
+			childTable = cl.Tables[0]
+		}
+		if childTable == "" {
+			return
+		}
+
+		for _, m := range reInlineForeignKey.FindAllStringSubmatch(sqlStr, -1) {
+			if len(m) < 5 {
+				continue
+			}
+			constraintName := strings.ToLower(strings.Trim(m[1], "[]"))
+			childCols := parseColumnList(m[2])
+			parentTable := strings.ToLower(strings.Trim(m[3], "[]"))
+			parentCols := parseColumnList(m[4])
+
+			// Look for ON DELETE / ON UPDATE after this constraint match.
+			onDelete := "NO ACTION"
+			onUpdate := "NO ACTION"
+			matchEnd := strings.Index(sqlStr, m[0]) + len(m[0])
+			if matchEnd < len(sqlStr) {
+				remainder := sqlStr[matchEnd:]
+				if dm := reOnDelete.FindStringSubmatch(remainder); len(dm) > 1 {
+					onDelete = strings.ToUpper(strings.TrimSpace(dm[1]))
+				}
+				if um := reOnUpdate.FindStringSubmatch(remainder); len(um) > 1 {
+					onUpdate = strings.ToUpper(strings.TrimSpace(um[1]))
+				}
+			}
+
+			fk := coreSchema.ForeignKey{
+				ConstraintName: constraintName,
+				ChildTable:     childTable,
+				ChildColumns:   childCols,
+				ParentTable:    parentTable,
+				ParentColumns:  parentCols,
+				OnDelete:       onDelete,
+				OnUpdate:       onUpdate,
+			}
+			p.schemaRegistry.RecordForeignKey(childTable, fk)
+
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: FK (inline) %s on %s(%v) -> %s(%v)",
+					connID, constraintName, childTable, childCols, parentTable, parentCols)
+			}
+		}
+	}
+}
+
+// parseColumnList splits a comma-separated column list and cleans each name.
+func parseColumnList(s string) []string {
+	parts := strings.Split(s, ",")
+	var cols []string
+	for _, part := range parts {
+		col := strings.TrimSpace(part)
+		col = strings.Trim(col, "[]`\"")
+		col = strings.ToLower(col)
+		if col != "" {
+			cols = append(cols, col)
+		}
+	}
+	return cols
 }

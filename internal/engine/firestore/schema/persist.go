@@ -14,7 +14,7 @@ const (
 // CollectionMeta holds metadata for a Firestore collection.
 type CollectionMeta struct {
 	PKColumns []string `json:"pk_columns"`
-	PKType    string   `json:"pk_type"` // Always "uuid" for Firestore document IDs
+	PKType    string   `json:"pk_type"` // "string" for Firestore document IDs (arbitrary strings)
 }
 
 // WriteTables persists the collection metadata to .mori/tables.json.

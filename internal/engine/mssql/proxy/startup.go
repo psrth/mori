@@ -3,7 +3,6 @@ package proxy
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
 	"net"
 	"time"
 )
@@ -445,9 +444,3 @@ func putUint32LE(b []byte, v uint32) {
 	b[3] = byte(v >> 24)
 }
 
-// readRawBytes reads exactly n bytes from the reader.
-func readRawBytes(r io.Reader, n int) ([]byte, error) {
-	buf := make([]byte, n)
-	_, err := io.ReadFull(r, buf)
-	return buf, err
-}

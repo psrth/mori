@@ -35,13 +35,18 @@ func (c *FirestoreClassifier) Classify(query string) (*core.Classification, erro
 	// Read operations.
 	case "GetDocument", "ListDocuments", "RunQuery",
 		"RunAggregationQuery", "BatchGetDocuments",
-		"Listen", "PartitionQuery", "ListCollectionIds":
+		"PartitionQuery", "ListCollectionIds":
 		cl.OpType = core.OpRead
 		cl.SubType = core.SubSelect
 
 		if method == "RunAggregationQuery" {
 			cl.HasAggregate = true
 		}
+
+	// Listen is classified as a listen-only operation (prod-only, no shadow awareness).
+	case "Listen":
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubListen
 
 	// Write operations.
 	case "CreateDocument":
@@ -79,7 +84,7 @@ func (c *FirestoreClassifier) Classify(query string) (*core.Classification, erro
 
 // ClassifyWithParams classifies a parameterized query. For Firestore,
 // this delegates directly to Classify since there are no SQL parameters.
-func (c *FirestoreClassifier) ClassifyWithParams(query string, params []interface{}) (*core.Classification, error) {
+func (c *FirestoreClassifier) ClassifyWithParams(query string, params []any) (*core.Classification, error) {
 	return c.Classify(query)
 }
 
@@ -115,4 +120,55 @@ func IsTransactionMethod(method string) bool {
 	default:
 		return false
 	}
+}
+
+// ExtractCollectionFromPath extracts the root collection name from a Firestore
+// document resource path.
+// e.g. "projects/p/databases/d/documents/users/abc123" → "users"
+// e.g. "projects/p/databases/d/documents/users/abc/posts/p1" → "users" (root collection)
+func ExtractCollectionFromPath(resourcePath string) string {
+	const marker = "/documents/"
+	_, rest, found := strings.Cut(resourcePath, marker)
+	if !found {
+		return ""
+	}
+	// The root collection is always the first segment.
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) > 0 && parts[0] != "" {
+		return parts[0]
+	}
+	return ""
+}
+
+// ExtractCollectionsFromPaths extracts unique collection names from multiple resource paths.
+func ExtractCollectionsFromPaths(paths []string) []string {
+	seen := make(map[string]bool)
+	var collections []string
+	for _, p := range paths {
+		c := ExtractCollectionFromPath(p)
+		if c != "" && !seen[c] {
+			seen[c] = true
+			collections = append(collections, c)
+		}
+	}
+	return collections
+}
+
+// ExtractCollectionsFromWrites extracts collection names from a list of Write protos.
+func ExtractCollectionsFromWrites(writes []WriteInfo) []string {
+	seen := make(map[string]bool)
+	var collections []string
+	for _, w := range writes {
+		c := ExtractCollectionFromPath(w.DocumentPath)
+		if c != "" && !seen[c] {
+			seen[c] = true
+			collections = append(collections, c)
+		}
+	}
+	return collections
+}
+
+// WriteInfo is a minimal representation of a write operation for classification purposes.
+type WriteInfo struct {
+	DocumentPath string
 }

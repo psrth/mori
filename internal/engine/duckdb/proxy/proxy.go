@@ -29,12 +29,13 @@ type Proxy struct {
 	port       int
 	verbose    bool
 
-	deltaMap       *delta.Map
-	tombstones     *delta.TombstoneSet
-	tables         map[string]schema.TableMeta
-	schemaRegistry *coreSchema.Registry
-	moriDir        string
-	logger         *logging.Logger
+	deltaMap        *delta.Map
+	tombstones      *delta.TombstoneSet
+	tables          map[string]schema.TableMeta
+	schemaRegistry  *coreSchema.Registry
+	moriDir         string
+	logger          *logging.Logger
+	maxRowsHydrate  int
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -52,7 +53,12 @@ func New(prodDSN, shadowDSN string, listenPort int, verbose bool,
 	tables map[string]schema.TableMeta, moriDir string,
 	schemaRegistry *coreSchema.Registry,
 	logger *logging.Logger,
+	maxRowsHydrate ...int,
 ) *Proxy {
+	cap := 0
+	if len(maxRowsHydrate) > 0 {
+		cap = maxRowsHydrate[0]
+	}
 	return &Proxy{
 		prodDSN:        prodDSN,
 		shadowDSN:      shadowDSN,
@@ -66,6 +72,7 @@ func New(prodDSN, shadowDSN string, listenPort int, verbose bool,
 		schemaRegistry: schemaRegistry,
 		moriDir:        moriDir,
 		logger:         logger,
+		maxRowsHydrate: cap,
 		shutdownCh:     make(chan struct{}),
 	}
 }
@@ -92,6 +99,11 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 		if err := p.shadowDB.Ping(); err != nil {
 			return fmt.Errorf("failed to connect to shadow DuckDB: %w", err)
 		}
+	}
+
+	// Discover foreign keys from Prod for proxy-level FK enforcement.
+	if p.prodDB != nil && p.schemaRegistry != nil {
+		discoverFKsFromProd(p.prodDB, p.schemaRegistry, p.verbose, 0)
 	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", p.port)

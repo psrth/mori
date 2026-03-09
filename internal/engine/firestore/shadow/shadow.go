@@ -52,13 +52,117 @@ func NewManager() (*Manager, error) {
 }
 
 // Pull pulls the Firestore emulator image if not already present.
+// Skips pull if the image is already cached locally (P3 4.5).
 func (m *Manager) Pull(ctx context.Context) error {
+	// Check if image is already cached.
+	checkCmd := exec.CommandContext(ctx, "docker", "image", "inspect", EmulatorImage)
+	if err := checkCmd.Run(); err == nil {
+		// Image exists locally — skip pull.
+		return nil
+	}
+
 	cmd := exec.CommandContext(ctx, "docker", "pull", EmulatorImage)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to pull image %q: %s", EmulatorImage, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// FindExisting checks if a matching emulator container already exists for the project.
+// Returns the container info if found, nil otherwise.
+func (m *Manager) FindExisting(ctx context.Context, projectID string) (*ContainerInfo, error) {
+	// Look for containers with the mori-firestore prefix.
+	cmd := exec.CommandContext(ctx, "docker", "ps", "-a",
+		"--filter", fmt.Sprintf("name=mori-firestore-%s", sanitizeProjectID(projectID)),
+		"--format", "{{.ID}}|{{.Names}}|{{.Status}}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, nil // Not found or error — will create new.
+	}
+
+	output := strings.TrimSpace(string(out))
+	if output == "" {
+		return nil, nil
+	}
+
+	// Parse the first line.
+	lines := strings.Split(output, "\n")
+	parts := strings.SplitN(lines[0], "|", 3)
+	if len(parts) < 3 {
+		return nil, nil
+	}
+
+	containerID := parts[0]
+	containerName := parts[1]
+	containerStatus := parts[2]
+
+	// Check if running.
+	isRunning := strings.Contains(strings.ToLower(containerStatus), "up")
+
+	if !isRunning {
+		// Try to restart.
+		restartCmd := exec.CommandContext(ctx, "docker", "start", containerID)
+		if restartOut, err := restartCmd.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("failed to restart existing container: %s", strings.TrimSpace(string(restartOut)))
+		}
+	}
+
+	// Get the host port.
+	portCmd := exec.CommandContext(ctx, "docker", "port", containerID, fmt.Sprintf("%d", EmulatorPort))
+	portOut, err := portCmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get container port: %s", strings.TrimSpace(string(portOut)))
+	}
+	portStr := strings.TrimSpace(string(portOut))
+	// Parse "0.0.0.0:9010" or "127.0.0.1:9010"
+	hostPort := DefaultHostPort
+	if idx := strings.LastIndex(portStr, ":"); idx >= 0 {
+		portPart := portStr[idx+1:]
+		if p, err := net.LookupPort("tcp", portPart); err == nil {
+			hostPort = p
+		} else {
+			// Try direct parsing.
+			for _, c := range portPart {
+				if c < '0' || c > '9' {
+					goto useDefault
+				}
+			}
+			if n := 0; true {
+				for _, c := range portPart {
+					n = n*10 + int(c-'0')
+				}
+				hostPort = n
+			}
+		useDefault:
+		}
+	}
+
+	// Verify health.
+	if err := m.WaitReady(ctx, hostPort); err != nil {
+		return nil, fmt.Errorf("existing container not healthy: %w", err)
+	}
+
+	return &ContainerInfo{
+		ContainerID:   containerID,
+		ContainerName: containerName,
+		HostPort:      hostPort,
+		Image:         EmulatorImage,
+	}, nil
+}
+
+// sanitizeProjectID sanitizes a project ID for Docker container name matching.
+func sanitizeProjectID(projectID string) string {
+	safe := strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return '-'
+	}, strings.ToLower(projectID))
+	if len(safe) > 20 {
+		safe = safe[:20]
+	}
+	return safe
 }
 
 // Create creates and starts a Firestore emulator container.

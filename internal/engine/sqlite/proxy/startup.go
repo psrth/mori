@@ -3,7 +3,6 @@ package proxy
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 )
 
@@ -102,9 +101,3 @@ func buildBackendKeyDataMsg(pid, secretKey uint32) []byte {
 	return buildPGMsg('K', payload)
 }
 
-// readRawBytes reads exactly n bytes from the reader.
-func readRawBytes(r io.Reader, n int) ([]byte, error) {
-	buf := make([]byte, n)
-	_, err := io.ReadFull(r, buf)
-	return buf, err
-}

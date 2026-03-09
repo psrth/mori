@@ -13,8 +13,9 @@ const (
 
 // TableMeta holds primary key metadata for a DuckDB table.
 type TableMeta struct {
-	PKColumns []string `json:"pk_columns"`
-	PKType    string   `json:"pk_type"` // "serial", "bigserial", "uuid", "composite", "none"
+	PKColumns     []string `json:"pk_columns"`
+	PKType        string   `json:"pk_type"` // "serial", "bigserial", "uuid", "composite", "none"
+	GeneratedCols []string `json:"generated_cols,omitempty"`
 }
 
 // WriteTables persists the table metadata to .mori/tables.json.

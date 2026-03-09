@@ -86,6 +86,7 @@ func (e *mssqlEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 		deps.MoriDir,
 		deps.SchemaReg,
 		deps.Logger,
+		deps.MaxRowsHydrate,
 	)
 }
 
@@ -94,8 +95,9 @@ func convertTablesFromMSSQL(msTables map[string]schema.TableMeta) map[string]eng
 	out := make(map[string]engine.TableMeta, len(msTables))
 	for name, t := range msTables {
 		out[name] = engine.TableMeta{
-			PKColumns: t.PKColumns,
-			PKType:    t.PKType,
+			PKColumns:     t.PKColumns,
+			PKType:        t.PKType,
+			GeneratedCols: t.GeneratedCols,
 		}
 	}
 	return out
@@ -106,8 +108,9 @@ func convertTablesToMSSQL(tables map[string]engine.TableMeta) map[string]schema.
 	out := make(map[string]schema.TableMeta, len(tables))
 	for name, t := range tables {
 		out[name] = schema.TableMeta{
-			PKColumns: t.PKColumns,
-			PKType:    t.PKType,
+			PKColumns:     t.PKColumns,
+			PKType:        t.PKType,
+			GeneratedCols: t.GeneratedCols,
 		}
 	}
 	return out

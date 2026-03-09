@@ -114,6 +114,126 @@ func classifyPKType(dataTypes []string) string {
 	return dt
 }
 
+// DetectGeneratedColumns detects generated (computed) columns for all tables.
+// DuckDB stores generated column info in duckdb_columns().
+func DetectGeneratedColumns(ctx context.Context, db *sql.DB, tables map[string]TableMeta) (map[string]TableMeta, error) {
+	for tableName, meta := range tables {
+		genCols, err := detectGeneratedColumnsForTable(ctx, db, tableName)
+		if err != nil {
+			// Non-fatal: some DuckDB versions may not expose this.
+			continue
+		}
+		if len(genCols) > 0 {
+			meta.GeneratedCols = genCols
+			tables[tableName] = meta
+		}
+	}
+	return tables, nil
+}
+
+func detectGeneratedColumnsForTable(ctx context.Context, db *sql.DB, tableName string) ([]string, error) {
+	// DuckDB's duckdb_columns() includes column_default and is_generated info.
+	// Generated columns have is_nullable = true and a non-null expression in column_default
+	// when using GENERATED ALWAYS AS syntax.
+	// Attempt to use duckdb_columns() which has richer metadata.
+	rows, err := db.QueryContext(ctx,
+		`SELECT column_name FROM duckdb_columns()
+		 WHERE schema_name = 'main' AND table_name = $1
+		 AND column_default IS NOT NULL
+		 AND column_default LIKE '%GENERATED%'`, tableName)
+	if err != nil {
+		// Fallback: try information_schema approach
+		rows, err = db.QueryContext(ctx,
+			`SELECT column_name FROM information_schema.columns
+			 WHERE table_schema = 'main' AND table_name = $1
+			 AND is_generated = 'ALWAYS'`, tableName)
+		if err != nil {
+			return nil, err
+		}
+	}
+	defer rows.Close()
+
+	var genCols []string
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, err
+		}
+		genCols = append(genCols, col)
+	}
+	return genCols, rows.Err()
+}
+
+// DetectForeignKeys queries the DuckDB database for foreign key constraints.
+func DetectForeignKeys(ctx context.Context, db *sql.DB) ([]ForeignKeyInfo, error) {
+	// DuckDB supports referential_constraints and key_column_usage in information_schema.
+	rows, err := db.QueryContext(ctx,
+		`SELECT
+			rc.constraint_name,
+			kcu.table_name AS child_table,
+			kcu.column_name AS child_column,
+			ccu.table_name AS parent_table,
+			ccu.column_name AS parent_column,
+			rc.delete_rule,
+			rc.update_rule
+		 FROM information_schema.referential_constraints rc
+		 JOIN information_schema.key_column_usage kcu
+			ON rc.constraint_name = kcu.constraint_name
+			AND rc.constraint_schema = kcu.table_schema
+		 JOIN information_schema.constraint_column_usage ccu
+			ON rc.unique_constraint_name = ccu.constraint_name
+			AND rc.unique_constraint_schema = ccu.constraint_schema
+		 WHERE rc.constraint_schema = 'main'
+		 ORDER BY rc.constraint_name, kcu.ordinal_position`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query FKs: %w", err)
+	}
+	defer rows.Close()
+
+	fkMap := make(map[string]*ForeignKeyInfo)
+	var fkOrder []string
+	for rows.Next() {
+		var constraintName, childTable, childCol, parentTable, parentCol, deleteRule, updateRule string
+		if err := rows.Scan(&constraintName, &childTable, &childCol, &parentTable, &parentCol, &deleteRule, &updateRule); err != nil {
+			return nil, err
+		}
+		fk, ok := fkMap[constraintName]
+		if !ok {
+			fk = &ForeignKeyInfo{
+				ConstraintName: constraintName,
+				ChildTable:     childTable,
+				ParentTable:    parentTable,
+				OnDelete:       deleteRule,
+				OnUpdate:       updateRule,
+			}
+			fkMap[constraintName] = fk
+			fkOrder = append(fkOrder, constraintName)
+		}
+		fk.ChildColumns = append(fk.ChildColumns, childCol)
+		fk.ParentColumns = append(fk.ParentColumns, parentCol)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var result []ForeignKeyInfo
+	for _, name := range fkOrder {
+		result = append(result, *fkMap[name])
+	}
+	return result, nil
+}
+
+// ForeignKeyInfo holds the detected FK relationship from the database.
+type ForeignKeyInfo struct {
+	ConstraintName string
+	ChildTable     string
+	ChildColumns   []string
+	ParentTable    string
+	ParentColumns  []string
+	OnDelete       string
+	OnUpdate       string
+}
+
 // DetectSequenceOffsets queries DuckDB for current max auto-increment values
 // and computes shadow offsets.
 func DetectSequenceOffsets(ctx context.Context, db *sql.DB, tables map[string]TableMeta) (map[string]int64, error) {

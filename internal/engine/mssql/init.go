@@ -119,6 +119,9 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		initErr = err
 		return nil, fmt.Errorf("table metadata detection failed: %w", err)
 	}
+	// 7b. Detect computed columns for hydration filtering.
+	schema.DetectComputedColumns(ctx, prodDB, tables)
+
 	ui.StepDone(fmt.Sprintf("%d tables dumped", len(tables)))
 
 	// 8. Detect identity offsets.

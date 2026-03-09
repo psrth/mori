@@ -71,8 +71,88 @@ func DetectTableMetadata(ctx context.Context, db *sql.DB) (map[string]TableMeta,
 }
 
 func detectTablePK(ctx context.Context, db *sql.DB, tableName string) (TableMeta, error) {
-	// PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+	// PRAGMA table_xinfo returns: cid, name, type, notnull, dflt_value, pk, hidden
 	// pk > 0 means the column is part of the PRIMARY KEY (pk is the 1-based index in the key).
+	// hidden: 0=normal, 1=hidden (internal), 2=virtual generated, 3=stored generated
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_xinfo(%q)", tableName))
+	if err != nil {
+		// Fall back to table_info if table_xinfo is not supported (old SQLite).
+		return detectTablePKFallback(ctx, db, tableName)
+	}
+	defer rows.Close()
+
+	type colInfo struct {
+		name     string
+		dataType string
+		pkIndex  int
+		hidden   int
+	}
+	var pkCols []colInfo
+	var generatedCols []string
+	hasRows := false
+
+	for rows.Next() {
+		hasRows = true
+		var cid int
+		var name, dataType string
+		var notnull int
+		var dfltValue sql.NullString
+		var pk int
+		var hidden int
+		if err := rows.Scan(&cid, &name, &dataType, &notnull, &dfltValue, &pk, &hidden); err != nil {
+			return TableMeta{}, fmt.Errorf("failed to scan column for %q: %w", tableName, err)
+		}
+		// hidden=2 is virtual generated, hidden=3 is stored generated.
+		if hidden == 2 || hidden == 3 {
+			generatedCols = append(generatedCols, name)
+		}
+		if pk > 0 {
+			pkCols = append(pkCols, colInfo{name: name, dataType: dataType, pkIndex: pk, hidden: hidden})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return TableMeta{}, err
+	}
+
+	// If table_xinfo returned no rows, fall back to table_info.
+	if !hasRows {
+		return detectTablePKFallback(ctx, db, tableName)
+	}
+
+	if len(pkCols) == 0 {
+		return TableMeta{PKType: "none", GeneratedCols: generatedCols}, nil
+	}
+
+	// Sort by pk index (they should already be in order from PRAGMA, but be safe).
+	for i := 0; i < len(pkCols); i++ {
+		for j := i + 1; j < len(pkCols); j++ {
+			if pkCols[j].pkIndex < pkCols[i].pkIndex {
+				pkCols[i], pkCols[j] = pkCols[j], pkCols[i]
+			}
+		}
+	}
+
+	var columns []string
+	var dataTypes []string
+	for _, col := range pkCols {
+		columns = append(columns, col.name)
+		dataTypes = append(dataTypes, col.dataType)
+	}
+
+	pkType := classifyPKType(dataTypes, tableName)
+	if len(columns) > 1 {
+		pkType = "composite"
+	}
+
+	return TableMeta{
+		PKColumns:     columns,
+		PKType:        pkType,
+		GeneratedCols: generatedCols,
+	}, nil
+}
+
+// detectTablePKFallback uses PRAGMA table_info (no generated column detection).
+func detectTablePKFallback(ctx context.Context, db *sql.DB, tableName string) (TableMeta, error) {
 	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%q)", tableName))
 	if err != nil {
 		return TableMeta{}, fmt.Errorf("failed to query table_info for %q: %w", tableName, err)
@@ -107,7 +187,6 @@ func detectTablePK(ctx context.Context, db *sql.DB, tableName string) (TableMeta
 		return TableMeta{PKType: "none"}, nil
 	}
 
-	// Sort by pk index (they should already be in order from PRAGMA, but be safe).
 	for i := 0; i < len(pkCols); i++ {
 		for j := i + 1; j < len(pkCols); j++ {
 			if pkCols[j].pkIndex < pkCols[i].pkIndex {

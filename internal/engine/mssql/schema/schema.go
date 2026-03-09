@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 )
 
 // DumpResult holds the complete result of an MSSQL schema dump and analysis.
@@ -426,4 +428,134 @@ func ApplyIdentityOffsets(ctx context.Context, db *sql.DB, offsets map[string]in
 		}
 	}
 	return nil
+}
+
+// DetectComputedColumns queries Prod for computed (generated) columns and merges
+// them into the existing table metadata. These columns must be excluded from
+// hydration INSERTs because SQL Server rejects explicit values for computed columns.
+func DetectComputedColumns(ctx context.Context, db *sql.DB, tables map[string]TableMeta) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT t.name AS table_name, c.name AS column_name
+		FROM sys.computed_columns c
+		JOIN sys.tables t ON c.object_id = t.object_id
+		WHERE SCHEMA_NAME(t.schema_id) = 'dbo'
+		ORDER BY t.name, c.column_id`)
+	if err != nil {
+		// sys.computed_columns not available; ignore gracefully.
+		return
+	}
+	defer rows.Close()
+
+	genCols := make(map[string][]string)
+	for rows.Next() {
+		var tableName, colName string
+		if err := rows.Scan(&tableName, &colName); err != nil {
+			return
+		}
+		genCols[strings.ToLower(tableName)] = append(genCols[strings.ToLower(tableName)], strings.ToLower(colName))
+	}
+
+	for tableName, cols := range genCols {
+		if meta, ok := tables[tableName]; ok {
+			meta.GeneratedCols = cols
+			tables[tableName] = meta
+		}
+	}
+}
+
+// DetectForeignKeys queries Prod for all foreign key constraints in the dbo schema.
+func DetectForeignKeys(ctx context.Context, db *sql.DB) ([]coreSchema.ForeignKey, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT
+			fk.name AS constraint_name,
+			tp.name AS child_table,
+			cp.name AS child_column,
+			tr.name AS parent_table,
+			cr.name AS parent_column,
+			fk.delete_referential_action_desc AS delete_rule,
+			fk.update_referential_action_desc AS update_rule,
+			fkc.constraint_column_id AS ordinal
+		FROM sys.foreign_keys fk
+		JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+		JOIN sys.tables tp ON fkc.parent_object_id = tp.object_id
+		JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+		JOIN sys.tables tr ON fkc.referenced_object_id = tr.object_id
+		JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+		ORDER BY fk.name, fkc.constraint_column_id`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query foreign keys: %w", err)
+	}
+	defer rows.Close()
+
+	type fkAccum struct {
+		constraintName string
+		childTable     string
+		parentTable    string
+		childColumns   []string
+		parentColumns  []string
+		deleteAction   string
+		updateAction   string
+	}
+	var orderedKeys []string
+	accum := make(map[string]*fkAccum)
+
+	for rows.Next() {
+		var constraintName, childTable, childCol, parentTable, parentCol, deleteRule, updateRule string
+		var ordinal int
+		if err := rows.Scan(&constraintName, &childTable, &childCol, &parentTable, &parentCol,
+			&deleteRule, &updateRule, &ordinal); err != nil {
+			return nil, fmt.Errorf("failed to scan foreign key: %w", err)
+		}
+
+		key := childTable + "." + constraintName
+		a, ok := accum[key]
+		if !ok {
+			a = &fkAccum{
+				constraintName: constraintName,
+				childTable:     strings.ToLower(childTable),
+				parentTable:    strings.ToLower(parentTable),
+				deleteAction:   normalizeFKAction(deleteRule),
+				updateAction:   normalizeFKAction(updateRule),
+			}
+			accum[key] = a
+			orderedKeys = append(orderedKeys, key)
+		}
+		a.childColumns = append(a.childColumns, strings.ToLower(childCol))
+		a.parentColumns = append(a.parentColumns, strings.ToLower(parentCol))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	result := make([]coreSchema.ForeignKey, 0, len(orderedKeys))
+	for _, key := range orderedKeys {
+		a := accum[key]
+		result = append(result, coreSchema.ForeignKey{
+			ConstraintName: a.constraintName,
+			ChildTable:     a.childTable,
+			ChildColumns:   a.childColumns,
+			ParentTable:    a.parentTable,
+			ParentColumns:  a.parentColumns,
+			OnDelete:       a.deleteAction,
+			OnUpdate:       a.updateAction,
+		})
+	}
+
+	return result, nil
+}
+
+// normalizeFKAction normalizes MSSQL FK action descriptions to standard names.
+func normalizeFKAction(action string) string {
+	switch strings.ToUpper(strings.TrimSpace(action)) {
+	case "CASCADE":
+		return "CASCADE"
+	case "SET_NULL", "SET NULL":
+		return "SET NULL"
+	case "SET_DEFAULT", "SET DEFAULT":
+		return "SET DEFAULT"
+	case "NO_ACTION", "NO ACTION":
+		return "NO ACTION"
+	default:
+		return "NO ACTION"
+	}
 }

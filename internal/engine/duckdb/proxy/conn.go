@@ -68,16 +68,43 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 	// Per-connection handlers.
 	var txh *TxnHandler
 	if p.deltaMap != nil && p.tombstones != nil {
-		txh = &TxnHandler{proxy: p, connID: connID}
+		txh = &TxnHandler{proxy: p, connID: connID, txnState: 'I'}
 	}
+
+	// txnState returns the current transaction state for ReadyForQuery messages.
+	txnState := func() byte {
+		if txh != nil {
+			return txh.TxnState()
+		}
+		return 'I'
+	}
+	_ = txnState // used below
+
+	// Per-connection FK enforcer.
+	var fkEnforcer *FKEnforcer
+	if p.prodDB != nil && p.shadowDB != nil && p.schemaRegistry != nil {
+		fkEnforcer = &FKEnforcer{
+			prodDB:         p.prodDB,
+			shadowDB:       p.shadowDB,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			connID:         connID,
+			verbose:        p.verbose,
+		}
+	}
+	// fkEnforcer is used in targetShadow write paths below.
 
 	var eh *ExtHandler
 	if p.classifier != nil && p.router != nil {
 		eh = &ExtHandler{
-			proxy:     p,
-			connID:    connID,
-			txh:       txh,
-			stmtCache: make(map[string]string),
+			proxy:       p,
+			connID:      connID,
+			txh:         txh,
+			stmtCache:   make(map[string]string),
+			stmtClCache: make(map[string]*core.Classification),
+			fkEnforcer:  fkEnforcer,
 		}
 	}
 
@@ -123,9 +150,31 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 				continue
 			}
 
+			// Handle not-supported queries.
+			if decision.strategy == core.StrategyNotSupported {
+				msg := "mori: operation not supported"
+				if decision.classification != nil && decision.classification.NotSupportedMsg != "" {
+					msg = decision.classification.NotSupportedMsg
+				}
+				clientConn.Write(buildErrorResponse(msg))
+				continue
+			}
+
 			// Handle merged reads: query both prod and shadow, merge in-process.
 			if decision.strategy == core.StrategyMergedRead || decision.strategy == core.StrategyJoinPatch {
-				resp := p.executeMergedRead(sqlStr, decision.classification, connID)
+				cl := decision.classification
+				var resp []byte
+				// Dispatch to specialized handlers for complex read patterns.
+				switch {
+				case cl != nil && cl.HasWindowFunc:
+					resp = p.executeWindowRead(sqlStr, cl, connID)
+				case cl != nil && cl.HasSetOp:
+					resp = p.executeSetOpRead(sqlStr, cl, connID)
+				case cl != nil && cl.IsComplexRead:
+					resp = p.executeComplexRead(sqlStr, cl, connID)
+				default:
+					resp = p.executeMergedRead(sqlStr, cl, connID)
+				}
 				clientConn.Write(resp)
 				continue
 			}
@@ -144,17 +193,53 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 				clientConn.Write(resp)
 
 			case targetShadow:
-				// For HydrateAndWrite (UPDATE), hydrate from prod first.
-				if decision.strategy == core.StrategyHydrateAndWrite && decision.classification != nil {
-					p.hydrateBeforeUpdate(decision.classification, connID)
+				cl := decision.classification
+
+				// Handle TRUNCATE.
+				if decision.strategy == core.StrategyTruncate && cl != nil {
+					resp := p.handleTruncate(sqlStr, cl, connID)
+					clientConn.Write(resp)
+					continue
+				}
+
+				// FK enforcement before writes (simple query protocol).
+				if fkEnforcer != nil && cl != nil &&
+					(decision.strategy == core.StrategyShadowWrite ||
+						decision.strategy == core.StrategyHydrateAndWrite ||
+						decision.strategy == core.StrategyShadowDelete) {
+					if errMsg := p.checkFKConstraints(fkEnforcer, cl, sqlStr); errMsg != "" {
+						clientConn.Write(buildErrorResponse(errMsg))
+						continue
+					}
+				}
+
+				// For HydrateAndWrite (UPDATE/upsert), handle bulk case if no PKs.
+				if decision.strategy == core.StrategyHydrateAndWrite && cl != nil {
+					if len(cl.PKs) == 0 && cl.SubType == core.SubUpdate {
+						resp := p.handleBulkUpdate(sqlStr, cl, connID, txh)
+						clientConn.Write(resp)
+						continue
+					}
+					p.hydrateBeforeUpdate(cl, connID)
+				}
+
+				// For ShadowDelete, handle bulk case if no PKs.
+				if decision.strategy == core.StrategyShadowDelete && cl != nil {
+					if len(cl.PKs) == 0 && !cl.IsJoin && len(cl.Tables) == 1 {
+						if meta, ok := p.tables[cl.Tables[0]]; ok && len(meta.PKColumns) > 0 {
+							resp := p.handleBulkDelete(sqlStr, cl, connID, txh)
+							clientConn.Write(resp)
+							continue
+						}
+					}
 				}
 
 				resp := p.executeQuery(p.shadowDB, sqlStr, connID)
 				clientConn.Write(resp)
 
 				// Track deltas/tombstones/schema after successful writes.
-				if decision.classification != nil {
-					p.trackWriteEffects(decision.classification, decision.strategy, connID, txh)
+				if cl != nil {
+					p.trackWriteEffects(cl, decision.strategy, connID, txh)
 				}
 
 			case targetBoth:
@@ -207,7 +292,8 @@ func (p *Proxy) classifyAndRoute(sqlStr string, connID int64) routeDecision {
 	switch strategy {
 	case core.StrategyShadowWrite,
 		core.StrategyHydrateAndWrite,
-		core.StrategyShadowDelete:
+		core.StrategyShadowDelete,
+		core.StrategyTruncate:
 		return routeDecision{
 			target:         targetShadow,
 			classification: classification,
@@ -224,6 +310,12 @@ func (p *Proxy) classifyAndRoute(sqlStr string, connID int64) routeDecision {
 	case core.StrategyTransaction:
 		return routeDecision{target: targetBoth, classification: classification, strategy: strategy}
 
+	case core.StrategyForwardBoth:
+		return routeDecision{target: targetBoth, classification: classification, strategy: strategy}
+
+	case core.StrategyNotSupported:
+		return routeDecision{target: targetProd, classification: classification, strategy: strategy}
+
 	case core.StrategyMergedRead, core.StrategyJoinPatch:
 		return routeDecision{
 			target:         targetProd,
@@ -238,6 +330,13 @@ func (p *Proxy) classifyAndRoute(sqlStr string, connID int64) routeDecision {
 
 // executeQuery runs a SQL query against a database and returns the pgwire response bytes.
 func (p *Proxy) executeQuery(db *sql.DB, sqlStr string, connID int64) []byte {
+	// WRITE GUARD L2: if this is the Prod database, block writes.
+	if db == p.prodDB {
+		if blocked, ok := safeProdExec(p.prodDB, sqlStr, connID, p.logger, p.verbose); ok {
+			return blocked
+		}
+	}
+
 	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
 	isSelect := strings.HasPrefix(upper, "SELECT") ||
 		strings.HasPrefix(upper, "EXPLAIN") ||
@@ -266,10 +365,8 @@ func (p *Proxy) executeSelectQuery(db *sql.DB, sqlStr string, connID int64) []by
 		return buildSQLErrorResponse(err.Error())
 	}
 
-	colOIDs := make([]uint32, len(columns))
-	for i := range colOIDs {
-		colOIDs[i] = 25 // text OID
-	}
+	// Map DuckDB column types to PostgreSQL OIDs.
+	colOIDs := resolveColumnOIDs(rows)
 	var resp []byte
 	resp = append(resp, buildRowDescMsg(columns, colOIDs)...)
 
@@ -330,6 +427,8 @@ func (p *Proxy) executeExecQuery(db *sql.DB, sqlStr string, connID int64) []byte
 		tag = "ALTER TABLE"
 	case strings.HasPrefix(upper, "DROP"):
 		tag = "DROP TABLE"
+	case strings.HasPrefix(upper, "TRUNCATE"):
+		tag = "TRUNCATE TABLE"
 	case strings.HasPrefix(upper, "BEGIN") || strings.HasPrefix(upper, "START"):
 		tag = "BEGIN"
 	case strings.HasPrefix(upper, "COMMIT") || strings.HasPrefix(upper, "END"):
@@ -368,8 +467,9 @@ func (p *Proxy) executeMergedRead(sqlStr string, cl *core.Classification, connID
 		}
 	}
 
-	// PK injection.
+	// PK injection — also supports rowid for PK-less tables (DuckDB implicit column).
 	injectedPK := ""
+	useRowID := false
 	effectiveSQL := sqlStr
 	if !cl.IsJoin {
 		if meta, ok := p.tables[table]; ok && len(meta.PKColumns) > 0 {
@@ -378,8 +478,16 @@ func (p *Proxy) executeMergedRead(sqlStr string, cl *core.Classification, connID
 				effectiveSQL = injectPKColumn(sqlStr, pkCol)
 				injectedPK = pkCol
 			}
+		} else if _, ok := p.tables[table]; ok {
+			// PK-less table: inject DuckDB's implicit rowid for dedup.
+			if needsPKInjection(sqlStr, "rowid") {
+				effectiveSQL = injectPKColumn(sqlStr, "rowid")
+				injectedPK = "rowid"
+				useRowID = true
+			}
 		}
 	}
+	_ = useRowID // rowid is used as dedup key below
 
 	// Query shadow.
 	shadowCols, shadowRows, shadowNulls, shadowErr := queryToRows(p.shadowDB, effectiveSQL)
@@ -390,8 +498,28 @@ func (p *Proxy) executeMergedRead(sqlStr string, cl *core.Classification, connID
 		return p.executeQuery(p.prodDB, sqlStr, connID)
 	}
 
-	// Query prod (with overfetch for LIMIT queries).
+	// Rewrite Prod query for schema diffs (DDL changes).
 	prodSQL := effectiveSQL
+	skipProd := false
+	if p.schemaRegistry != nil {
+		rewritten, shouldSkip := rewriteSQLForProd(prodSQL, p.schemaRegistry, cl.Tables)
+		if shouldSkip {
+			skipProd = true
+		} else {
+			prodSQL = rewritten
+		}
+	}
+
+	// Check if table is fully shadowed (e.g., after TRUNCATE) — skip Prod entirely.
+	if !skipProd && p.schemaRegistry != nil && p.schemaRegistry.IsFullyShadowed(table) {
+		skipProd = true
+	}
+
+	if skipProd {
+		return buildMergedResponse(shadowCols, shadowRows, shadowNulls)
+	}
+
+	// Query prod (with overfetch for LIMIT queries).
 	if cl.HasLimit && cl.Limit > 0 {
 		deltaCount := p.deltaMap.CountForTable(table)
 		tombstoneCount := p.tombstones.CountForTable(table)
@@ -412,7 +540,7 @@ func (p *Proxy) executeMergedRead(sqlStr string, cl *core.Classification, connID
 		return buildSQLErrorResponse(prodErr.Error())
 	}
 
-	// Find PK column index.
+	// Find PK column index — for PK-less tables, use rowid if injected.
 	meta, hasMeta := p.tables[table]
 	pkIdx := -1
 	if hasMeta && len(meta.PKColumns) > 0 {
@@ -429,6 +557,14 @@ func (p *Proxy) executeMergedRead(sqlStr string, cl *core.Classification, connID
 					pkIdx = i
 					break
 				}
+			}
+		}
+	} else if injectedPK == "rowid" {
+		// PK-less table: use injected rowid for dedup.
+		for i, col := range shadowCols {
+			if col == "rowid" {
+				pkIdx = i
+				break
 			}
 		}
 	}
@@ -458,11 +594,16 @@ func (p *Proxy) executeMergedRead(sqlStr string, cl *core.Classification, connID
 		filteredProdNulls = prodNulls
 	}
 
+	// Schema adaptation: adjust Prod columns/rows for schema diffs.
+	adaptedProdCols := adaptColumns(p.schemaRegistry, table, prodCols)
+	filteredProd, filteredProdNulls = adaptRows(p.schemaRegistry, table, prodCols, filteredProd, filteredProdNulls)
+	_ = adaptedProdCols // used for column alignment below
+
 	// Merge — shadow first, then filtered prod.
 	merged := append(shadowRows, filteredProd...)
 	mergedNulls := append(shadowNulls, filteredProdNulls...)
 
-	// Dedup by PK.
+	// Dedup by PK, or by full-row hash for PK-less tables.
 	if pkIdx >= 0 {
 		seen := make(map[string]bool)
 		var deduped [][]sql.NullString
@@ -483,6 +624,9 @@ func (p *Proxy) executeMergedRead(sqlStr string, cl *core.Classification, connID
 		}
 		merged = deduped
 		mergedNulls = dedupedNulls
+	} else {
+		// PK-less table: deduplicate by full-row hash (shadow wins on collision).
+		merged, mergedNulls = deduplicateByFullRow(merged, mergedNulls)
 	}
 
 	// Re-sort.
@@ -592,6 +736,12 @@ func (p *Proxy) mergedReadRows(sqlStr string, cl *core.Classification, connID in
 				effectiveSQL = injectPKColumn(sqlStr, pkCol)
 				injectedPK = pkCol
 			}
+		} else if _, ok := p.tables[table]; ok {
+			// PK-less table: inject rowid for dedup.
+			if needsPKInjection(sqlStr, "rowid") {
+				effectiveSQL = injectPKColumn(sqlStr, "rowid")
+				injectedPK = "rowid"
+			}
 		}
 	}
 
@@ -600,7 +750,28 @@ func (p *Proxy) mergedReadRows(sqlStr string, cl *core.Classification, connID in
 		return queryToRows(p.prodDB, sqlStr)
 	}
 
+	// Rewrite Prod query for schema diffs.
 	prodSQL := effectiveSQL
+	skipProdInternal := false
+	if p.schemaRegistry != nil {
+		rewritten, shouldSkip := rewriteSQLForProd(prodSQL, p.schemaRegistry, cl.Tables)
+		if shouldSkip {
+			skipProdInternal = true
+		} else {
+			prodSQL = rewritten
+		}
+	}
+	if !skipProdInternal && p.schemaRegistry != nil && p.schemaRegistry.IsFullyShadowed(table) {
+		skipProdInternal = true
+	}
+
+	if skipProdInternal {
+		if injectedPK != "" {
+			shadowCols, shadowRows, shadowNulls = stripInjectedPKColumn(shadowCols, shadowRows, shadowNulls, injectedPK)
+		}
+		return shadowCols, shadowRows, shadowNulls, nil
+	}
+
 	prodCols, prodRows, prodNulls, prodErr := queryToRows(p.prodDB, prodSQL)
 	if prodErr != nil {
 		if p.schemaRegistry != nil && p.schemaRegistry.HasDiff(table) {
@@ -630,6 +801,14 @@ func (p *Proxy) mergedReadRows(sqlStr string, cl *core.Classification, connID in
 				}
 			}
 		}
+	} else if injectedPK == "rowid" {
+		// PK-less table: use injected rowid for dedup.
+		for i, col := range shadowCols {
+			if col == "rowid" {
+				pkIdx = i
+				break
+			}
+		}
 	}
 
 	var filteredProd [][]sql.NullString
@@ -656,6 +835,11 @@ func (p *Proxy) mergedReadRows(sqlStr string, cl *core.Classification, connID in
 		filteredProdNulls = prodNulls
 	}
 
+	// Schema adaptation for Prod rows.
+	adaptedProdCols := adaptColumns(p.schemaRegistry, table, prodCols)
+	filteredProd, filteredProdNulls = adaptRows(p.schemaRegistry, table, prodCols, filteredProd, filteredProdNulls)
+	_ = adaptedProdCols
+
 	merged := append(shadowRows, filteredProd...)
 	mergedNulls := append(shadowNulls, filteredProdNulls...)
 
@@ -679,6 +863,9 @@ func (p *Proxy) mergedReadRows(sqlStr string, cl *core.Classification, connID in
 		}
 		merged = deduped
 		mergedNulls = dedupedNulls
+	} else {
+		// PK-less table: deduplicate by full-row hash.
+		merged, mergedNulls = deduplicateByFullRow(merged, mergedNulls)
 	}
 
 	cols := shadowCols
@@ -691,6 +878,25 @@ func (p *Proxy) mergedReadRows(sqlStr string, cl *core.Classification, connID in
 	}
 
 	return cols, merged, mergedNulls, nil
+}
+
+// resolveColumnOIDs uses sql.ColumnType metadata to map DuckDB types to PostgreSQL OIDs.
+func resolveColumnOIDs(rows *sql.Rows) []uint32 {
+	colTypes, err := rows.ColumnTypes()
+	if err != nil {
+		// Fallback to all-text.
+		cols, _ := rows.Columns()
+		oids := make([]uint32, len(cols))
+		for i := range oids {
+			oids[i] = 25
+		}
+		return oids
+	}
+	oids := make([]uint32, len(colTypes))
+	for i, ct := range colTypes {
+		oids[i] = duckDBTypeToOID(ct.DatabaseTypeName())
+	}
+	return oids
 }
 
 // queryToRows executes a SELECT query and returns columns, rows, and null flags.
@@ -888,6 +1094,169 @@ func compareMergedValues(a, b string) int {
 	return 0
 }
 
+// extractInsertedPKs attempts to extract inserted PK values from an INSERT statement.
+// For auto-increment tables, it queries Shadow for the last inserted row.
+// For explicit PK values in the INSERT, it extracts them from the SQL.
+func (p *Proxy) extractInsertedPKs(sqlStr, table string, connID int64) []string {
+	meta, ok := p.tables[table]
+	if !ok || len(meta.PKColumns) == 0 {
+		return nil
+	}
+	pkCol := meta.PKColumns[0]
+
+	// For serial/bigserial PKs, query shadow for the last inserted PK.
+	if meta.PKType == "serial" || meta.PKType == "bigserial" {
+		query := fmt.Sprintf(`SELECT MAX("%s") FROM "%s"`, pkCol, table)
+		var maxPK sql.NullString
+		if err := p.shadowDB.QueryRow(query).Scan(&maxPK); err == nil && maxPK.Valid {
+			return []string{maxPK.String}
+		}
+	}
+
+	// Try to extract PK from VALUES clause.
+	pks := extractPKFromInsertValues(sqlStr, table, pkCol, meta.PKColumns)
+	return pks
+}
+
+// extractPKFromInsertValues tries to extract PK values from an INSERT statement's
+// VALUES clause by matching the PK column position.
+func extractPKFromInsertValues(sqlStr, table, pkCol string, pkColumns []string) []string {
+	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
+
+	// Find column list: INSERT INTO table (col1, col2, ...) VALUES (...)
+	parenStart := strings.Index(upper, "(")
+	valuesIdx := strings.Index(upper, "VALUES")
+	if parenStart < 0 || valuesIdx < 0 || parenStart > valuesIdx {
+		return nil
+	}
+
+	// Extract column list.
+	parenEnd := strings.Index(upper[:valuesIdx], ")")
+	if parenEnd < 0 {
+		return nil
+	}
+	colList := sqlStr[parenStart+1 : parenEnd]
+	cols := strings.Split(colList, ",")
+
+	// Find PK column index.
+	pkIdx := -1
+	for i, col := range cols {
+		trimmed := strings.Trim(strings.TrimSpace(col), `"'`)
+		if strings.EqualFold(trimmed, pkCol) {
+			pkIdx = i
+			break
+		}
+	}
+	if pkIdx < 0 {
+		return nil
+	}
+
+	// Extract VALUES tuples.
+	valuesStart := strings.Index(upper[valuesIdx:], "(")
+	if valuesStart < 0 {
+		return nil
+	}
+	valuesPart := sqlStr[valuesIdx+valuesStart:]
+
+	// Parse value tuples (handles multiple VALUES (...), (...))
+	var pks []string
+	depth := 0
+	tupleStart := -1
+	for i, ch := range valuesPart {
+		if ch == '(' {
+			if depth == 0 {
+				tupleStart = i + 1
+			}
+			depth++
+		} else if ch == ')' {
+			depth--
+			if depth == 0 && tupleStart >= 0 {
+				tuple := valuesPart[tupleStart:i]
+				vals := splitValuesTuple(tuple)
+				if pkIdx < len(vals) {
+					val := strings.TrimSpace(vals[pkIdx])
+					val = strings.Trim(val, "'")
+					if val != "" && !strings.EqualFold(val, "NULL") && !strings.EqualFold(val, "DEFAULT") {
+						pks = append(pks, val)
+					}
+				}
+				tupleStart = -1
+			}
+		}
+	}
+	return pks
+}
+
+// splitValuesTuple splits a VALUES tuple by commas, respecting parentheses and quotes.
+func splitValuesTuple(s string) []string {
+	var parts []string
+	depth := 0
+	inQuote := false
+	start := 0
+	for i, ch := range s {
+		switch {
+		case ch == '\'' && !inQuote:
+			inQuote = true
+		case ch == '\'' && inQuote:
+			inQuote = false
+		case ch == '(' && !inQuote:
+			depth++
+		case ch == ')' && !inQuote:
+			depth--
+		case ch == ',' && depth == 0 && !inQuote:
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}
+
+// handleTruncate executes TRUNCATE on Shadow and marks the table as fully shadowed.
+func (p *Proxy) handleTruncate(sqlStr string, cl *core.Classification, connID int64) []byte {
+	// Execute TRUNCATE on Shadow.
+	resp := p.executeQuery(p.shadowDB, sqlStr, connID)
+
+	// Mark each truncated table as fully shadowed and clear delta/tombstone state.
+	for _, table := range cl.Tables {
+		if p.schemaRegistry != nil {
+			p.schemaRegistry.MarkFullyShadowed(table)
+		}
+		if p.deltaMap != nil {
+			p.deltaMap.ClearTable(table)
+		}
+		if p.tombstones != nil {
+			p.tombstones.ClearTable(table)
+		}
+		if p.verbose {
+			log.Printf("[conn %d] TRUNCATE: table %s marked fully shadowed", connID, table)
+		}
+	}
+
+	// Persist state.
+	if p.schemaRegistry != nil {
+		coreSchema.WriteRegistry(p.moriDir, p.schemaRegistry)
+	}
+	if p.deltaMap != nil {
+		delta.WriteDeltaMap(p.moriDir, p.deltaMap)
+	}
+	if p.tombstones != nil {
+		delta.WriteTombstoneSet(p.moriDir, p.tombstones)
+	}
+
+	p.logger.Event(connID, "truncate", fmt.Sprintf("tables=%v", cl.Tables))
+	return resp
+}
+
+// checkFKConstraints enforces FK constraints before a write operation in the simple query path.
+// Returns an error string if the FK constraint would be violated, or "" if OK.
+func (p *Proxy) checkFKConstraints(fkEnforcer *FKEnforcer, cl *core.Classification, sqlStr string) string {
+	if fkEnforcer == nil || cl == nil {
+		return ""
+	}
+	return fkEnforcer.CheckWriteFK(cl, sqlStr)
+}
+
 // hydrateBeforeUpdate copies affected rows from prod to shadow before an UPDATE.
 func (p *Proxy) hydrateBeforeUpdate(cl *core.Classification, connID int64) {
 	for _, pk := range cl.PKs {
@@ -905,7 +1274,11 @@ func (p *Proxy) hydrateBeforeUpdate(cl *core.Classification, connID int64) {
 		if err != nil || len(rows) == 0 {
 			continue
 		}
-		insertSQL := buildHydrateInsert(pk.Table, cols, rows[0])
+		var genCols []string
+		if meta, ok := p.tables[pk.Table]; ok {
+			genCols = meta.GeneratedCols
+		}
+		insertSQL := buildHydrateInsert(pk.Table, cols, rows[0], genCols)
 		if _, err := p.shadowDB.Exec(insertSQL); err != nil {
 			if p.verbose {
 				log.Printf("[conn %d] hydration failed for (%s, %s): %v", connID, pk.Table, pk.PK, err)
@@ -916,17 +1289,24 @@ func (p *Proxy) hydrateBeforeUpdate(cl *core.Classification, connID int64) {
 
 // buildHydrateInsert constructs an INSERT OR REPLACE statement.
 // DuckDB uses INSERT OR REPLACE syntax for upserts.
-func buildHydrateInsert(table string, cols []string, row []sql.NullString) string {
-	quotedCols := make([]string, len(cols))
-	for i, c := range cols {
-		quotedCols[i] = `"` + c + `"`
+// Generated columns are excluded since they cannot be written to directly.
+func buildHydrateInsert(table string, cols []string, row []sql.NullString, generatedCols []string) string {
+	genSet := make(map[string]bool, len(generatedCols))
+	for _, g := range generatedCols {
+		genSet[strings.ToLower(g)] = true
 	}
-	values := make([]string, len(row))
-	for i, v := range row {
-		if !v.Valid {
-			values[i] = "NULL"
+
+	var quotedCols []string
+	var values []string
+	for i, c := range cols {
+		if genSet[strings.ToLower(c)] {
+			continue
+		}
+		quotedCols = append(quotedCols, `"`+c+`"`)
+		if i < len(row) && row[i].Valid {
+			values = append(values, "'"+strings.ReplaceAll(row[i].String, "'", "''")+"'")
 		} else {
-			values[i] = "'" + strings.ReplaceAll(v.String, "'", "''") + "'"
+			values = append(values, "NULL")
 		}
 	}
 	return fmt.Sprintf(`INSERT OR REPLACE INTO "%s" (%s) VALUES (%s)`,
@@ -939,8 +1319,31 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 
 	switch strategy {
 	case core.StrategyShadowWrite:
-		for _, table := range cl.Tables {
-			p.deltaMap.MarkInserted(table)
+		// For INSERTs, try to extract individual PKs for row-level tracking.
+		if cl.SubType == core.SubInsert && len(cl.Tables) > 0 {
+			table := cl.Tables[0]
+			inserted := p.extractInsertedPKs(cl.RawSQL, table, connID)
+			if len(inserted) > 0 {
+				for _, pk := range inserted {
+					if inTxn {
+						p.deltaMap.Stage(table, pk)
+					} else {
+						p.deltaMap.Add(table, pk)
+					}
+				}
+				if !inTxn {
+					delta.WriteDeltaMap(p.moriDir, p.deltaMap)
+				}
+			} else {
+				// Fallback to table-level tracking.
+				for _, table := range cl.Tables {
+					p.deltaMap.MarkInserted(table)
+				}
+			}
+		} else {
+			for _, table := range cl.Tables {
+				p.deltaMap.MarkInserted(table)
+			}
 		}
 
 	case core.StrategyHydrateAndWrite:
@@ -1023,11 +1426,42 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 			}
 		}
 
+	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "DROP COLUMN"):
+		table, col := parseAlterDropColumn(sqlStr)
+		if table != "" && col != "" {
+			p.schemaRegistry.RecordDropColumn(table, col)
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: DROP COLUMN %s.%s", connID, table, col)
+			}
+		}
+
+	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "TYPE"):
+		table, col, oldType, newType := parseAlterColumnType(sqlStr)
+		if table != "" && col != "" {
+			p.schemaRegistry.RecordTypeChange(table, col, oldType, newType)
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: ALTER COLUMN TYPE %s.%s %s -> %s", connID, table, col, oldType, newType)
+			}
+		}
+
 	case strings.HasPrefix(upper, "CREATE TABLE"):
 		for _, table := range cl.Tables {
 			p.schemaRegistry.RecordNewTable(table)
 			if p.verbose {
 				log.Printf("[conn %d] schema registry: CREATE TABLE %s", connID, table)
+			}
+		}
+		// Extract FK constraints from DDL and record them.
+		fks := extractFKFromDDL(sqlStr)
+		for _, fk := range fks {
+			if len(cl.Tables) > 0 {
+				fk.ChildTable = cl.Tables[0]
+				p.schemaRegistry.RecordForeignKey(fk.ChildTable, fk)
+				if p.verbose {
+					log.Printf("[conn %d] schema registry: FK %s.(%s) -> %s.(%s)",
+						connID, fk.ChildTable, strings.Join(fk.ChildColumns, ","),
+						fk.ParentTable, strings.Join(fk.ParentColumns, ","))
+				}
 			}
 		}
 
@@ -1077,6 +1511,59 @@ func parseAlterRenameColumn(sqlStr string) (table, oldName, newName string) {
 		newName = strings.Trim(fields[idx], `"'`)
 	}
 	return table, oldName, newName
+}
+
+func parseAlterDropColumn(sqlStr string) (table, col string) {
+	fields := strings.Fields(sqlStr)
+	if len(fields) < 5 {
+		return "", ""
+	}
+	table = strings.Trim(fields[2], `"'`)
+	idx := 3
+	if idx < len(fields) && strings.EqualFold(fields[idx], "DROP") {
+		idx++
+	}
+	if idx < len(fields) && strings.EqualFold(fields[idx], "COLUMN") {
+		idx++
+	}
+	if idx < len(fields) {
+		col = strings.Trim(fields[idx], `"'`)
+	}
+	return table, col
+}
+
+func parseAlterColumnType(sqlStr string) (table, col, oldType, newType string) {
+	fields := strings.Fields(sqlStr)
+	if len(fields) < 6 {
+		return "", "", "", ""
+	}
+	table = strings.Trim(fields[2], `"'`)
+	// ALTER TABLE t ALTER COLUMN c TYPE new_type
+	idx := 3
+	if idx < len(fields) && strings.EqualFold(fields[idx], "ALTER") {
+		idx++
+	}
+	if idx < len(fields) && strings.EqualFold(fields[idx], "COLUMN") {
+		idx++
+	}
+	if idx < len(fields) {
+		col = strings.Trim(fields[idx], `"'`)
+		idx++
+	}
+	if idx < len(fields) && strings.EqualFold(fields[idx], "SET") {
+		// ALTER ... SET DATA TYPE
+		idx++
+		if idx < len(fields) && strings.EqualFold(fields[idx], "DATA") {
+			idx++
+		}
+	}
+	if idx < len(fields) && strings.EqualFold(fields[idx], "TYPE") {
+		idx++
+	}
+	if idx < len(fields) {
+		newType = fields[idx]
+	}
+	return table, col, oldType, newType
 }
 
 func parseAlterAddColumn(sqlStr string) (table, col, colType string) {

@@ -30,6 +30,7 @@ type Proxy struct {
 	shadowAddr      string
 	credentialsFile string
 	projectID       string
+	databaseID      string // Firestore database ID (default: "(default)")
 	port            int
 	verbose         bool
 
@@ -56,6 +57,11 @@ type Proxy struct {
 	connCount  atomic.Int64
 	shutdownCh chan struct{}
 	once       sync.Once
+
+	// Transaction tracking: maps transaction ID (hex-encoded) to active state.
+	txnMu             sync.Mutex
+	activeTransactions map[string]bool
+	inTransaction      bool // true if any transaction is staged (simplified: single-session)
 }
 
 // New creates a Firestore Proxy.
@@ -68,22 +74,27 @@ func New(
 	schemaRegistry *coreSchema.Registry,
 	logger *logging.Logger,
 ) *Proxy {
+	// Extract database ID from connection string if available.
+	databaseID := "(default)"
+
 	return &Proxy{
-		prodAddr:        prodAddr,
-		shadowAddr:      shadowAddr,
-		credentialsFile: credentialsFile,
-		projectID:       projectID,
-		port:            listenPort,
-		verbose:         verbose,
-		classifier:      classifier,
-		router:          router,
-		deltaMap:        deltaMap,
-		tombstones:      tombstones,
-		collections:     collections,
-		schemaRegistry:  schemaRegistry,
-		moriDir:         moriDir,
-		logger:          logger,
-		shutdownCh:      make(chan struct{}),
+		prodAddr:           prodAddr,
+		shadowAddr:         shadowAddr,
+		credentialsFile:    credentialsFile,
+		projectID:          projectID,
+		databaseID:         databaseID,
+		port:               listenPort,
+		verbose:            verbose,
+		classifier:         classifier,
+		router:             router,
+		deltaMap:           deltaMap,
+		tombstones:         tombstones,
+		collections:        collections,
+		schemaRegistry:     schemaRegistry,
+		moriDir:            moriDir,
+		logger:             logger,
+		shutdownCh:         make(chan struct{}),
+		activeTransactions: make(map[string]bool),
 	}
 }
 
@@ -98,7 +109,7 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 
 	// Connect to shadow backend (emulator) for raw forwarding.
 	if p.shadowAddr != "" {
-		p.shadowConn, err = grpc.DialContext(ctx, p.shadowAddr,
+		p.shadowConn, err = grpc.NewClient(p.shadowAddr,
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 			grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
 		)
@@ -203,7 +214,7 @@ func (p *Proxy) Addr() string {
 }
 
 // dialProd establishes a gRPC connection to the production Firestore backend.
-func (p *Proxy) dialProd(ctx context.Context) (*grpc.ClientConn, error) {
+func (p *Proxy) dialProd(_ context.Context) (*grpc.ClientConn, error) {
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})))
 
@@ -227,7 +238,7 @@ func (p *Proxy) dialProd(ctx context.Context) (*grpc.ClientConn, error) {
 		}
 	}
 
-	return grpc.DialContext(ctx, p.prodAddr, opts...)
+	return grpc.NewClient(p.prodAddr, opts...)
 }
 
 // isLocalAddr checks if an address is a local/emulator address.
@@ -244,7 +255,7 @@ func isLocalAddr(addr string) bool {
 // gRPC frames opaquely.
 type rawCodec struct{}
 
-func (rawCodec) Marshal(v interface{}) ([]byte, error) {
+func (rawCodec) Marshal(v any) ([]byte, error) {
 	f, ok := v.(*frame)
 	if !ok {
 		return nil, status.Errorf(codes.Internal, "rawCodec: unexpected type %T", v)
@@ -252,7 +263,7 @@ func (rawCodec) Marshal(v interface{}) ([]byte, error) {
 	return f.payload, nil
 }
 
-func (rawCodec) Unmarshal(data []byte, v interface{}) error {
+func (rawCodec) Unmarshal(data []byte, v any) error {
 	f, ok := v.(*frame)
 	if !ok {
 		return status.Errorf(codes.Internal, "rawCodec: unexpected type %T", v)
