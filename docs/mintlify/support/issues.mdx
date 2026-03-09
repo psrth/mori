@@ -1,0 +1,33 @@
+---
+title: "Issues"
+description: "How to report bugs and request features."
+sidebarTitle: "Issues"
+---
+
+## Report an Issue
+
+Mori is under active development and we welcome feedback. The edge cases you run into in your day-to-day usage are especially valuable — they help us improve the proxy for everyone.
+
+If you encounter a bug, unexpected behavior, or have a feature request, please open a GitHub issue:
+
+<Card title="Open an Issue" icon="github" href="https://github.com/psrth/mori/issues/new">
+  github.com/psrth/mori/issues
+</Card>
+
+## What to Include
+
+When reporting a bug, including these details helps us reproduce and fix it faster:
+
+- **Engine and provider** — e.g., PostgreSQL + Neon, MySQL + AWS RDS
+- **Mori version** — output of `mori --version`
+- **The query that failed** — the SQL (or Redis command, or Firestore operation) that produced unexpected results
+- **Expected vs actual behavior** — what you expected to happen and what happened instead
+- **Proxy logs** — relevant output from `mori log` or `mori start --verbose`
+
+## Feature Requests
+
+We'd love to hear what you need. Open an issue with the `enhancement` label describing:
+
+- The use case you're trying to solve
+- How you'd expect it to work
+- Any workarounds you're currently using

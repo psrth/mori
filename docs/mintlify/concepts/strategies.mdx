@@ -1,0 +1,350 @@
+---
+title: "Strategies"
+description: "Exhaustive reference of how every type of database operation is classified, routed, and executed."
+sidebarTitle: "Strategies"
+---
+
+Every query that arrives at Mori is classified, routed to a strategy, and executed against the appropriate backend(s). This page is the exhaustive reference for how each operation type is handled.
+
+## Query Classification
+
+The classifier parses each incoming statement to extract:
+
+- **OpType** — `READ`, `WRITE`, `DDL`, `TRANSACTION`, or `OTHER`
+- **SubType** — specific operation (e.g., `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `ALTER`, `BEGIN`)
+- **Tables** — all tables referenced in the query
+- **Primary Keys** — extractable PKs from WHERE clauses (e.g., `WHERE id = 42`)
+- **Feature flags** — `IsJoin`, `HasAggregate`, `HasSetOp`, `IsComplexRead`, `HasReturning`, `HasOnConflict`, `HasWindowFunc`, `HasDistinct`, `HasCursor`, `IsMetadataQuery`
+
+### Statement Types
+
+| Category | Statements | SubType |
+|----------|-----------|---------|
+| **Read** | SELECT | SubSelect |
+| **Write** | INSERT, UPDATE, DELETE, TRUNCATE | SubInsert, SubUpdate, SubDelete, SubTruncate |
+| **DDL** | CREATE TABLE/INDEX, ALTER TABLE, DROP TABLE, RENAME | SubCreate, SubAlter, SubDrop |
+| **Transaction** | BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE | SubBegin, SubCommit, SubRollback, SubSavepoint, SubRelease |
+| **Cursor** | DECLARE, FETCH, CLOSE | SubCursor |
+| **Session** | SET, SHOW | SubSet, SubShow |
+| **Explain** | EXPLAIN (rejects ANALYZE) | SubExplain |
+| **Prepared** | PREPARE, EXECUTE, DEALLOCATE | SubPrepare, SubExecute, SubDeallocate |
+| **Listen** | LISTEN, UNLISTEN | SubListen |
+| **Unsupported** | NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE | SubNotSupported |
+
+## Routing Decision Matrix
+
+The router takes the classification output plus the current delta/tombstone/schema state and selects one of 12 execution strategies.
+
+### Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| **Prod Direct** | Forward to prod unchanged, return result. Zero overhead. |
+| **Merged Read** | Query both backends, filter tombstones/deltas, merge results. |
+| **Join Patch** | Execute JOIN on prod, patch delta rows from shadow. |
+| **Shadow Write** | Execute INSERT on shadow only. |
+| **Hydrate and Write** | Hydrate affected rows from prod → shadow, then write. |
+| **Shadow Delete** | Delete from shadow, add tombstone. |
+| **Shadow DDL** | Execute DDL on shadow, update schema registry. |
+| **Transaction** | Forward transaction control to both backends. |
+| **Not Supported** | Return error to client. |
+| **Forward Both** | Forward to both backends (e.g., SET). |
+| **Truncate** | Execute on shadow, mark table fully shadowed. |
+| **Listen Only** | Forward LISTEN to prod only. |
+
+### Decision Table
+
+| OpType | Condition | Strategy |
+|--------|-----------|----------|
+| SELECT | All tables clean (no deltas/tombstones/schema diffs) | **Prod Direct** |
+| SELECT | Affected table + set operation (UNION/INTERSECT/EXCEPT) | **Merged Read** |
+| SELECT | Affected table + complex read (CTEs, derived tables) | **Merged Read** |
+| SELECT | Affected table + aggregate/GROUP BY | **Merged Read** |
+| SELECT | Affected table + JOIN | **Join Patch** |
+| SELECT | Affected table (simple single-table) | **Merged Read** |
+| INSERT | No ON CONFLICT | **Shadow Write** |
+| INSERT | Has ON CONFLICT | **Hydrate and Write** |
+| UPDATE | Always | **Hydrate and Write** |
+| DELETE | Always | **Shadow Delete** |
+| TRUNCATE | Always | **Truncate** |
+| DDL | Always | **Shadow DDL** |
+| BEGIN/COMMIT/ROLLBACK | Always | **Transaction** |
+| SAVEPOINT/RELEASE | Always | **Transaction** |
+| SET | Always | **Forward Both** |
+| SHOW | Always | **Prod Direct** |
+| EXPLAIN | Clean tables | **Prod Direct** |
+| EXPLAIN | Affected tables | **Not Supported** |
+| CURSOR | Always | **Merged Read** |
+| LISTEN | Always | **Listen Only** |
+| PREPARE | Always | **Shadow Write** |
+| DEALLOCATE | Always | **Forward Both** |
+| NOTIFY | Always | **Not Supported** |
+
+---
+
+## Read Operations
+
+### Prod Direct
+
+When a SELECT touches only tables with no local mutations, the query passes straight through to prod. Zero overhead beyond the proxy hop.
+
+### Merged Read (Single Table)
+
+When a SELECT touches a table with delta or tombstone entries:
+
+<Steps>
+  <Step title="Shadow Query">
+    Execute the original query against shadow. Returns the local subset of results.
+  </Step>
+  <Step title="Prod Query (over-fetched)">
+    Execute against prod with adjusted LIMIT: `original_limit + |deltas| + |tombstones|`. If schema divergence exists, the query is rewritten first (remove predicates on shadow-only columns, revert renamed columns).
+  </Step>
+  <Step title="Filter Prod Results">
+    Discard rows where `(table, pk)` exists in the Delta Map (shadow has the authoritative version) or the Tombstone Set (locally deleted).
+  </Step>
+  <Step title="Adapt Prod Results">
+    Per the Schema Registry: inject NULLs for added columns, strip dropped columns, apply renames and type casts.
+  </Step>
+  <Step title="Merge and Deduplicate">
+    Combine shadow results with filtered/adapted prod results. Deduplicate by PK — shadow wins on conflict.
+  </Step>
+  <Step title="Re-apply Ordering and Limits">
+    Sort by original ORDER BY, apply LIMIT/OFFSET to produce the final result set.
+  </Step>
+</Steps>
+
+**PK injection:** The proxy injects PK columns into the SELECT if they aren't already present (needed for deduplication). They're stripped from the final output.
+
+**LIMIT over-fetching:** Prod queries add `delta_count + tombstone_count` to the LIMIT to compensate for rows that will be filtered out.
+
+### Join Patch
+
+When a SELECT joins tables and at least one has local mutations:
+
+<Steps>
+  <Step title="Execute on Prod">
+    Run the JOIN as-is on prod. Produces correct results for all non-delta rows.
+  </Step>
+  <Step title="Identify Affected Rows">
+    For each row in the result, check if any primary key from a delta table is in the Delta Map or Tombstone Set. Partition into clean, delta, and dead rows.
+  </Step>
+  <Step title="Discard Tombstoned Rows">
+    Remove rows referencing locally-deleted PKs.
+  </Step>
+  <Step title="Patch Delta Rows">
+    Fetch shadow versions of delta rows and replace the delta columns in the joined result.
+  </Step>
+  <Step title="Execute on Shadow">
+    Run the JOIN on shadow to catch locally-inserted rows that should appear in the result.
+  </Step>
+  <Step title="Merge and Deduplicate">
+    Combine patched prod results with shadow results. Deduplicate by composite key (all joined table PKs), then re-apply ORDER BY and LIMIT.
+  </Step>
+</Steps>
+
+**Schema diff handling for JOINs:** When joined tables have schema changes, dirty tables are materialized into temp tables and the JOIN is rewritten to reference them.
+
+### Aggregates
+
+Aggregate queries (COUNT, SUM, AVG, MIN, MAX with GROUP BY) can't be merged by simply combining prod and shadow results — aggregation must be re-applied on the combined data.
+
+**Approach:**
+1. Build a row-level base query (strip aggregates, keep GROUP BY columns and source columns)
+2. Run the base query through the merged read pipeline to get all rows
+3. Materialize into a temp table on shadow
+4. Re-aggregate in the proxy (in-memory grouping + function application)
+5. Apply HAVING filters on re-aggregated results
+
+**Complex aggregates** (array_agg, json_agg, string_agg, etc.) materialize into a temp table and re-execute the original query against it on shadow, leveraging the database's native aggregate implementation.
+
+### Complex Reads
+
+**CTEs (WITH clause):**
+- Non-recursive CTEs: Materialize dirty CTEs independently into temp tables
+- Recursive CTEs: Materialize dirty base tables, rewrite query to reference temp tables
+
+**Derived Tables (subqueries in FROM):**
+- Recursively rewrite subqueries, replacing dirty subquery results with temp tables
+
+**LATERAL Joins:**
+- Materialize referenced dirty base tables (not the LATERAL body itself)
+- Preserve LATERAL semantics through table materialization
+
+### Set Operations
+
+UNION, INTERSECT, EXCEPT are decomposed into leaf SELECT nodes. Each leaf runs through the merged read pipeline independently, then in-memory set operations are applied:
+
+- **UNION**: Combine + deduplicate
+- **UNION ALL**: Combine without dedup
+- **INTERSECT**: Keep rows in both sets
+- **EXCEPT**: Keep rows only in first set
+
+### Window Functions
+
+Window functions require the complete dataset to compute correctly — they can't be decomposed.
+
+1. Build a base SELECT (same FROM/WHERE, no window functions)
+2. Run base through merged read pipeline
+3. Materialize result into temp table on shadow
+4. Rewrite original query to read from temp table
+5. Execute on shadow (leverages the database's native window implementation)
+
+### Cursors
+
+- **DECLARE CURSOR**: Classifies inner query; materializes if affected tables
+- **FETCH**: Reads from cursor on the appropriate backend
+- **CLOSE**: Closes cursor on both backends
+
+---
+
+## Write Operations
+
+All writes execute on shadow. Production is never modified.
+
+### INSERT
+
+**Simple INSERT (Shadow Write):**
+1. Enforce FK constraints (validate parent rows exist)
+2. Execute INSERT on shadow
+3. Capture RETURNING clause to extract inserted PKs for precise delta tracking
+4. Add all inserted PKs to the Delta Map
+5. Persist state
+
+Shadow's offset sequences assign PKs in the local range (e.g., 10,000,001+), guaranteed to not collide with prod.
+
+**Upsert — INSERT ... ON CONFLICT (Hydrate and Write):**
+1. Detect conflict key columns
+2. Check prod for rows matching conflict keys
+3. Hydrate matching prod rows into shadow
+4. Execute upsert on shadow
+5. Track all affected rows (hydrated + newly inserted) in Delta Map
+
+### UPDATE
+
+**Point Update** (PK extractable from WHERE, e.g., `WHERE id = 42`):
+1. Enforce FK constraints on SET values
+2. Check if row exists in shadow — if not, hydrate from prod
+3. Execute UPDATE on shadow
+4. Add affected PK to Delta Map
+
+**Bulk Update** (PK not extractable, e.g., `WHERE status = 'pending'`):
+1. Query prod for all matching rows (with schema rewriting for prod compatibility)
+2. Hydrate all matching rows into shadow
+3. Rewrite UPDATE WHERE clause with concrete PK values
+4. Execute on shadow
+5. Track all affected PKs in Delta Map
+
+**Cross-table Updates** (UPDATE ... FROM):
+- Extract subquery predicates from FROM clause
+- Hydrate referenced tables before applying the update
+
+### DELETE
+
+**Point Delete** (PK extractable):
+1. Enforce FK RESTRICT/NO ACTION constraints (reject if child rows exist)
+2. Execute DELETE on shadow
+3. Add tombstone for each affected PK
+4. Enforce FK CASCADE (recursively tombstone/delete child rows)
+5. Return correct row count (including prod-only rows)
+
+**Bulk Delete** (PK not extractable):
+1. Pre-query prod for matching PKs
+2. Compute total count: shadow actual deletes + prod-only matches
+3. Tombstone all matching PKs
+4. Execute DELETE on shadow
+
+**DELETE ... RETURNING:** Hydrates from prod before deletion to synthesize return data.
+
+### TRUNCATE
+
+1. Execute on shadow
+2. Mark table as fully shadowed in Schema Registry — all subsequent reads skip prod entirely
+3. Clear all tombstones for the table
+4. CASCADE: recursively mark FK-related tables as fully shadowed
+
+---
+
+## DDL Handling
+
+DDL operations execute on shadow only. Production schema is never modified.
+
+1. Strip FK constraints from DDL before shadow execution (the proxy enforces FKs instead)
+2. Extract and store FK metadata in Schema Registry
+3. Execute modified DDL on shadow
+4. Update Schema Registry with the structural change
+
+| DDL | Registry Update | Impact on Reads |
+|-----|----------------|-----------------|
+| `ADD COLUMN` | Records column name, type, default | Prod rows get NULL/default injected |
+| `DROP COLUMN` | Records dropped column name | Column stripped from prod results |
+| `RENAME COLUMN` | Records `old → new` mapping | Prod queries use old name, results renamed |
+| `ALTER TYPE` | Records `old_type → new_type` | Values cast in prod results |
+| `CREATE TABLE` | Marks table as shadow-only | Table is shadow-only, no prod reads |
+| `DROP TABLE` | Marks table as dropped | Queries return "table not found" |
+| `CREATE INDEX` | Shadow only, silent | No impact on reads |
+
+---
+
+## Transaction Management
+
+### Lifecycle
+
+| Operation | Behavior |
+|-----------|----------|
+| `BEGIN` | Open read-only transaction on prod (REPEATABLE READ) + read-write transaction on shadow. Snapshot delta/tombstone/schema state. |
+| `COMMIT` | Commit shadow, close prod, promote staged deltas/tombstones to persistent state. |
+| `ROLLBACK` | Rollback shadow, close prod, discard staged deltas/tombstones. Restore schema registry from snapshot. |
+
+Prod uses REPEATABLE READ isolation to ensure consistent reads across the transaction — the merged read always sees a stable prod snapshot.
+
+### Staged Deltas
+
+Within a transaction, all delta/tombstone additions are **staged** — held in a per-transaction buffer. This prevents phantom deltas from failed transactions: if a transaction rolls back, the Delta Map and Tombstone Set remain unchanged.
+
+Autocommit mode (implicit single-statement transactions) applies deltas immediately — no staging needed.
+
+### Savepoints
+
+Savepoints are fully supported with stack-based snapshot management:
+
+- **SAVEPOINT name**: Capture current delta/tombstone/schema/insert-count state, push onto stack
+- **RELEASE SAVEPOINT name**: Pop snapshot from stack (changes persist)
+- **ROLLBACK TO SAVEPOINT name**: Restore state from snapshot, keep savepoint on stack for re-use
+
+---
+
+## Foreign Key Enforcement
+
+### Why FKs are Stripped
+
+Shadow starts empty. INSERTs referencing prod rows via foreign key would fail because the referenced row doesn't exist in shadow. The proxy enforces referential integrity instead.
+
+### Parent Row Validation (INSERT/UPDATE)
+
+Validation order (fast-path first):
+1. **Delta map check**: If parent PK in delta → exists in shadow
+2. **Tombstone check**: If parent PK tombstoned → REJECT
+3. **Shadow query**: Check shadow for parent row
+4. **Prod query**: Fall back to prod if not found in shadow
+
+Supports multi-column (composite) foreign keys.
+
+### Referential Action Enforcement (DELETE)
+
+- **RESTRICT / NO ACTION**: Reject parent delete if child rows exist (checks shadow + prod)
+- **CASCADE**: Tombstone child rows when parent deleted, recursively cascade
+- **SET NULL / SET DEFAULT**: Falls through to shadow enforcement
+
+---
+
+## Known Limitations
+
+| Limitation | Impact | Mitigation |
+|-----------|--------|-----------|
+| Multi-column ORDER BY | Only single-column sort re-applied after merge | Multi-column ORDER BY returns in backend order |
+| Mutating CTEs only see shadow data | CTE reads from clean tables return empty | v1.1: split into write + read |
+| Stored procedures with side effects | `SELECT my_function()` routes as READ to prod | v2: function introspection or config allowlist |
+| Tables without PKs | Read-only, writes produce warning | Rare in practice |
+| Bulk ops on large tables | Hydrating thousands of rows is slow | Acceptable for dev tool |
+| JOIN PK patching | Requires PK in SELECT list | Patching skipped when PK not selected |
+| Parameterized LIMIT | `LIMIT $1` not rewritten for over-fetching | Uncommon in practice |

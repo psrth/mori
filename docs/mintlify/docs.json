@@ -41,60 +41,44 @@
             "group": "Core Concepts",
             "pages": [
               "concepts/architecture",
-              "concepts/read-path",
-              "concepts/write-path",
-              "concepts/transactions",
-              "concepts/schema-registry"
+              "concepts/components",
+              "concepts/strategies",
+              "concepts/safety"
             ]
           },
           {
-            "group": "Engines",
+            "group": "Configuration",
             "pages": [
-              "engines/overview",
-              "engines/postgres",
-              "engines/cockroachdb",
-              "engines/mysql",
-              "engines/mariadb",
-              "engines/mssql",
-              "engines/sqlite",
-              "engines/duckdb",
-              "engines/redis",
-              "engines/firestore"
+              "configuration/engines",
+              "configuration/providers"
             ]
           },
           {
-            "group": "Providers",
+            "group": "Usage",
             "pages": [
-              "providers/direct",
-              "providers/gcp-cloud-sql",
-              "providers/aws-rds",
-              "providers/neon",
-              "providers/supabase",
-              "providers/azure",
-              "providers/planetscale",
-              "providers/vercel-postgres",
-              "providers/digitalocean",
-              "providers/railway",
-              "providers/upstash",
-              "providers/cloudflare",
-              "providers/firebase"
+              "usage/cli",
+              "usage/ports",
+              "usage/mcp",
+              "usage/tui"
             ]
           },
           {
-            "group": "CLI",
-            "pages": ["cli/reference", "cli/configuration"]
+            "group": "Resources",
+            "pages": [
+              "resources/motivation",
+              "resources/name",
+              "resources/roadmap",
+              "resources/test-suite"
+            ]
           },
           {
-            "group": "Integrations",
-            "pages": ["integrations/mcp-server"]
-          },
-          {
-            "group": "Advanced",
-            "pages": ["advanced/write-guard", "advanced/adding-engines"]
-          },
-          {
-            "group": "About",
-            "pages": ["design-decisions", "roadmap"]
+            "group": "Support",
+            "pages": [
+              "support/issues",
+              "support/contributing",
+              "support/sponsor",
+              "support/contact"
+            ]
           }
         ]
       }
@@ -104,12 +88,12 @@
     "primary": {
       "type": "button",
       "label": "GitHub",
-      "href": "https://github.com/mori-dev/mori"
+      "href": "https://github.com/psrth/mori"
     }
   },
   "footer": {
     "socials": {
-      "github": "https://github.com/mori-dev/mori"
+      "github": "https://github.com/psrth/mori"
     }
   }
 }

@@ -1,7 +1,7 @@
 ---
-title: "CLI Reference"
-description: "Complete reference for all Mori CLI commands."
-sidebarTitle: "Reference"
+title: "CLI"
+description: "Complete reference for all Mori CLI commands and configuration."
+sidebarTitle: "CLI"
 ---
 
 ## Setup
@@ -46,7 +46,16 @@ mori start                    # Start with default connection
 mori start my-connection      # Start a specific connection
 mori start --port 5433        # Start on a custom port
 mori start --verbose          # Log all queries and routing decisions
+mori start --mcp              # Enable MCP server for AI agents
+mori start --mcp-port 9000    # Set MCP server port
 ```
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--port` | Proxy listen port | Auto-assign |
+| `--verbose` | Log all queries and routing decisions | `false` |
+| `--mcp` | Enable MCP server | `false` |
+| `--mcp-port` | MCP HTTP server port | `9000` |
 
 ### `mori stop`
 
@@ -100,7 +109,7 @@ mori log --tail 50    # Show last 50 entries
 
 ### `mori dash`
 
-Launch the TUI dashboard — real-time query stream, delta/tombstone stats, table breakdown, live charts.
+Launch the [TUI dashboard](/docs/usage/tui) — real-time query stream, delta/tombstone stats, table breakdown, live charts.
 
 ```bash
 mori dash
@@ -131,3 +140,24 @@ View or edit configuration.
 ```bash
 mori config
 ```
+
+## Configuration Files
+
+Mori stores all state in a `.mori/` directory at your project root, created by `mori init`. See [Components](/docs/concepts/components#state-persistence) for details on each state file.
+
+```
+.mori/
+  mori.yaml             # Connection config (engine, addresses, ports)
+  shadow/               # Shadow container metadata
+  state/
+    delta.json           # Delta Map (locally modified rows)
+    tombstones.json      # Tombstone Set (locally deleted rows)
+    schema_registry.json # Schema divergence tracking
+    tables.json          # Table metadata (PKs, types)
+    sequences.json       # Sequence offsets
+  log/                   # Query and routing logs
+```
+
+<Tip>
+You may want to check `mori.yaml` into version control (with secrets excluded) so teammates can share the same connection setup.
+</Tip>

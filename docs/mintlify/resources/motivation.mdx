@@ -1,0 +1,44 @@
+---
+title: "Motivation"
+description: "Why database virtualization exists and the design trade-offs behind Mori."
+sidebarTitle: "Motivation"
+---
+
+## The Problem
+
+Developing against real data is hard. The common approaches all have significant drawbacks:
+
+- **Seed data** — Stale, incomplete, doesn't reflect production edge cases. Maintaining seeds is a constant tax.
+- **Staging databases** — Expensive, drift from production, shared across the team (your changes break someone else's test).
+- **Database snapshots** — Large, slow to restore, consume storage. Not practical for quick iteration.
+- **Mocking** — Doesn't catch real query bugs, schema mismatches, or performance issues.
+
+For AI agents, the problem is worse. Agents need to explore database schemas, run diagnostic queries, and test mutations — all against real data. Giving an agent write access to production is dangerous. Giving it a stale seed database produces poor results.
+
+## The Solution
+
+Mori gives every developer and AI agent a **virtual copy** of the production database. Reads return real production data. Writes are captured locally. Reset is instant.
+
+No data copying. No snapshot management. No staging infrastructure. Just swap a connection string.
+
+## Design Trade-offs
+
+### FK Constraints Stripped from Shadow
+
+Shadow starts empty. INSERTs referencing prod rows via foreign key would fail because the referenced row doesn't exist in shadow. Hydrating referenced rows transitively is a rabbit hole. The app's code already ensures referential integrity — Mori trusts it and enforces FKs at the proxy layer instead.
+
+### Production Data Drift Accepted
+
+Prod reads are live, not pinned to a snapshot. Pinning holds resources on prod that interfere with vacuuming and replication. For a dev tool with short sessions, live reads are pragmatic. Shadow overrides are consistent; prod reads are best-effort recent.
+
+### 1:1:1 Connection Model
+
+Each app connection to Mori gets one dedicated prod connection and one dedicated shadow connection. Simple, no multiplexing complexity. Per-connection transaction isolation comes for free.
+
+### Sequence Offset
+
+`max(prod_max × 10, prod_max + 10,000,000)` per table. Large enough that prod's ongoing inserts don't catch up during a session. Configurable for high-volume tables.
+
+### Two-Phase Classification for Parameterized Queries
+
+Classify at template parse time (tables, operation type); resolve PK values at parameter bind time. Necessary because wire protocols separate SQL templates from parameter values.

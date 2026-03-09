@@ -1,0 +1,71 @@
+---
+title: "Test Suite"
+description: "End-to-end test infrastructure and coverage across all engines."
+sidebarTitle: "Test Suite"
+---
+
+## Overview
+
+Mori has 202+ end-to-end tests that exercise the full proxy pipeline — from query classification through routing, execution, merging, and state management. Tests run against real database containers (Docker) with the compiled `mori` binary.
+
+## Test Categories
+
+Each engine's test suite covers these categories:
+
+| Category | What It Tests |
+|----------|--------------|
+| **Lifecycle** | `mori init`, `mori start`, `mori stop`, `mori reset` — proxy startup, schema sync, clean shutdown |
+| **Basic CRUD** | INSERT, UPDATE, DELETE, SELECT — core read/write paths, delta tracking, tombstone filtering |
+| **Complex Queries** | JOINs, aggregates, window functions, CTEs, set operations (UNION/INTERSECT/EXCEPT), subqueries |
+| **Migrations** | DDL: CREATE TABLE, ALTER TABLE (add/drop/rename column), DROP TABLE, CREATE INDEX — schema registry tracking |
+| **Edge Cases** | Composite PKs, generated columns, TRUNCATE, INSERT ON CONFLICT, bulk operations, PK-less tables |
+| **MCP** | MCP server `db_query` tool execution through the proxy |
+
+## Per-Engine Coverage
+
+| Engine | Lifecycle | CRUD | Complex | Migrations | Edge Cases | MCP |
+|--------|-----------|------|---------|------------|------------|-----|
+| PostgreSQL | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| CockroachDB | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| MySQL | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| MariaDB | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| MS SQL Server | ✓ | ✓ | partial | ✓ | partial | ✓ |
+| SQLite | ✓ | ✓ | ✓ | ✓ | partial | ✓ |
+| DuckDB | ✓ | ✓ | partial | ✓ | partial | ✓ |
+| Redis | ✓ | ✓ | N/A | N/A | ✓ | ✓ |
+| Firestore | ✓ | ✓ | N/A | N/A | ✓ | ✓ |
+
+"partial" indicates some tests are skipped due to [known limitations](/docs/configuration/engines).
+
+## Running Tests
+
+### Prerequisites
+
+- Compiled `mori` binary (`go build -o mori ./cmd/mori`)
+- Docker (for database containers)
+
+### Run All Tests
+
+```bash
+go test -tags e2e -v ./e2e/...
+```
+
+### Run Tests for a Specific Engine
+
+```bash
+go test -tags e2e -v -run TestPostgres ./e2e/...
+go test -tags e2e -v -run TestMySQL ./e2e/...
+go test -tags e2e -v -run TestRedis ./e2e/...
+```
+
+### Test Infrastructure
+
+Tests use `TestMain` to:
+1. Build the `mori` binary
+2. Start a production database container (e.g., PostgreSQL on port 15432)
+3. Seed the database with test data (`seed.sql`)
+4. Run `mori init` + `mori start` against the test database
+5. Execute test cases against the proxy
+6. Tear down containers on completion
+
+Each test suite creates an isolated project directory and database, so tests don't interfere with each other.
