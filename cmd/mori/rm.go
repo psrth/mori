@@ -1,7 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/ui"
@@ -42,16 +48,10 @@ func runRm(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("connection %q not found in mori.yaml", name)
 	}
 
-	// Check if this connection is active and proxy is running.
-	if config.IsInitialized(projectRoot) {
-		if runtimeCfg, err := config.ReadConfig(projectRoot); err == nil {
-			if runtimeCfg.ActiveConnection == name {
-				pidPath := config.PidFilePath(projectRoot)
-				if _, running := isProxyRunning(pidPath); running {
-					return fmt.Errorf("connection %q is currently running — run 'mori stop' first", name)
-				}
-			}
-		}
+	// Check if this connection's proxy is running.
+	pidPath := config.ConnPidFilePath(projectRoot, name)
+	if _, running := isProxyRunning(pidPath); running {
+		return fmt.Errorf("connection %q is currently running — run 'mori stop %s' first", name, name)
 	}
 
 	// Confirm unless --force.
@@ -65,11 +65,30 @@ func runRm(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Remove Shadow container and state directory if initialized.
+	if config.IsConnInitialized(projectRoot, name) {
+		if cfg, cfgErr := config.ReadConnConfig(projectRoot, name); cfgErr == nil && cfg.ShadowContainer != "" {
+			_ = ui.Spinner("Removing Shadow container...", func() error {
+				rmCtx, rmCancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer rmCancel()
+				rmCmd := exec.CommandContext(rmCtx, "docker", "rm", "-f", "-v", cfg.ShadowContainer)
+				if out, err := rmCmd.CombinedOutput(); err != nil {
+					log.Printf("Warning: could not remove Shadow container: %s", strings.TrimSpace(string(out)))
+				}
+				return nil
+			})
+		}
+		connDir := config.ConnDir(projectRoot, name)
+		if err := os.RemoveAll(connDir); err != nil {
+			log.Printf("Warning: could not remove state directory %s: %v", connDir, err)
+		}
+	}
+
 	projCfg.RemoveConnection(name)
 	if err := config.WriteProjectConfig(projectRoot, projCfg); err != nil {
 		return fmt.Errorf("failed to write mori.yaml: %w", err)
 	}
 
-	ui.StepDone(fmt.Sprintf("Connection %s removed from mori.yaml.", ui.Cyan(name)))
+	ui.StepDone(fmt.Sprintf("Connection %s removed.", ui.Cyan(name)))
 	return nil
 }

@@ -69,7 +69,10 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 	defer mgr.Close()
 
-	if err := ui.Spinner(fmt.Sprintf("Pulling Docker image %s...", imageName), func() error {
+	if err := ui.Spinner(fmt.Sprintf("Checking Docker image %s...", imageName), func() error {
+		if mgr.ImageExists(ctx, imageName) {
+			return nil
+		}
 		return mgr.Pull(ctx, imageName)
 	}); err != nil {
 		return nil, err

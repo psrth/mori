@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -153,6 +156,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 		cfg, err = config.ReadConnConfig(projectRoot, connName)
 		if err != nil {
 			return fmt.Errorf("failed to read runtime config: %w", err)
+		}
+
+		// Ensure the Shadow container is running (it may have been stopped
+		// by a previous 'mori stop' or a Docker restart).
+		if cfg.ShadowContainer != "" {
+			if err := ensureShadowRunning(cmd.Context(), cfg.ShadowContainer, cfg.ShadowPort); err != nil {
+				return err
+			}
 		}
 	} else {
 		authProvider := auth.Lookup(registry.ProviderID(conn.Provider))
@@ -398,7 +409,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 		log.Printf("Shutdown timeout: %v", err)
 	}
 
-	// 25. Stop tunnel if active.
+	// 25. Stop Shadow container (fresh context — shutdownCtx may be exhausted).
+	if cfg.ShadowContainer != "" {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer stopCancel()
+		stopShadowContainer(stopCtx, cfg.ShadowContainer)
+	}
+
+	// 26. Stop tunnel if active.
 	if tunnelMgr != nil {
 		if err := tunnelMgr.Stop(); err != nil {
 			log.Printf("Warning: failed to stop tunnel: %v", err)
@@ -406,7 +424,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		os.Remove(config.ConnTunnelPidFilePath(projectRoot, connName))
 	}
 
-	// 26. Remove PID file.
+	// 27. Remove PID file.
 	os.Remove(pidPath)
 	ui.StepDone(fmt.Sprintf("Proxy stopped %s.", ui.Cyan(connName)))
 
@@ -452,4 +470,65 @@ func resolveConnectionName(projCfg *config.ProjectConfig, args []string) (string
 	}
 
 	return selected, nil
+}
+
+// ensureShadowRunning checks that the Shadow Docker container is running and
+// restarts it if it was stopped. Returns an error if the container no longer exists.
+func ensureShadowRunning(ctx context.Context, containerName string, shadowPort int) error {
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(checkCtx, "docker", "inspect", containerName,
+		"--format", "{{.State.Running}}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "No such") {
+			return fmt.Errorf("shadow container %q no longer exists — run 'mori reset --hard' to re-create it", containerName)
+		}
+		return fmt.Errorf("cannot check Shadow container (is Docker running?): %s", strings.TrimSpace(string(out)))
+	}
+
+	if strings.TrimSpace(string(out)) == "true" {
+		return nil // Already running.
+	}
+
+	// Container exists but is stopped — restart it.
+	return ui.Spinner("Restarting Shadow container...", func() error {
+		startCmd := exec.CommandContext(ctx, "docker", "start", containerName)
+		if startOut, err := startCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to restart Shadow container: %s", strings.TrimSpace(string(startOut)))
+		}
+
+		// Wait for the database to accept connections.
+		deadline := time.After(30 * time.Second)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		addr := fmt.Sprintf("127.0.0.1:%d", shadowPort)
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-deadline:
+				return fmt.Errorf("shadow container restarted but database not ready after 30s")
+			case <-ticker.C:
+				conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+				if err == nil {
+					conn.Close()
+					return nil
+				}
+			}
+		}
+	})
+}
+
+// stopShadowContainer stops a Shadow Docker container gracefully.
+// Logs a warning on failure but does not return an error.
+func stopShadowContainer(ctx context.Context, containerName string) {
+	_ = ui.Spinner("Stopping Shadow container...", func() error {
+		cmd := exec.CommandContext(ctx, "docker", "stop", "-t", "10", containerName)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			log.Printf("Warning: could not stop Shadow container: %s", strings.TrimSpace(string(out)))
+		}
+		return nil
+	})
 }

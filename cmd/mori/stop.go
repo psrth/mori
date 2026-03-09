@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -99,6 +103,25 @@ func runStop(cmd *cobra.Command, args []string) error {
 	}
 
 	ui.StepDone(fmt.Sprintf("Stopped proxy %s.", ui.Cyan(connName)))
+
+	// 6. Stop Shadow container unless --keep-shadow.
+	keepShadow, _ := cmd.Flags().GetBool("keep-shadow")
+	if !keepShadow {
+		if cfg, cfgErr := config.ReadConnConfig(projectRoot, connName); cfgErr == nil && cfg.ShadowContainer != "" {
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer stopCancel()
+			_ = ui.Spinner("Stopping Shadow container...", func() error {
+				stopCmd := exec.CommandContext(stopCtx, "docker", "stop", "-t", "10", cfg.ShadowContainer)
+				if out, err := stopCmd.CombinedOutput(); err != nil {
+					log.Printf("Warning: could not stop Shadow container: %s", strings.TrimSpace(string(out)))
+				}
+				return nil
+			})
+		}
+	} else {
+		ui.Info("Shadow container left running (--keep-shadow).")
+	}
+
 	stopConnTunnelIfRunning(projectRoot, connName)
 	return nil
 }

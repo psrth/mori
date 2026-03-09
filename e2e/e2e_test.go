@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -211,9 +212,17 @@ func startMoriProxy(ctx context.Context) error {
 
 // stopMoriProxy gracefully stops the mori proxy.
 func stopMoriProxy() {
-	if moriProcess != nil && moriProcess.Process != nil {
+	if moriProcess == nil || moriProcess.Process == nil {
+		return
+	}
+	moriProcess.Process.Signal(syscall.SIGTERM)
+	done := make(chan error, 1)
+	go func() { done <- moriProcess.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
 		moriProcess.Process.Kill()
-		moriProcess.Wait()
+		<-done
 	}
 }
 
