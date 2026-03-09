@@ -3,6 +3,7 @@ package proxy
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/engine/firestore/classify"
@@ -28,12 +29,7 @@ func validateRouteDecision(cl *core.Classification, strategy core.RoutingStrateg
 	log.Printf("%s", msg)
 
 	if logger != nil {
-		logger.Log(logging.LogEntry{
-			Level:  "critical",
-			ConnID: connID,
-			Event:  "write_guard_l1",
-			Detail: msg,
-		})
+		logBlockedOperation(logger, connID, cl.RawSQL, "L1", msg)
 	}
 
 	return fmt.Errorf("write guard: %s/%s must not route to prod", cl.OpType, cl.SubType)
@@ -42,7 +38,7 @@ func validateRouteDecision(cl *core.Classification, strategy core.RoutingStrateg
 // guardProdMethod checks whether a gRPC method being sent to prod is a write
 // method. If so, it blocks the call and logs a critical message.
 // This is L2 of the write guard.
-func guardProdMethod(method string, connID int64, verbose bool, logger *logging.Logger) error {
+func guardProdMethod(method string, connID int64, _ bool, logger *logging.Logger) error {
 	if !classify.IsWriteMethod(method) {
 		return nil
 	}
@@ -52,13 +48,22 @@ func guardProdMethod(method string, connID int64, verbose bool, logger *logging.
 	log.Printf("%s", msg)
 
 	if logger != nil {
-		logger.Log(logging.LogEntry{
-			Level:  "critical",
-			ConnID: connID,
-			Event:  "write_guard_l2",
-			Detail: msg,
-		})
+		logBlockedOperation(logger, connID, method, "L2", msg)
 	}
 
 	return fmt.Errorf("write guard: write method %q blocked from reaching production", method)
+}
+
+// logBlockedOperation logs a structured audit entry when a write operation is blocked.
+func logBlockedOperation(logger *logging.Logger, connID int64, method, guardLayer, detail string) {
+	if logger == nil {
+		return
+	}
+	logger.Log(logging.LogEntry{
+		Level:  "critical",
+		ConnID: connID,
+		Event:  fmt.Sprintf("write_guard_%s_blocked", guardLayer),
+		Detail: fmt.Sprintf("timestamp=%s method=%s guard=%s detail=%s",
+			time.Now().UTC().Format(time.RFC3339), method, guardLayer, detail),
+	})
 }

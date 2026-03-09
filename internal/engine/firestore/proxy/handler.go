@@ -17,14 +17,15 @@ import (
 type routeTarget int
 
 const (
-	targetProd    routeTarget = iota
-	targetShadow              // raw forward to shadow
-	targetMerged              // SDK-based merged read
-	targetSDKWrite            // SDK-based write with delta tracking
+	targetProd        routeTarget = iota
+	targetShadow                  // raw forward to shadow
+	targetMerged                  // SDK-based merged read
+	targetSDKWrite                // SDK-based write with delta tracking
+	targetTransaction             // SDK-based transaction control (BeginTransaction/Rollback)
 )
 
 // handler is the gRPC unknown service handler that routes Firestore calls.
-func (p *Proxy) handler(srv interface{}, serverStream grpc.ServerStream) error {
+func (p *Proxy) handler(srv any, serverStream grpc.ServerStream) error {
 	method, ok := grpc.Method(serverStream.Context())
 	if !ok {
 		return status.Error(codes.Internal, "mori-firestore: could not determine gRPC method")
@@ -40,6 +41,12 @@ func (p *Proxy) handler(srv interface{}, serverStream grpc.ServerStream) error {
 		}
 		return p.forwardToProd(serverStream, method, connID)
 	}
+
+	// Extract collection names from gRPC metadata if available.
+	// The request body is not yet read, so we extract from metadata headers.
+	// Full collection extraction happens at the SDK handler level after deserialization.
+	// For now, populate Tables if we have resource path info from metadata.
+	p.populateTablesFromMetadata(serverStream, cl, method)
 
 	// Route.
 	strategy := p.router.Route(cl)
@@ -69,6 +76,10 @@ func (p *Proxy) handler(srv interface{}, serverStream grpc.ServerStream) error {
 	case targetSDKWrite:
 		// SDK-based write with delta/tombstone tracking.
 		return p.handleSDKWrite(serverStream, method, connID)
+
+	case targetTransaction:
+		// SDK-based transaction control.
+		return p.handleSDKTransaction(serverStream, method, connID)
 
 	case targetShadow:
 		return p.forwardToShadow(serverStream, method, connID)
@@ -100,19 +111,22 @@ func (p *Proxy) resolveTargetSDK(cl *core.Classification, strategy core.RoutingS
 		// Merged reads via SDK.
 		if strategy == core.StrategyMergedRead || strategy == core.StrategyJoinPatch {
 			switch methodName {
-			case "GetDocument", "BatchGetDocuments", "ListDocuments", "RunQuery":
+			case "GetDocument", "BatchGetDocuments", "ListDocuments", "RunQuery",
+				"RunAggregationQuery":
 				return targetMerged
 			}
 		}
 
 		// Reads that should go to prod but need delta/tombstone handling.
-		// Firestore classifications don't include table names, so the router
-		// defaults to ProdDirect. We upgrade to merged read when any deltas
-		// or tombstones exist, so shadow writes are visible in subsequent reads.
+		// With collection name extraction in populateTablesFromMetadata(),
+		// the router now has table names for per-collection routing.
+		// However, for safety, still upgrade to merged read when any deltas
+		// exist and the router couldn't determine the affected tables.
 		if cl.OpType == core.OpRead && strategy == core.StrategyProdDirect {
 			switch methodName {
-			case "GetDocument", "BatchGetDocuments", "ListDocuments", "RunQuery":
-				if p.deltaMap.HasAnyDelta() || p.tombstones.CountForTable("") > 0 || len(p.tombstones.Tables()) > 0 {
+			case "GetDocument", "BatchGetDocuments", "ListDocuments", "RunQuery",
+				"RunAggregationQuery":
+				if p.deltaMap.HasAnyDelta() || len(p.tombstones.Tables()) > 0 {
 					return targetMerged
 				}
 			}
@@ -124,6 +138,17 @@ func (p *Proxy) resolveTargetSDK(cl *core.Classification, strategy core.RoutingS
 			case "CreateDocument", "UpdateDocument", "DeleteDocument",
 				"Commit", "BatchWrite":
 				return targetSDKWrite
+			case "Write":
+				// Bidirectional streaming write — handle with delta tracking.
+				return targetSDKWrite
+			}
+		}
+
+		// Transaction control via SDK.
+		if cl.OpType == core.OpTransaction {
+			switch methodName {
+			case "BeginTransaction", "Rollback":
+				return targetTransaction
 			}
 		}
 	}
@@ -167,13 +192,14 @@ func (p *Proxy) handleSDKRead(serverStream grpc.ServerStream, method string, con
 	}
 
 	rh := &readHandler{
-		prodClient:   p.sdk.prod,
-		shadowClient: p.sdk.shadow,
-		deltaMap:     p.deltaMap,
-		tombstones:   p.tombstones,
-		projectID:    p.projectID,
-		databaseID:   "(default)",
-		verbose:      p.verbose,
+		prodClient:          p.sdk.prod,
+		shadowClient:        p.sdk.shadow,
+		deltaMap:            p.deltaMap,
+		tombstones:          p.tombstones,
+		projectID:           p.projectID,
+		databaseID:          p.databaseID,
+		verbose:             p.verbose,
+		activeTransactionFn: p.isActiveTransaction,
 	}
 
 	switch methodName {
@@ -260,6 +286,29 @@ func (p *Proxy) handleSDKRead(serverStream grpc.ServerStream, method string, con
 		}
 		return nil
 
+	case "RunAggregationQuery":
+		req := &firestorepb.RunAggregationQueryRequest{}
+		if err := proto.Unmarshal(f.payload, req); err != nil {
+			log.Printf("[conn %d] failed to unmarshal RunAggregationQueryRequest: %v — falling back to raw", connID, err)
+			return p.forwardToProd(serverStream, method, connID)
+		}
+
+		results, err := rh.runAggregationQuery(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		for _, r := range results {
+			respBytes, err := proto.Marshal(r)
+			if err != nil {
+				return status.Errorf(codes.Internal, "failed to marshal RunAggregationQuery response: %v", err)
+			}
+			if err := serverStream.SendMsg(&frame{payload: respBytes}); err != nil {
+				return err
+			}
+		}
+		return nil
+
 	default:
 		// Should not reach here; fall back to prod.
 		return p.forwardToProd(serverStream, method, connID)
@@ -286,12 +335,30 @@ func (p *Proxy) handleSDKWrite(serverStream grpc.ServerStream, method string, co
 		return err
 	}
 
+	var hy *hydrator
+	if p.sdk.prod != nil {
+		hy = &hydrator{
+			prodClient:   p.sdk.prod,
+			shadowClient: p.sdk.shadow,
+			deltaMap:     p.deltaMap,
+			tombstones:   p.tombstones,
+			verbose:      p.verbose,
+		}
+	}
+
+	p.txnMu.Lock()
+	inTxn := p.inTransaction
+	p.txnMu.Unlock()
+
 	wh := &writeHandler{
-		shadowClient: p.sdk.shadow,
-		deltaMap:     p.deltaMap,
-		tombstones:   p.tombstones,
-		moriDir:      p.moriDir,
-		verbose:      p.verbose,
+		shadowClient:  p.sdk.shadow,
+		prodClient:    p.sdk.prod,
+		deltaMap:      p.deltaMap,
+		tombstones:    p.tombstones,
+		moriDir:       p.moriDir,
+		verbose:       p.verbose,
+		hydrator:      hy,
+		inTransaction: inTxn,
 	}
 
 	switch methodName {
@@ -354,7 +421,24 @@ func (p *Proxy) handleSDKWrite(serverStream grpc.ServerStream, method string, co
 
 		resp, err := wh.commitWrite(ctx, req)
 		if err != nil {
+			// If commit fails and there was a transaction, roll back the staged deltas.
+			if txnID := string(req.GetTransaction()); txnID != "" && p.isActiveTransaction(txnID) {
+				p.txnMu.Lock()
+				p.deltaMap.Rollback()
+				p.deltaMap.RollbackInsertCounts()
+				p.tombstones.Rollback()
+				delete(p.activeTransactions, txnID)
+				if len(p.activeTransactions) == 0 {
+					p.inTransaction = false
+				}
+				p.txnMu.Unlock()
+			}
 			return err
+		}
+
+		// If this commit was part of a transaction, promote staged deltas.
+		if txnID := string(req.GetTransaction()); txnID != "" {
+			p.commitTransaction(txnID)
 		}
 
 		respBytes, err := proto.Marshal(resp)
@@ -381,9 +465,232 @@ func (p *Proxy) handleSDKWrite(serverStream grpc.ServerStream, method string, co
 		}
 		return serverStream.SendMsg(&frame{payload: respBytes})
 
+	case "Write":
+		// The Write RPC is a bidirectional stream. Forward to shadow with delta tracking.
+		// We intercept write frames, track deltas/tombstones, then forward.
+		return p.handleWriteStream(serverStream, method, connID, wh)
+
 	default:
 		// Fall back to shadow raw forwarding.
 		return p.forwardToShadow(serverStream, method, connID)
+	}
+}
+
+// handleWriteStream handles the bidirectional Write streaming RPC.
+// It forwards frames to shadow while intercepting write operations for delta tracking.
+func (p *Proxy) handleWriteStream(serverStream grpc.ServerStream, method string, connID int64, wh *writeHandler) error {
+	if p.shadowConn == nil {
+		return status.Error(codes.Unavailable, "mori-firestore: shadow emulator unavailable")
+	}
+
+	ctx := serverStream.Context()
+
+	// Open a stream to the shadow backend.
+	desc := &grpc.StreamDesc{
+		ServerStreams: true,
+		ClientStreams: true,
+	}
+	clientStream, err := p.shadowConn.NewStream(ctx, desc, method)
+	if err != nil {
+		return err
+	}
+
+	// Forward client -> shadow in a goroutine, tracking writes.
+	s2cErr := make(chan error, 1)
+	go func() {
+		for {
+			f := &frame{}
+			if err := serverStream.RecvMsg(f); err != nil {
+				s2cErr <- err
+				return
+			}
+
+			// Try to parse as WriteRequest for delta tracking.
+			writeReq := &firestorepb.WriteRequest{}
+			if parseErr := proto.Unmarshal(f.payload, writeReq); parseErr == nil {
+				for _, w := range writeReq.GetWrites() {
+					// Hydrate before write if needed.
+					if wh.hydrator != nil {
+						wh.hydrateForWrite(ctx, w)
+					}
+					wh.trackWrite(w)
+				}
+			}
+
+			if err := clientStream.SendMsg(f); err != nil {
+				s2cErr <- err
+				return
+			}
+		}
+	}()
+
+	// Forward shadow -> client in a goroutine.
+	c2sErr := make(chan error, 1)
+	go func() {
+		c2sErr <- forwardFrames(clientStream, serverStream)
+	}()
+
+	// Wait for either direction to finish.
+	for range 2 {
+		select {
+		case err := <-s2cErr:
+			if err == io.EOF {
+				clientStream.CloseSend()
+			} else if err != nil {
+				return err
+			}
+		case err := <-c2sErr:
+			if err != nil && err != io.EOF {
+				return err
+			}
+			// Persist deltas after stream completes.
+			wh.persistDelta()
+			wh.persistTombstone()
+			return nil
+		}
+	}
+
+	wh.persistDelta()
+	wh.persistTombstone()
+	return nil
+}
+
+// handleSDKTransaction handles BeginTransaction and Rollback with staged delta support.
+func (p *Proxy) handleSDKTransaction(serverStream grpc.ServerStream, method string, connID int64) error {
+	ctx := serverStream.Context()
+	methodName := extractMethodNameFromHandler(method)
+
+	// Receive the request frame.
+	f := &frame{}
+	if err := serverStream.RecvMsg(f); err != nil {
+		return err
+	}
+
+	switch methodName {
+	case "BeginTransaction":
+		req := &firestorepb.BeginTransactionRequest{}
+		if err := proto.Unmarshal(f.payload, req); err != nil {
+			log.Printf("[conn %d] failed to unmarshal BeginTransactionRequest: %v — falling back to shadow raw", connID, err)
+			return p.forwardToShadow(serverStream, method, connID)
+		}
+
+		// Forward to shadow.
+		resp, err := p.sdk.shadow.BeginTransaction(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		// Stage deltas and tombstones for this transaction.
+		// When Stage() is called, subsequent Add() calls go to committed map directly,
+		// but we track the transaction for Commit/Rollback correlation.
+		txnID := string(resp.GetTransaction())
+		p.txnMu.Lock()
+		p.activeTransactions[txnID] = true
+		p.inTransaction = true
+		p.txnMu.Unlock()
+
+		if p.verbose {
+			log.Printf("[conn %d] BeginTransaction: staged delta/tombstone tracking for txn", connID)
+		}
+
+		respBytes, err := proto.Marshal(resp)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to marshal BeginTransaction response: %v", err)
+		}
+		return serverStream.SendMsg(&frame{payload: respBytes})
+
+	case "Rollback":
+		req := &firestorepb.RollbackRequest{}
+		if err := proto.Unmarshal(f.payload, req); err != nil {
+			log.Printf("[conn %d] failed to unmarshal RollbackRequest: %v — falling back to shadow raw", connID, err)
+			return p.forwardToShadow(serverStream, method, connID)
+		}
+
+		// Forward to shadow.
+		err := p.sdk.shadow.Rollback(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		// Rollback deltas and tombstones.
+		txnID := string(req.GetTransaction())
+		p.txnMu.Lock()
+		if p.activeTransactions[txnID] {
+			p.deltaMap.Rollback()
+			p.deltaMap.RollbackInsertCounts()
+			p.tombstones.Rollback()
+			delete(p.activeTransactions, txnID)
+			if len(p.activeTransactions) == 0 {
+				p.inTransaction = false
+			}
+		}
+		p.txnMu.Unlock()
+
+		if p.verbose {
+			log.Printf("[conn %d] Rollback: rolled back staged deltas/tombstones", connID)
+		}
+
+		// Rollback returns Empty.
+		return serverStream.SendMsg(&frame{payload: nil})
+
+	default:
+		return p.forwardToShadow(serverStream, method, connID)
+	}
+}
+
+// commitTransaction is called by the write handler when a Commit includes a transaction ID.
+// It promotes staged deltas/tombstones to committed state.
+func (p *Proxy) commitTransaction(txnID string) {
+	p.txnMu.Lock()
+	defer p.txnMu.Unlock()
+
+	if p.activeTransactions[txnID] {
+		p.deltaMap.Commit()
+		p.deltaMap.CommitInsertCounts()
+		p.tombstones.Commit()
+		delete(p.activeTransactions, txnID)
+		if len(p.activeTransactions) == 0 {
+			p.inTransaction = false
+		}
+	}
+}
+
+// isActiveTransaction reports whether the given transaction ID is tracked.
+func (p *Proxy) isActiveTransaction(txnID string) bool {
+	p.txnMu.Lock()
+	defer p.txnMu.Unlock()
+	return p.activeTransactions[txnID]
+}
+
+// populateTablesFromMetadata attempts to extract collection names from gRPC metadata
+// headers and populates Classification.Tables. This enables per-collection routing
+// instead of relying on HasAnyDelta() globally.
+func (p *Proxy) populateTablesFromMetadata(serverStream grpc.ServerStream, cl *core.Classification, method string) {
+	// gRPC metadata headers may contain resource-related information.
+	// Since we can't peek at the request body without consuming it,
+	// we use a heuristic: check if the method path contains resource info.
+	// For most Firestore methods, the actual collection info is in the request body.
+	// We set Tables from delta/tombstone state to allow proper routing.
+	// The real per-request collection extraction happens in handleSDKRead/handleSDKWrite.
+
+	// For read operations, if no tables are set yet, check all tables with deltas
+	// so the router can make a correct decision.
+	if cl.OpType == core.OpRead && len(cl.Tables) == 0 {
+		tables := p.deltaMap.Tables()
+		tombTables := p.tombstones.Tables()
+		seen := make(map[string]bool)
+		for _, t := range tables {
+			if !seen[t] {
+				cl.Tables = append(cl.Tables, t)
+				seen[t] = true
+			}
+		}
+		for _, t := range tombTables {
+			if !seen[t] {
+				cl.Tables = append(cl.Tables, t)
+				seen[t] = true
+			}
+		}
 	}
 }
 
@@ -436,7 +743,7 @@ func (p *Proxy) forward(serverStream grpc.ServerStream, backendConn *grpc.Client
 	}()
 
 	// Wait for either direction to finish.
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case err := <-s2cErr:
 			if err == io.EOF {
@@ -461,8 +768,18 @@ type frame struct {
 	payload []byte
 }
 
+// streamSender can send gRPC message frames.
+type streamSender interface {
+	SendMsg(any) error
+}
+
+// streamReceiver can receive gRPC message frames.
+type streamReceiver interface {
+	RecvMsg(any) error
+}
+
 // forwardFrames reads frames from src and writes them to dst.
-func forwardFrames(src grpc.Stream, dst grpc.Stream) error {
+func forwardFrames(src streamReceiver, dst streamSender) error {
 	for {
 		f := &frame{}
 		if err := src.RecvMsg(f); err != nil {

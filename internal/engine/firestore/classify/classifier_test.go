@@ -22,7 +22,7 @@ func TestClassify(t *testing.T) {
 		{"RunQuery", "/google.firestore.v1.Firestore/RunQuery", core.OpRead, core.SubSelect, false},
 		{"RunAggregationQuery", "/google.firestore.v1.Firestore/RunAggregationQuery", core.OpRead, core.SubSelect, true},
 		{"BatchGetDocuments", "/google.firestore.v1.Firestore/BatchGetDocuments", core.OpRead, core.SubSelect, false},
-		{"Listen", "/google.firestore.v1.Firestore/Listen", core.OpRead, core.SubSelect, false},
+		{"Listen", "/google.firestore.v1.Firestore/Listen", core.OpOther, core.SubListen, false},
 		{"PartitionQuery", "/google.firestore.v1.Firestore/PartitionQuery", core.OpRead, core.SubSelect, false},
 		{"ListCollectionIds", "/google.firestore.v1.Firestore/ListCollectionIds", core.OpRead, core.SubSelect, false},
 
