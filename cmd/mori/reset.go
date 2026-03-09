@@ -236,7 +236,9 @@ func runReset(cmd *cobra.Command, args []string) error {
 		return nil
 	})
 
-	ui.StepDone("Reset complete — run 'mori start' to begin fresh.")
+	fmt.Println()
+	ui.StepDone("Reset complete.")
+	ui.Info("Next: run 'mori start' to begin fresh.")
 	return nil
 }
 

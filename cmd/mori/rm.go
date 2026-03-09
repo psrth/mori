@@ -56,6 +56,7 @@ func runRm(cmd *cobra.Command, args []string) error {
 
 	// Confirm unless --force.
 	if !force {
+		ui.StepWarn(fmt.Sprintf("Removing '%s' will delete its Shadow container and all local state.", name))
 		fmt.Printf("Remove connection %q from mori.yaml? [y/N] ", name)
 		var confirm string
 		fmt.Scanln(&confirm)

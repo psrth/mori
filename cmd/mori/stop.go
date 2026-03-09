@@ -73,7 +73,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	}
 
 	// 5. Send SIGTERM and wait.
-	stopMsg := fmt.Sprintf("Stopping proxy [%s] (PID %d)...", connName, pid)
+	stopMsg := fmt.Sprintf("Stopping proxy [%s]...", connName)
 	stopErr := ui.Spinner(stopMsg, func() error {
 		if err := process.Signal(syscall.SIGTERM); err != nil {
 			return fmt.Errorf("failed to send SIGTERM to PID %d: %w", pid, err)

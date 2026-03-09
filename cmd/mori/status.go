@@ -54,21 +54,21 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	connDir := config.ConnDir(projectRoot, connName)
 
-	// Connection info.
-	fmt.Printf("Connection: %s\n", ui.Cyan(connName))
-	fmt.Printf("Engine:     %s %s\n", cfg.Engine, cfg.EngineVersion)
-	fmt.Printf("Prod:       %s\n", cfg.RedactedProdConnection())
-	fmt.Printf("Shadow:     localhost:%d\n", cfg.ShadowPort)
-
-	// Proxy running state.
+	// Connection info box.
 	pidPath := config.ConnPidFilePath(projectRoot, connName)
-	if pid, running := isProxyRunning(pidPath); running {
-		fmt.Printf("Proxy:      localhost:%d · %s (PID %d)\n",
-			cfg.ProxyPort, ui.Green(ui.IconActive+" running"), pid)
+	var proxyStatus string
+	if _, running := isProxyRunning(pidPath); running {
+		proxyStatus = fmt.Sprintf("localhost:%d · %s", cfg.ProxyPort, ui.Green(ui.IconActive+" running"))
 	} else {
-		fmt.Printf("Proxy:      localhost:%d · %s\n",
-			cfg.ProxyPort, ui.Dim(ui.IconInactive+" stopped"))
+		proxyStatus = fmt.Sprintf("localhost:%d · %s", cfg.ProxyPort, ui.Dim(ui.IconInactive+" stopped"))
 	}
+
+	const labelW = 6
+	boxContent := ui.BoxLine("Engine", fmt.Sprintf("%s %s", cfg.Engine, cfg.EngineVersion), labelW) + "\n" +
+		ui.BoxLine("Prod", cfg.RedactedProdConnection(), labelW) + "\n" +
+		ui.BoxLine("Shadow", fmt.Sprintf("localhost:%d", cfg.ShadowPort), labelW) + "\n" +
+		ui.BoxLine("Proxy", proxyStatus, labelW)
+	fmt.Println(ui.Box(connName, boxContent))
 
 	// Delta Rows.
 	if dm, err := delta.ReadDeltaMap(connDir); err == nil {
@@ -102,7 +102,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	if ts, err := delta.ReadTombstoneSet(connDir); err == nil {
 		tables := ts.Tables()
 		if len(tables) > 0 {
-			fmt.Println("Tombstones:")
+			fmt.Println("\nTombstones:")
 			for _, t := range tables {
 				count := ts.CountForTable(t)
 				fmt.Printf("  %-20s %d %s\n", t, count, pluralize(count, "row", "rows"))
@@ -118,7 +118,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	if sr, err := coreSchema.ReadRegistry(connDir); err == nil {
 		tables := sr.Tables()
 		if len(tables) > 0 {
-			fmt.Println("Schema Diffs:")
+			fmt.Println("\nSchema Diffs:")
 			for _, t := range tables {
 				diff := sr.GetDiff(t)
 				fmt.Printf("  %-20s %s\n", t, formatSchemaDiff(diff))
@@ -132,7 +132,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 	// Sequence Offsets.
 	if seqs, err := schema.ReadSequences(connDir); err == nil && len(seqs) > 0 {
-		fmt.Println("Sequence Offsets:")
+		fmt.Println("\nSequence Offsets:")
 		for tableName, offset := range seqs {
 			label := tableName + "." + offset.Column
 			fmt.Printf("  %-20s start=%s (prod max: %s)\n",

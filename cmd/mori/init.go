@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/engine"
 	"github.com/mori-dev/mori/internal/registry"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 
 	// Register engine implementations via side-effect imports.
@@ -110,13 +112,19 @@ func runNonInteractiveInit(projectRoot string, existing *config.ProjectConfig, c
 	}
 
 	fmt.Println()
-	fmt.Printf("  Connection %q saved to mori.yaml\n", name)
-	fmt.Printf("    Engine:   PostgreSQL\n")
-	fmt.Printf("    Provider: Direct / Self-Hosted\n")
-	fmt.Printf("    Host:     %s:%d\n", connInfo.Host, connInfo.Port)
-	fmt.Printf("    Database: %s\n", connInfo.DBName)
+	ui.StepDone(fmt.Sprintf("Connection %s saved to mori.yaml", ui.Cyan(name)))
+
+	const labelW = 8
+	boxLines := []string{
+		ui.BoxLine("Engine", "PostgreSQL", labelW),
+		ui.BoxLine("Provider", "Direct / Self-Hosted", labelW),
+		ui.BoxLine("Host", fmt.Sprintf("%s:%d", connInfo.Host, connInfo.Port), labelW),
+		ui.BoxLine("Database", connInfo.DBName, labelW),
+	}
+	fmt.Println(ui.Box(name, strings.Join(boxLines, "\n")))
+
 	fmt.Println()
-	fmt.Printf("  Next: run 'mori start %s' to begin proxying.\n", name)
+	ui.Info(fmt.Sprintf("Next: run 'mori start %s' to begin proxying.", name))
 	fmt.Println()
 
 	return nil

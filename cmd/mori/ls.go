@@ -91,8 +91,8 @@ func styledConnectionStatus(name string, conn *config.Connection, projectRoot st
 	// Check if this connection is initialized and proxy is running.
 	if config.IsConnInitialized(projectRoot, name) {
 		pidPath := config.ConnPidFilePath(projectRoot, name)
-		if pid, running := isProxyRunning(pidPath); running {
-			return ui.Green(fmt.Sprintf("%s running (PID %d)", ui.IconActive, pid))
+		if _, running := isProxyRunning(pidPath); running {
+			return ui.Green(fmt.Sprintf("%s running", ui.IconActive))
 		}
 	}
 

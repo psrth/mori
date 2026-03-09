@@ -26,7 +26,40 @@ Break something, reset, start over.`,
 	SilenceErrors: true,
 }
 
+// Custom help template with grouped commands.
+const helpTemplate = `{{.Long}}
+
+Usage:
+  {{.UseLine}}{{if .HasAvailableSubCommands}} [command]{{end}}
+
+Setup:
+  init          Add a database connection
+  config        View project configuration
+
+Lifecycle:
+  start         Start the Mori proxy
+  stop          Stop the Mori proxy
+  reset         Reset all local state
+  reinit        Drop all state and re-initialize
+
+Inspection:
+  status        Display current Mori state
+  log           Show proxy activity log
+  inspect       Show detailed state for a table
+  dash          Launch the interactive dashboard
+
+Management:
+  ls            List all configured connections
+  rm            Remove a connection
+
+Flags:
+{{.LocalFlags.FlagUsages | trimTrailingWhitespaces}}
+
+Use "{{.CommandPath}} [command] --help" for more about a command.
+`
+
 func init() {
+	rootCmd.SetHelpTemplate(helpTemplate)
 	rootCmd.AddCommand(initCmd)
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(stopCmd)
@@ -37,6 +70,7 @@ func init() {
 	rootCmd.AddCommand(lsCmd)
 	rootCmd.AddCommand(rmCmd)
 	rootCmd.AddCommand(configCmd)
+	rootCmd.AddCommand(reinitCmd)
 	rootCmd.AddCommand(dashCmd)
 }
 
