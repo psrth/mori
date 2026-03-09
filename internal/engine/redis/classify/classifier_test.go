@@ -31,21 +31,58 @@ func TestClassify(t *testing.T) {
 		{"SCAN", "SCAN 0 MATCH user:* COUNT 100", core.OpRead, core.SubSelect, nil},
 		{"DBSIZE", "DBSIZE", core.OpRead, core.SubSelect, nil},
 
-		// Writes
+		// Writes (insert — new keys)
 		{"SET", "SET user:1 hello", core.OpWrite, core.SubInsert, []string{"user"}},
 		{"SETNX", "SETNX lock:task1 1", core.OpWrite, core.SubInsert, []string{"lock"}},
 		{"MSET", "MSET user:1 val1 session:2 val2", core.OpWrite, core.SubInsert, []string{"user", "session"}},
-		{"INCR", "INCR counter:hits", core.OpWrite, core.SubInsert, []string{"counter"}},
-		{"HSET", "HSET user:1 name Alice", core.OpWrite, core.SubInsert, []string{"user"}},
-		{"LPUSH", "LPUSH queue:tasks task1", core.OpWrite, core.SubInsert, []string{"queue"}},
-		{"SADD", "SADD tags:post1 redis", core.OpWrite, core.SubInsert, []string{"tags"}},
-		{"ZADD", "ZADD leaderboard 100 player1", core.OpWrite, core.SubInsert, []string{"leaderboard"}},
-		{"EXPIRE", "EXPIRE session:abc 3600", core.OpWrite, core.SubInsert, []string{"session"}},
 
-		// Deletes
+		// Writes (update — hydrate before write)
+		{"INCR", "INCR counter:hits", core.OpWrite, core.SubUpdate, []string{"counter"}},
+		{"DECR", "DECR counter:hits", core.OpWrite, core.SubUpdate, []string{"counter"}},
+		{"INCRBY", "INCRBY counter:hits 5", core.OpWrite, core.SubUpdate, []string{"counter"}},
+		{"DECRBY", "DECRBY counter:hits 3", core.OpWrite, core.SubUpdate, []string{"counter"}},
+		{"INCRBYFLOAT", "INCRBYFLOAT price:item 1.5", core.OpWrite, core.SubUpdate, []string{"price"}},
+		{"APPEND", "APPEND log:entry data", core.OpWrite, core.SubUpdate, []string{"log"}},
+		{"SETRANGE", "SETRANGE buf:1 5 hello", core.OpWrite, core.SubUpdate, []string{"buf"}},
+		{"GETSET", "GETSET key:1 newval", core.OpWrite, core.SubUpdate, []string{"key"}},
+		{"HSET", "HSET user:1 name Alice", core.OpWrite, core.SubUpdate, []string{"user"}},
+		{"HSETNX", "HSETNX user:1 email a@b.c", core.OpWrite, core.SubUpdate, []string{"user"}},
+		{"HMSET", "HMSET user:1 name Alice age 30", core.OpWrite, core.SubUpdate, []string{"user"}},
+		{"HINCRBY", "HINCRBY user:1 age 1", core.OpWrite, core.SubUpdate, []string{"user"}},
+		{"HINCRBYFLOAT", "HINCRBYFLOAT user:1 score 1.5", core.OpWrite, core.SubUpdate, []string{"user"}},
+		{"LPUSH", "LPUSH queue:tasks task1", core.OpWrite, core.SubUpdate, []string{"queue"}},
+		{"RPUSH", "RPUSH queue:tasks task2", core.OpWrite, core.SubUpdate, []string{"queue"}},
+		{"LPUSHX", "LPUSHX queue:tasks task1", core.OpWrite, core.SubUpdate, []string{"queue"}},
+		{"RPUSHX", "RPUSHX queue:tasks task2", core.OpWrite, core.SubUpdate, []string{"queue"}},
+		{"LSET", "LSET queue:tasks 0 newtask", core.OpWrite, core.SubUpdate, []string{"queue"}},
+		{"LINSERT", "LINSERT queue:tasks BEFORE task1 task0", core.OpWrite, core.SubUpdate, []string{"queue"}},
+		{"SADD", "SADD tags:post1 redis", core.OpWrite, core.SubUpdate, []string{"tags"}},
+		{"ZADD", "ZADD leaderboard 100 player1", core.OpWrite, core.SubUpdate, []string{"leaderboard"}},
+		{"ZINCRBY", "ZINCRBY leaderboard 5 player1", core.OpWrite, core.SubUpdate, []string{"leaderboard"}},
+		{"XADD", "XADD stream:events * key val", core.OpWrite, core.SubUpdate, []string{"stream"}},
+		{"RENAME", "RENAME old:key new:key", core.OpWrite, core.SubUpdate, []string{"old"}},
+		{"EXPIRE", "EXPIRE session:abc 3600", core.OpWrite, core.SubUpdate, []string{"session"}},
+		{"PERSIST", "PERSIST session:abc", core.OpWrite, core.SubUpdate, []string{"session"}},
+
+		// Writes (delete — tombstone tracking)
 		{"DEL single", "DEL user:1", core.OpWrite, core.SubDelete, []string{"user"}},
 		{"DEL multi", "DEL user:1 session:abc", core.OpWrite, core.SubDelete, []string{"user", "session"}},
 		{"UNLINK", "UNLINK temp:key1", core.OpWrite, core.SubDelete, []string{"temp"}},
+		{"HDEL", "HDEL user:1 field1", core.OpWrite, core.SubDelete, []string{"user"}},
+		{"SREM", "SREM myset member1", core.OpWrite, core.SubDelete, []string{"myset"}},
+		{"SPOP", "SPOP myset", core.OpWrite, core.SubDelete, []string{"myset"}},
+		{"ZREM", "ZREM leaderboard player1", core.OpWrite, core.SubDelete, []string{"leaderboard"}},
+		{"ZPOPMIN", "ZPOPMIN leaderboard", core.OpWrite, core.SubDelete, []string{"leaderboard"}},
+		{"ZPOPMAX", "ZPOPMAX leaderboard", core.OpWrite, core.SubDelete, []string{"leaderboard"}},
+		{"LREM", "LREM mylist 0 val", core.OpWrite, core.SubDelete, []string{"mylist"}},
+		{"LPOP", "LPOP mylist", core.OpWrite, core.SubDelete, []string{"mylist"}},
+		{"RPOP", "RPOP mylist", core.OpWrite, core.SubDelete, []string{"mylist"}},
+		{"XDEL", "XDEL stream:events 1-1", core.OpWrite, core.SubDelete, []string{"stream"}},
+		{"GETDEL", "GETDEL key:1", core.OpWrite, core.SubDelete, []string{"key"}},
+
+		// Writes (truncate)
+		{"LTRIM", "LTRIM mylist 0 99", core.OpWrite, core.SubTruncate, []string{"mylist"}},
+		{"XTRIM", "XTRIM stream:events MAXLEN 1000", core.OpWrite, core.SubTruncate, []string{"stream"}},
 
 		// DDL
 		{"FLUSHDB", "FLUSHDB", core.OpDDL, core.SubOther, nil},
@@ -84,6 +121,37 @@ func TestClassify(t *testing.T) {
 		{"EVALSHA", "EVALSHA abc123 1 counter:hits arg1", core.OpWrite, core.SubInsert, []string{"counter"}},
 		{"EVAL no keys", `EVAL "return 1" 0`, core.OpWrite, core.SubInsert, nil},
 		{"SCRIPT", "SCRIPT LOAD return 1", core.OpOther, core.SubOther, nil},
+
+		// HyperLogLog
+		{"PFADD", "PFADD hll:visits user1", core.OpWrite, core.SubUpdate, []string{"hll"}},
+		{"PFCOUNT", "PFCOUNT hll:visits hll:visits2", core.OpRead, core.SubSelect, []string{"hll"}},
+		{"PFMERGE", "PFMERGE hll:dest hll:src1 hll:src2", core.OpWrite, core.SubInsert, []string{"hll"}},
+
+		// Bitmap
+		{"SETBIT", "SETBIT bitmap:flags 7 1", core.OpWrite, core.SubUpdate, []string{"bitmap"}},
+		{"GETBIT", "GETBIT bitmap:flags 7", core.OpRead, core.SubSelect, []string{"bitmap"}},
+		{"BITCOUNT", "BITCOUNT bitmap:flags", core.OpRead, core.SubSelect, []string{"bitmap"}},
+		{"BITPOS", "BITPOS bitmap:flags 1", core.OpRead, core.SubSelect, []string{"bitmap"}},
+		{"BITFIELD", "BITFIELD counter:bf SET u8 0 100", core.OpWrite, core.SubUpdate, []string{"counter"}},
+
+		// Geospatial
+		{"GEOADD", "GEOADD geo:places 13.361 38.115 Palermo", core.OpWrite, core.SubUpdate, []string{"geo"}},
+		{"GEODIST", "GEODIST geo:places Palermo Catania", core.OpRead, core.SubSelect, []string{"geo"}},
+		{"GEOHASH", "GEOHASH geo:places Palermo", core.OpRead, core.SubSelect, []string{"geo"}},
+		{"GEOPOS", "GEOPOS geo:places Palermo", core.OpRead, core.SubSelect, []string{"geo"}},
+		{"GEOSEARCH", "GEOSEARCH geo:places FROMMEMBER Palermo BYRADIUS 100 km", core.OpRead, core.SubSelect, []string{"geo"}},
+		{"GEOSEARCHSTORE", "GEOSEARCHSTORE dst:geo geo:places FROMMEMBER Palermo BYRADIUS 100 km", core.OpWrite, core.SubInsert, []string{"dst"}},
+
+		// Redis 7.0+
+		{"GETEX", "GETEX session:abc EX 3600", core.OpWrite, core.SubUpdate, []string{"session"}},
+		{"GETDEL", "GETDEL key:1", core.OpWrite, core.SubDelete, []string{"key"}},
+		{"EXPIRETIME", "EXPIRETIME session:abc", core.OpRead, core.SubSelect, []string{"session"}},
+		{"PEXPIRETIME", "PEXPIRETIME session:abc", core.OpRead, core.SubSelect, []string{"session"}},
+
+		// Dangerous commands — blocked
+		{"SHUTDOWN", "SHUTDOWN NOSAVE", core.OpOther, core.SubNotSupported, nil},
+		{"REPLICAOF", "REPLICAOF NO ONE", core.OpOther, core.SubNotSupported, nil},
+		{"DEBUG", "DEBUG SLEEP 0", core.OpOther, core.SubNotSupported, nil},
 	}
 
 	for _, tt := range tests {
@@ -129,7 +197,7 @@ func TestKeyPrefix(t *testing.T) {
 }
 
 func TestIsWriteCommand(t *testing.T) {
-	writes := []string{"SET", "DEL", "HSET", "LPUSH", "SADD", "ZADD", "FLUSHDB", "set", "del", "EVAL", "EVALSHA"}
+	writes := []string{"SET", "DEL", "HSET", "LPUSH", "SADD", "ZADD", "FLUSHDB", "set", "del", "EVAL", "EVALSHA", "PFADD", "SETBIT", "BITFIELD", "GEOADD", "GEOSEARCHSTORE", "GETEX", "GETDEL"}
 	for _, cmd := range writes {
 		if !IsWriteCommand(cmd) {
 			t.Errorf("IsWriteCommand(%q) = false, want true", cmd)

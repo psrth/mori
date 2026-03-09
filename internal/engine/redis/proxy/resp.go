@@ -35,6 +35,93 @@ func ReadRESPValue(r *bufio.Reader) (*RESPValue, error) {
 		return readBulkString(r)
 	case '*':
 		return readArray(r)
+
+	// RESP3 types — read and normalize to RESP2 equivalents.
+	case '_': // Null
+		if _, err := readLine(r); err != nil {
+			return nil, err
+		}
+		return &RESPValue{Type: '$', IsNull: true}, nil
+	case '#': // Boolean → integer 0/1
+		line, err := readLine(r)
+		if err != nil {
+			return nil, err
+		}
+		val := int64(0)
+		if line == "t" {
+			val = 1
+		}
+		return &RESPValue{Type: ':', Int: val}, nil
+	case ',': // Double → bulk string
+		line, err := readLine(r)
+		if err != nil {
+			return nil, err
+		}
+		return &RESPValue{Type: '$', Str: line}, nil
+	case '(': // Big number → bulk string
+		line, err := readLine(r)
+		if err != nil {
+			return nil, err
+		}
+		return &RESPValue{Type: '$', Str: line}, nil
+	case '!': // Blob error → error (read like bulk string)
+		v, err := readBulkString(r)
+		if err != nil {
+			return nil, err
+		}
+		return &RESPValue{Type: '-', Str: v.Str}, nil
+	case '=': // Verbatim string → bulk string (strip encoding prefix)
+		v, err := readBulkString(r)
+		if err != nil {
+			return nil, err
+		}
+		s := v.Str
+		if len(s) > 4 && s[3] == ':' {
+			s = s[4:] // strip "txt:" or "mkd:" prefix
+		}
+		return &RESPValue{Type: '$', Str: s}, nil
+	case '~': // Set → array
+		return readArray(r)
+	case '%': // Map → array (key1, val1, key2, val2, ...)
+		line, err := readLine(r)
+		if err != nil {
+			return nil, err
+		}
+		count, err := strconv.Atoi(line)
+		if err != nil {
+			return nil, fmt.Errorf("invalid map count: %q", line)
+		}
+		arr := make([]RESPValue, 0, count*2)
+		for i := 0; i < count; i++ {
+			key, err := ReadRESPValue(r)
+			if err != nil {
+				return nil, fmt.Errorf("reading map key %d: %w", i, err)
+			}
+			val, err := ReadRESPValue(r)
+			if err != nil {
+				return nil, fmt.Errorf("reading map value %d: %w", i, err)
+			}
+			arr = append(arr, *key, *val)
+		}
+		return &RESPValue{Type: '*', Array: arr}, nil
+	case '|': // Attribute → read and discard, then read the actual value
+		line, err := readLine(r)
+		if err != nil {
+			return nil, err
+		}
+		count, err := strconv.Atoi(line)
+		if err != nil {
+			return nil, fmt.Errorf("invalid attribute count: %q", line)
+		}
+		for i := 0; i < count*2; i++ {
+			if _, err := ReadRESPValue(r); err != nil {
+				return nil, fmt.Errorf("reading attribute element %d: %w", i, err)
+			}
+		}
+		return ReadRESPValue(r) // read the actual value following the attribute
+	case '>': // Push → array
+		return readArray(r)
+
 	default:
 		// Might be an inline command (no RESP prefix).
 		// Unread the byte and try to read a line as inline command.

@@ -76,9 +76,11 @@ func (e *redisEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 	info, _ := connstr.Parse(deps.ProdAddr)
 	prodPass := ""
 	prodDB := 0
+	prodSSL := false
 	if info != nil {
 		prodPass = info.Password
 		prodDB = info.DB
+		prodSSL = info.SSL
 		// Use the actual addr for connecting.
 		deps.ProdAddr = info.Addr()
 	}
@@ -88,6 +90,7 @@ func (e *redisEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 		deps.ShadowAddr,
 		prodPass,
 		prodDB,
+		prodSSL,
 		deps.ListenPort,
 		deps.Verbose,
 		deps.Classifier,

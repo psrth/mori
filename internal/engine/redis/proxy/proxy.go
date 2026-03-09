@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
@@ -38,6 +39,7 @@ type Proxy struct {
 	shadowAddr string
 	prodPass   string // password for prod Redis
 	prodDB     int    // db number for prod Redis
+	prodSSL    bool   // use TLS for prod Redis (rediss://)
 	port       int
 	verbose    bool
 
@@ -62,7 +64,7 @@ type Proxy struct {
 // New creates a Redis Proxy.
 func New(
 	prodAddr, shadowAddr string,
-	prodPass string, prodDB int,
+	prodPass string, prodDB int, prodSSL bool,
 	listenPort int, verbose bool,
 	classifier core.Classifier, router *core.Router,
 	deltaMap *delta.Map, tombstones *delta.TombstoneSet,
@@ -75,6 +77,7 @@ func New(
 		shadowAddr:     shadowAddr,
 		prodPass:       prodPass,
 		prodDB:         prodDB,
+		prodSSL:        prodSSL,
 		port:           listenPort,
 		verbose:        verbose,
 		classifier:     classifier,
@@ -180,7 +183,13 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	}
 
 	// Connect to prod Redis.
-	prodConn, err := net.Dial("tcp", p.prodAddr)
+	var prodConn net.Conn
+	var err error
+	if p.prodSSL {
+		prodConn, err = tls.Dial("tcp", p.prodAddr, &tls.Config{})
+	} else {
+		prodConn, err = net.Dial("tcp", p.prodAddr)
+	}
 	if err != nil {
 		log.Printf("[conn %d] failed to connect to prod Redis: %v", connID, err)
 		WriteRESPValue(clientConn, BuildErrorReply("MORI failed to connect to production Redis"))
@@ -245,6 +254,8 @@ func (p *Proxy) routeLoop(
 	shadowReader *bufio.Reader,
 	connID int64,
 ) {
+	var txn redisTxnState
+
 	for {
 		// Read command from client.
 		cmdVal, err := ReadRESPValue(clientReader)
@@ -266,6 +277,44 @@ func (p *Proxy) routeLoop(
 		if cmd == "QUIT" {
 			WriteRESPValue(clientConn, BuildSimpleString("OK"))
 			return
+		}
+
+		// Intercept HELLO: force RESP2 protocol (Mori proxy speaks RESP2).
+		if cmd == "HELLO" {
+			// Respond with a RESP2 map-like array matching Redis 6+ HELLO response.
+			clientConn.Write(BuildCommandArray(
+				"server", "redis",
+				"version", "6.0.0",
+				"proto", "2",
+				"mode", "standalone",
+			).Bytes())
+			continue
+		}
+
+		// --- Transaction state machine (MULTI/EXEC/DISCARD) ---
+		if txn.inMulti {
+			switch cmd {
+			case "EXEC":
+				p.handleExec(&txn, clientConn, rawProdConn, prodReader, shadowConn, shadowReader, connID)
+				txn = redisTxnState{}
+				continue
+			case "DISCARD":
+				p.handleDiscard(&txn, clientConn, shadowConn, shadowReader, connID)
+				txn = redisTxnState{}
+				continue
+			case "MULTI":
+				// Nested MULTI is an error in Redis.
+				clientConn.Write(BuildErrorReply("ERR MULTI calls can not be nested").Bytes())
+				continue
+			default:
+				p.handleQueuedCommand(&txn, clientConn, cmdVal, inline, connID)
+				continue
+			}
+		}
+
+		if cmd == "MULTI" {
+			p.handleMulti(&txn, clientConn, shadowConn, shadowReader, connID)
+			continue
 		}
 
 		// Handle Pub/Sub SUBSCRIBE/PSUBSCRIBE: fan-in from both backends.
@@ -302,9 +351,25 @@ func (p *Proxy) routeLoop(
 			continue
 		}
 
+		// Handle blocking commands: hydrate keys then forward to shadow.
+		if isBlockingCommand(cmd) {
+			p.handleBlockingCommand(clientConn, cmdVal, cmd, args, rawProdConn, prodReader, shadowConn, shadowReader, connID)
+			continue
+		}
+
 		// Classify the command.
 		decision := p.classifyAndRoute(inline, cmd, connID)
 		cmdBytes := cmdVal.Bytes()
+
+		// Handle StrategyNotSupported — return error to client.
+		if decision.strategy == core.StrategyNotSupported {
+			msg := "this command is not supported through Mori"
+			if decision.classification != nil && decision.classification.NotSupportedMsg != "" {
+				msg = decision.classification.NotSupportedMsg
+			}
+			clientConn.Write(BuildErrorReply("MORI " + msg).Bytes())
+			continue
+		}
 
 		switch {
 		case decision.strategy == core.StrategyMergedRead || decision.strategy == core.StrategyJoinPatch:
@@ -336,9 +401,18 @@ func (p *Proxy) routeLoop(
 			clientConn.Write(resp.Bytes())
 
 		case decision.target == targetShadow:
-			// For HydrateAndWrite, copy key from prod to shadow first.
-			if decision.strategy == core.StrategyHydrateAndWrite && decision.classification != nil {
+			// For HydrateAndWrite or Truncate, copy key from prod to shadow first.
+			if (decision.strategy == core.StrategyHydrateAndWrite || decision.strategy == core.StrategyTruncate) && decision.classification != nil {
 				p.hydrateKeys(decision.classification, rawProdConn, prodReader, shadowConn, shadowReader, connID)
+			}
+
+			// For ShadowDelete commands that need to return the old value (GETDEL),
+			// hydrate first so the value is available in shadow.
+			if decision.strategy == core.StrategyShadowDelete && decision.classification != nil {
+				delCmd := strings.ToUpper(strings.Fields(decision.classification.RawSQL)[0])
+				if delCmd == "GETDEL" {
+					p.hydrateKeys(decision.classification, rawProdConn, prodReader, shadowConn, shadowReader, connID)
+				}
 			}
 
 			// Forward to shadow.
@@ -359,7 +433,7 @@ func (p *Proxy) routeLoop(
 			}
 
 		case decision.target == targetBoth:
-			// Forward to both (for transactions).
+			// Forward to both (for non-transaction commands that need both).
 			shadowConn.Write(cmdBytes)
 			ReadRESPValue(shadowReader)
 
@@ -429,6 +503,20 @@ func (p *Proxy) classifyAndRoute(inline, cmd string, connID int64) routeDecision
 			strategy:       strategy,
 		}
 
+	case core.StrategyTruncate:
+		return routeDecision{
+			target:         targetShadow,
+			classification: classification,
+			strategy:       strategy,
+		}
+
+	case core.StrategyNotSupported:
+		return routeDecision{
+			target:         targetProd,
+			classification: classification,
+			strategy:       strategy,
+		}
+
 	case core.StrategyTransaction:
 		return routeDecision{target: targetBoth, classification: classification, strategy: strategy}
 
@@ -441,6 +529,40 @@ func (p *Proxy) classifyAndRoute(inline, cmd string, connID int64) routeDecision
 
 	default:
 		return routeDecision{target: targetProd, classification: classification, strategy: strategy}
+	}
+}
+
+// tombstoneResponseForCommand returns the correct empty/nil response for a
+// tombstoned key, based on what Redis returns when the key does not exist.
+func tombstoneResponseForCommand(cmd string) []byte {
+	switch cmd {
+	// Commands that return null bulk string for missing keys.
+	case "GET", "GETRANGE", "HGET", "LINDEX", "ZSCORE", "OBJECT", "DUMP":
+		return BuildNullBulkString().Bytes()
+
+	// Commands that return empty array for missing keys.
+	case "HGETALL", "HMGET", "LRANGE", "SMEMBERS", "ZRANGE",
+		"ZRANGEBYSCORE", "ZRANGEBYLEX", "ZREVRANGE", "ZREVRANGEBYSCORE",
+		"ZREVRANGEBYLEX", "XRANGE", "XREVRANGE", "HKEYS", "HVALS",
+		"SMISMEMBER", "ZMSCORE":
+		return (&RESPValue{Type: '*', Array: []RESPValue{}}).Bytes()
+
+	// Commands that return integer 0 for missing keys.
+	case "LLEN", "SCARD", "ZCARD", "XLEN", "STRLEN", "HLEN",
+		"EXISTS", "SISMEMBER", "HEXISTS", "ZCOUNT", "ZLEXCOUNT",
+		"ZRANK", "ZREVRANK":
+		return BuildInteger(0).Bytes()
+
+	// TTL/PTTL return -2 for missing keys.
+	case "TTL", "PTTL":
+		return BuildInteger(-2).Bytes()
+
+	// TYPE returns "none" for missing keys.
+	case "TYPE":
+		return BuildSimpleString("none").Bytes()
+
+	default:
+		return BuildNullBulkString().Bytes()
 	}
 }
 
@@ -457,14 +579,24 @@ func (p *Proxy) executeMergedRead(
 	cmd, args, _ := ParseCommand(cmdVal)
 	cmdBytes := cmdVal.Bytes()
 
+	// If database is fully shadowed (after FLUSHDB), always read from shadow.
+	if p.schemaRegistry != nil && p.schemaRegistry.IsFullyShadowed("*") {
+		shadowConn.Write(cmdBytes)
+		resp, err := ReadRESPValue(shadowReader)
+		if err != nil {
+			return BuildErrorReply("ERR shadow read failed").Bytes()
+		}
+		return resp.Bytes()
+	}
+
 	// For single-key commands (GET, HGETALL, etc.), check the key directly.
 	if len(args) > 0 && !isMultiKeyRead(cmd) {
 		key := args[0]
 		prefix := classify.KeyPrefix(key)
 
-		// If tombstoned, return null.
+		// If tombstoned, return the correct empty response for this command type.
 		if p.tombstones != nil && p.tombstones.IsTombstoned(prefix, key) {
-			return BuildNullBulkString().Bytes()
+			return tombstoneResponseForCommand(cmd)
 		}
 
 		// If in deltaMap, read from shadow.
@@ -508,6 +640,20 @@ func (p *Proxy) executeMergedMGET(
 	_ int64,
 ) []byte {
 	results := make([]RESPValue, len(keys))
+
+	// If database is fully shadowed, route all keys to shadow.
+	if p.schemaRegistry != nil && p.schemaRegistry.IsFullyShadowed("*") {
+		allArgs := make([]string, len(keys)+1)
+		allArgs[0] = "MGET"
+		copy(allArgs[1:], keys)
+		cmd := BuildCommandArray(allArgs...)
+		shadowConn.Write(cmd.Bytes())
+		resp, err := ReadRESPValue(shadowReader)
+		if err == nil && resp.Type == '*' && !resp.IsNull {
+			return resp.Bytes()
+		}
+		return (&RESPValue{Type: '*', Array: results}).Bytes()
+	}
 
 	// Separate keys by source.
 	var prodKeys []int
@@ -566,54 +712,25 @@ func (p *Proxy) executeMergedMGET(
 }
 
 // hydrateKeys copies keys from prod to shadow before a write operation.
+// Uses extractHydrationKeys to determine which keys need hydration based on the command.
 func (p *Proxy) hydrateKeys(
 	cl *core.Classification,
 	prodConn net.Conn, prodReader *bufio.Reader,
 	shadowConn net.Conn, shadowReader *bufio.Reader,
 	connID int64,
 ) {
-	// Extract keys from the classification.
-	// For Redis, we use the raw command tables as key prefixes,
-	// but we need the actual key. Reconstruct from RawSQL.
 	args := strings.Fields(cl.RawSQL)
-	if len(args) < 2 {
-		return
-	}
-	key := args[1]
-	prefix := classify.KeyPrefix(key)
+	keys := extractHydrationKeys(args)
 
-	// Already in shadow? Skip.
-	if p.deltaMap != nil && p.deltaMap.IsDelta(prefix, key) {
-		return
-	}
+	for _, key := range keys {
+		prefix := classify.KeyPrefix(key)
 
-	// Use DUMP/RESTORE to copy.
-	dumpCmd := BuildCommandArray("DUMP", key)
-	prodConn.Write(dumpCmd.Bytes())
-	dumpResp, err := ReadRESPValue(prodReader)
-	if err != nil || dumpResp.IsNull {
-		return
-	}
+		// Already in shadow? Skip.
+		if p.deltaMap != nil && p.deltaMap.IsDelta(prefix, key) {
+			continue
+		}
 
-	// Get TTL.
-	pttlCmd := BuildCommandArray("PTTL", key)
-	prodConn.Write(pttlCmd.Bytes())
-	pttlResp, err := ReadRESPValue(prodReader)
-	if err != nil {
-		return
-	}
-	ttl := "0"
-	if pttlResp.Type == ':' && pttlResp.Int > 0 {
-		ttl = fmt.Sprintf("%d", pttlResp.Int)
-	}
-
-	// RESTORE to shadow (REPLACE if exists).
-	restoreCmd := BuildCommandArray("RESTORE", key, ttl, dumpResp.Str, "REPLACE")
-	shadowConn.Write(restoreCmd.Bytes())
-	ReadRESPValue(shadowReader) // consume response
-
-	if p.verbose {
-		log.Printf("[conn %d] hydrated key %q to shadow", connID, key)
+		p.hydrateKey(key, prodConn, prodReader, shadowConn, shadowReader, connID)
 	}
 }
 
@@ -631,6 +748,11 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 		for _, key := range keys {
 			prefix := classify.KeyPrefix(key)
 			p.deltaMap.Add(prefix, key)
+		}
+		if err := delta.WriteDeltaMap(p.moriDir, p.deltaMap); err != nil {
+			if p.verbose {
+				log.Printf("[conn %d] failed to persist delta map: %v", connID, err)
+			}
 		}
 
 	case core.StrategyHydrateAndWrite:
@@ -656,25 +778,136 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 			}
 		}
 
+	case core.StrategyTruncate:
+		// Truncate (LTRIM, XTRIM) — track key in delta map.
+		for _, key := range keys {
+			prefix := classify.KeyPrefix(key)
+			p.deltaMap.Add(prefix, key)
+		}
+		if err := delta.WriteDeltaMap(p.moriDir, p.deltaMap); err != nil {
+			if p.verbose {
+				log.Printf("[conn %d] failed to persist delta map: %v", connID, err)
+			}
+		}
+
 	case core.StrategyShadowDDL:
-		// DDL (FLUSHDB, etc.) — nothing specific to track.
+		// DDL (FLUSHDB, FLUSHALL) — mark database as fully shadowed.
+		cmdName := ""
+		if len(args) > 0 {
+			cmdName = strings.ToUpper(args[0])
+		}
+		if cmdName == "FLUSHDB" || cmdName == "FLUSHALL" {
+			if p.schemaRegistry != nil {
+				p.schemaRegistry.MarkFullyShadowed("*")
+			}
+		}
 	}
 }
 
-// extractWriteKeys returns the keys affected by a write command.
-// For MSET/MSETNX, keys are at odd positions (cmd key val key val ...).
-// For other commands, the key is the second arg.
+// extractWriteKeys returns the keys affected by a write command (for delta/tombstone tracking).
+// For multi-key commands, returns all destination/affected keys.
 func extractWriteKeys(args []string) []string {
 	if len(args) < 2 {
 		return nil
 	}
 	cmd := strings.ToUpper(args[0])
-	if cmd == "MSET" || cmd == "MSETNX" {
+	switch cmd {
+	case "MSET", "MSETNX":
 		var keys []string
 		for i := 1; i < len(args); i += 2 {
 			keys = append(keys, args[i])
 		}
 		return keys
+	case "RENAME", "RENAMENX":
+		if len(args) >= 3 {
+			return []string{args[1], args[2]}
+		}
+	case "RPOPLPUSH", "BRPOPLPUSH":
+		if len(args) >= 3 {
+			return []string{args[1], args[2]}
+		}
+	case "LMOVE", "BLMOVE":
+		if len(args) >= 3 {
+			return []string{args[1], args[2]}
+		}
+	case "SMOVE":
+		if len(args) >= 3 {
+			return []string{args[1], args[2]}
+		}
+	case "COPY":
+		if len(args) >= 3 {
+			return []string{args[2]} // destination only
+		}
+	case "SDIFFSTORE", "SINTERSTORE", "SUNIONSTORE":
+		if len(args) >= 2 {
+			return []string{args[1]} // destination key
+		}
+	case "ZUNIONSTORE", "ZINTERSTORE":
+		if len(args) >= 2 {
+			return []string{args[1]} // destination key
+		}
+	case "BITOP":
+		if len(args) >= 3 {
+			return []string{args[2]} // destination key
+		}
+	case "SORT":
+		// SORT key ... STORE dst
+		for i := 2; i < len(args)-1; i++ {
+			if strings.ToUpper(args[i]) == "STORE" && i+1 < len(args) {
+				return []string{args[1], args[i+1]}
+			}
+		}
+		return []string{args[1]}
+	case "GEOSEARCHSTORE":
+		if len(args) >= 3 {
+			return []string{args[1]} // destination key
+		}
+	}
+	return []string{args[1]}
+}
+
+// extractHydrationKeys returns the keys that need to be hydrated from prod before a write.
+// This differs from extractWriteKeys: for store-type commands, source keys need hydration too.
+func extractHydrationKeys(args []string) []string {
+	if len(args) < 2 {
+		return nil
+	}
+	cmd := strings.ToUpper(args[0])
+	switch cmd {
+	case "RENAME", "RENAMENX":
+		if len(args) >= 3 {
+			return []string{args[1], args[2]}
+		}
+	case "RPOPLPUSH", "BRPOPLPUSH":
+		if len(args) >= 3 {
+			return []string{args[1], args[2]}
+		}
+	case "LMOVE", "BLMOVE":
+		if len(args) >= 3 {
+			return []string{args[1], args[2]}
+		}
+	case "SMOVE":
+		if len(args) >= 3 {
+			return []string{args[1], args[2]}
+		}
+	case "SDIFFSTORE", "SINTERSTORE", "SUNIONSTORE":
+		// Hydrate destination + all source keys.
+		if len(args) >= 2 {
+			return args[1:]
+		}
+	case "ZUNIONSTORE", "ZINTERSTORE":
+		// ZUNIONSTORE dst numkeys key [key ...] — hydrate destination + source keys.
+		if len(args) >= 2 {
+			return args[1:]
+		}
+	case "BITOP":
+		// BITOP op dst src [src ...] — hydrate source keys.
+		if len(args) >= 4 {
+			return args[3:]
+		}
+	case "SORT":
+		// SORT key — hydrate the source key.
+		return []string{args[1]}
 	}
 	return []string{args[1]}
 }
@@ -794,14 +1027,11 @@ func (p *Proxy) handlePubSubSubscribe(
 				return
 			}
 			cmd, _, _ := ParseCommand(val)
-			unsub := cmdVal.Bytes()
-			if classify.IsPubSubUnsubscribe(cmd) {
-				unsub = val.Bytes()
-			}
-			// Forward unsubscribe to both backends.
-			prodConn.Write(unsub)
-			shadowConn.Write(unsub)
-			// If it's a full unsubscribe or QUIT, exit pub/sub mode.
+			fwd := val.Bytes()
+			// Forward the actual command to both backends.
+			prodConn.Write(fwd)
+			shadowConn.Write(fwd)
+			// If it's an unsubscribe or QUIT, exit pub/sub mode.
 			if classify.IsPubSubUnsubscribe(cmd) || cmd == "QUIT" {
 				return
 			}
@@ -904,6 +1134,9 @@ func (p *Proxy) handleEval(
 
 // executeMergedScan runs SCAN on both backends when shadow has deltas,
 // merges the results, deduplicates, and filters tombstoned keys.
+// scanPhaseFlag is the high bit used to distinguish Prod scan (phase 0) from Shadow scan (phase 1).
+const scanPhaseFlag uint64 = 1 << 63
+
 func (p *Proxy) executeMergedScan(
 	cmdVal *RESPValue,
 	args []string,
@@ -911,9 +1144,20 @@ func (p *Proxy) executeMergedScan(
 	shadowConn net.Conn, shadowReader *bufio.Reader,
 	connID int64,
 ) []byte {
+	cmdBytes := cmdVal.Bytes()
+
+	// If database is fully shadowed, forward SCAN to shadow only.
+	if p.schemaRegistry != nil && p.schemaRegistry.IsFullyShadowed("*") {
+		shadowConn.Write(cmdBytes)
+		resp, err := ReadRESPValue(shadowReader)
+		if err != nil {
+			return BuildErrorReply("ERR shadow SCAN failed").Bytes()
+		}
+		return resp.Bytes()
+	}
+
 	// If no deltas exist, just forward to prod.
 	if p.deltaMap == nil || !p.deltaMap.HasAnyDelta() {
-		cmdBytes := cmdVal.Bytes()
 		prodConn.Write(cmdBytes)
 		resp, err := ReadRESPValue(prodReader)
 		if err != nil {
@@ -922,60 +1166,98 @@ func (p *Proxy) executeMergedScan(
 		return resp.Bytes()
 	}
 
-	cmdBytes := cmdVal.Bytes()
-
-	// Run SCAN on prod.
-	prodConn.Write(cmdBytes)
-	prodResp, err := ReadRESPValue(prodReader)
-	if err != nil {
-		return BuildErrorReply("ERR prod SCAN failed").Bytes()
+	// Two-phase cursor merging:
+	// Phase 0 (bit 63 = 0): scanning Prod, filtering tombstoned + delta keys
+	// Phase 1 (bit 63 = 1): scanning Shadow for delta/new keys
+	clientCursor := "0"
+	if len(args) > 0 {
+		clientCursor = args[0]
 	}
 
-	// Run SCAN on shadow.
-	shadowConn.Write(cmdBytes)
+	cursorVal := uint64(0)
+	if clientCursor != "0" {
+		fmt.Sscanf(clientCursor, "%d", &cursorVal)
+	}
+
+	inShadowPhase := (cursorVal & scanPhaseFlag) != 0
+	innerCursor := cursorVal &^ scanPhaseFlag
+
+	// Extract MATCH and COUNT args from the original command to propagate.
+	scanArgs := []string{"SCAN", fmt.Sprintf("%d", innerCursor)}
+	for i := 1; i < len(args); i++ {
+		upper := strings.ToUpper(args[i])
+		if (upper == "MATCH" || upper == "COUNT" || upper == "TYPE") && i+1 < len(args) {
+			scanArgs = append(scanArgs, args[i], args[i+1])
+			i++ // skip the value
+		}
+	}
+	scanCmd := BuildCommandArray(scanArgs...)
+
+	if !inShadowPhase {
+		// Phase 0: scan Prod.
+		prodConn.Write(scanCmd.Bytes())
+		prodResp, err := ReadRESPValue(prodReader)
+		if err != nil {
+			return BuildErrorReply("ERR prod SCAN failed").Bytes()
+		}
+		prodCursor, prodKeys := parseScanResponse(prodResp)
+
+		// Filter: remove tombstoned keys and keys in delta map (they'll appear in Phase 1).
+		var filtered []string
+		for _, key := range prodKeys {
+			prefix := classify.KeyPrefix(key)
+			if p.tombstones != nil && p.tombstones.IsTombstoned(prefix, key) {
+				continue
+			}
+			if p.deltaMap != nil && p.deltaMap.IsDelta(prefix, key) {
+				continue
+			}
+			filtered = append(filtered, key)
+		}
+
+		// Determine return cursor.
+		var returnCursor string
+		if prodCursor == "0" {
+			// Prod scan complete — transition to Phase 1 (shadow scan starting at cursor 0).
+			returnCursor = fmt.Sprintf("%d", scanPhaseFlag)
+		} else {
+			// Prod scan not done — return prod cursor (Phase 0 continues).
+			var pc uint64
+			fmt.Sscanf(prodCursor, "%d", &pc)
+			returnCursor = fmt.Sprintf("%d", pc)
+		}
+
+		return buildScanResponse(returnCursor, filtered)
+	}
+
+	// Phase 1: scan Shadow for delta/new keys.
+	shadowConn.Write(scanCmd.Bytes())
 	shadowResp, err := ReadRESPValue(shadowReader)
 	if err != nil {
 		return BuildErrorReply("ERR shadow SCAN failed").Bytes()
 	}
-
-	// Parse SCAN responses: *2 [$cursor, *N [key1, key2, ...]]
-	prodCursor, prodKeys := parseScanResponse(prodResp)
 	shadowCursor, shadowKeys := parseScanResponse(shadowResp)
 
-	// Merge and deduplicate keys.
-	seen := make(map[string]bool)
-	var merged []string
-	for _, key := range prodKeys {
-		prefix := classify.KeyPrefix(key)
-		// Skip tombstoned keys.
-		if p.tombstones != nil && p.tombstones.IsTombstoned(prefix, key) {
-			continue
-		}
-		if !seen[key] {
-			seen[key] = true
-			merged = append(merged, key)
-		}
-	}
-	for _, key := range shadowKeys {
-		if !seen[key] {
-			seen[key] = true
-			merged = append(merged, key)
-		}
+	var returnCursor string
+	if shadowCursor == "0" {
+		// Shadow scan complete — full scan done.
+		returnCursor = "0"
+	} else {
+		// Shadow scan not done — return shadow cursor with Phase 1 flag.
+		var sc uint64
+		fmt.Sscanf(shadowCursor, "%d", &sc)
+		returnCursor = fmt.Sprintf("%d", sc|scanPhaseFlag)
 	}
 
-	// Use the cursor from prod as the return cursor. When both cursors are "0",
-	// the scan is complete. Otherwise, prefer the non-zero cursor.
-	cursor := prodCursor
-	if cursor == "0" && shadowCursor != "0" {
-		cursor = shadowCursor
-	}
+	return buildScanResponse(returnCursor, shadowKeys)
+}
 
-	// Build response: *2 [$cursor, *N [keys...]]
-	keyValues := make([]RESPValue, len(merged))
-	for i, k := range merged {
+// buildScanResponse builds a RESP SCAN response from cursor and keys.
+func buildScanResponse(cursor string, keys []string) []byte {
+	keyValues := make([]RESPValue, len(keys))
+	for i, k := range keys {
 		keyValues[i] = RESPValue{Type: '$', Str: k}
 	}
-
 	return (&RESPValue{
 		Type: '*',
 		Array: []RESPValue{
@@ -983,6 +1265,92 @@ func (p *Proxy) executeMergedScan(
 			{Type: '*', Array: keyValues},
 		},
 	}).Bytes()
+}
+
+// isBlockingCommand returns true for blocking pop/move commands.
+func isBlockingCommand(cmd string) bool {
+	switch cmd {
+	case "BLPOP", "BRPOP", "BLMOVE", "BZPOPMIN", "BZPOPMAX", "BRPOPLPUSH", "BLMPOP", "BZMPOP":
+		return true
+	}
+	return false
+}
+
+// blockingKeyArgs extracts the key arguments from blocking commands for hydration.
+func blockingKeyArgs(cmd string, args []string) []string {
+	switch cmd {
+	case "BLPOP", "BRPOP":
+		// BLPOP key1 [key2 ...] timeout — all args except last are keys.
+		if len(args) < 2 {
+			return nil
+		}
+		return args[:len(args)-1]
+	case "BLMOVE", "BRPOPLPUSH":
+		// BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout
+		// BRPOPLPUSH src dst timeout
+		if len(args) < 2 {
+			return nil
+		}
+		return args[:2]
+	case "BZPOPMIN", "BZPOPMAX":
+		// BZPOPMIN key1 [key2 ...] timeout
+		if len(args) < 2 {
+			return nil
+		}
+		return args[:len(args)-1]
+	case "BLMPOP", "BZMPOP":
+		// BLMPOP timeout numkeys key1 [key2 ...] LEFT|RIGHT
+		// BZMPOP timeout numkeys key1 [key2 ...] MIN|MAX
+		if len(args) < 3 {
+			return nil
+		}
+		numkeys := 0
+		fmt.Sscanf(args[1], "%d", &numkeys)
+		if numkeys <= 0 || 2+numkeys > len(args) {
+			return nil
+		}
+		return args[2 : 2+numkeys]
+	}
+	return nil
+}
+
+// handleBlockingCommand hydrates keys and forwards a blocking command to shadow.
+func (p *Proxy) handleBlockingCommand(
+	clientConn net.Conn,
+	cmdVal *RESPValue,
+	cmd string, args []string,
+	prodConn net.Conn, prodReader *bufio.Reader,
+	shadowConn net.Conn, shadowReader *bufio.Reader,
+	connID int64,
+) {
+	// Hydrate the source keys from prod to shadow.
+	keys := blockingKeyArgs(cmd, args)
+	for _, key := range keys {
+		prefix := classify.KeyPrefix(key)
+		if p.deltaMap != nil && p.deltaMap.IsDelta(prefix, key) {
+			continue
+		}
+		p.hydrateKey(key, prodConn, prodReader, shadowConn, shadowReader, connID)
+	}
+
+	// Forward the blocking command to shadow.
+	if _, err := shadowConn.Write(cmdVal.Bytes()); err != nil {
+		log.Printf("[conn %d] shadow write error for %s: %v", connID, cmd, err)
+		return
+	}
+	resp, err := ReadRESPValue(shadowReader)
+	if err != nil {
+		log.Printf("[conn %d] shadow read error for %s: %v", connID, cmd, err)
+		return
+	}
+
+	// Track write effects for delete-type blocking commands.
+	cl, _ := p.classifier.Classify(CommandToInline(cmdVal))
+	if cl != nil && cl.OpType == core.OpWrite {
+		p.trackWriteEffects(cl, p.router.Route(cl), connID)
+	}
+
+	clientConn.Write(resp.Bytes())
 }
 
 // parseScanResponse extracts cursor and keys from a SCAN response.
