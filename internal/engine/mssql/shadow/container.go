@@ -51,6 +51,12 @@ func (m *Manager) Close() error {
 	return nil
 }
 
+// ImageExists checks whether a Docker image is available locally.
+func (m *Manager) ImageExists(ctx context.Context, imageName string) bool {
+	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", imageName)
+	return cmd.Run() == nil
+}
+
 // Pull pulls the specified Docker image if not already present locally.
 func (m *Manager) Pull(ctx context.Context, imageName string) error {
 	cmd := exec.CommandContext(ctx, "docker", "pull", imageName)
