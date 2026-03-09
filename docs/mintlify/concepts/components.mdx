@@ -1,0 +1,106 @@
+---
+title: "Components"
+description: "The state structures that track divergence between production and shadow."
+sidebarTitle: "Components"
+---
+
+Mori tracks three types of divergence between prod and shadow. Together, they tell the proxy exactly what has changed locally, enabling correct routing and transparent merging.
+
+## Delta Map
+
+The Delta Map is a set of `(table, primary_key)` pairs identifying rows that have been **modified locally** (inserted or updated in shadow). When a row is in the Delta Map, shadow holds the authoritative version — prod's version is stale.
+
+**How it's used:**
+- During a [merged read](/docs/concepts/strategies#merged-read-single-table), prod results for delta PKs are discarded in favor of shadow results
+- The router checks whether any table has delta entries to decide between Prod Direct and Merged Read strategies
+- INSERT adds the new row's PK; UPDATE adds the modified row's PK
+
+**Staging:** Within a transaction, delta additions are staged — held in a per-transaction buffer. On COMMIT, staged entries are promoted to the persistent map. On ROLLBACK, they're discarded. This prevents phantom deltas from failed transactions.
+
+**Insert counts:** For tables without extractable PKs, the Delta Map tracks aggregate insert counts instead of individual PKs. This is used for LIMIT over-fetching calculations.
+
+## Tombstone Set
+
+The Tombstone Set is a set of `(table, primary_key)` pairs identifying rows that have been **deleted locally**. Tombstoned rows are filtered from prod results — they still exist in production, but Mori hides them.
+
+**How it's used:**
+- During a merged read, prod rows matching tombstoned PKs are excluded from the result
+- DELETE always adds a tombstone, whether the row was in shadow, prod, or both
+- TRUNCATE clears all tombstones for the table and marks it as fully shadowed (all subsequent reads skip prod)
+
+**Staging:** Like the Delta Map, tombstone additions are staged within transactions and promoted on COMMIT.
+
+## Schema Registry
+
+The Schema Registry tracks **structural differences** between the shadow and prod schemas, introduced by local DDL. When you run DDL (which executes on shadow only), the schemas diverge. The registry records exactly what changed so Mori can adapt prod rows during reads.
+
+### Operations Tracked
+
+| DDL | Registry Records | Read Adaptation |
+|-----|-----------------|----------------|
+| `ADD COLUMN` | Column name, type, default | Prod rows get NULL/default injected |
+| `DROP COLUMN` | Dropped column name | Column stripped from prod results |
+| `RENAME COLUMN` | `old_name → new_name` | Column renamed in prod results |
+| `ALTER TYPE` | `old_type → new_type` | Value cast in prod results |
+| `CREATE TABLE` | Shadow-only table | N/A — table only exists in shadow |
+| `DROP TABLE` | Table marked as dropped | Queries return "table not found" |
+| `CREATE INDEX` | Shadow only, silent | N/A — indexes are internal to shadow |
+
+### How Adaptation Works
+
+During a merged read, the merge engine consults the Schema Registry before combining results:
+
+1. Fetch prod rows (original schema)
+2. For each registered divergence: inject NULLs, strip columns, rename, cast types
+3. Adapted prod rows now match shadow schema
+4. Merge with shadow rows and return unified result
+
+### Foreign Key Metadata
+
+The Schema Registry also stores foreign key constraints discovered from prod and from DDL. These are used for proxy-layer FK enforcement (parent row validation on INSERT, CASCADE/RESTRICT on DELETE). FKs are stripped from the shadow schema because shadow starts empty — the proxy enforces referential integrity instead.
+
+## Hydration
+
+Hydration is the process of copying a row from prod into shadow so it can be mutated locally. It happens transparently when you UPDATE or DELETE a row that only exists in prod.
+
+**When it triggers:**
+- UPDATE with a WHERE clause targeting a prod-only row
+- INSERT ... ON CONFLICT where the conflicting row exists in prod
+- DELETE ... RETURNING where return data is needed from a prod-only row
+- Bulk writes that discover affected rows via SELECT on prod
+
+**What it does:**
+1. SELECT the row from prod
+2. Filter out generated columns (GENERATED ALWAYS AS STORED)
+3. INSERT the row into shadow
+4. The subsequent write operates on the shadow copy
+
+Hydration respects schema divergence — dropped columns are excluded, renamed columns are mapped, and type changes are handled during the copy.
+
+## Primary Key Model
+
+| PK Type | Handling |
+|---------|---------|
+| **Serial / bigserial** | Sequence offset during init: `max(prod_max × 10, prod_max + 10,000,000)`. Shadow-generated PKs never collide with prod. |
+| **UUID** | Generated locally in shadow. Statistically unique, no collision risk. |
+| **Composite** | Serialized as JSON tuple in Delta Map / Tombstone Set. |
+| **No PK** | Table treated as read-only with warning. Uses `ctid` for deduplication where possible. |
+
+## State Persistence
+
+All state is stored in the `.mori/` directory at your project root, created by `mori init`.
+
+```
+.mori/
+  mori.yaml             # Connection config (engine, addresses, ports)
+  shadow/               # Shadow container metadata
+  state/
+    delta.json           # Delta Map (locally modified rows)
+    tombstones.json      # Tombstone Set (locally deleted rows)
+    schema_registry.json # Schema divergence tracking
+    tables.json          # Table metadata (PKs, types)
+    sequences.json       # Sequence offsets
+  log/                   # Query and routing logs
+```
+
+State is persisted after each autocommit write and on transaction COMMIT. On `mori reset`, the entire `.mori/state/` directory is wiped and the shadow container is recreated.

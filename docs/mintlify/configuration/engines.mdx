@@ -1,0 +1,278 @@
+---
+title: "Database Engines"
+description: "Supported database engines, wire protocols, and implementation details."
+sidebarTitle: "Database Engines"
+---
+
+Mori supports 9 database engines across SQL, NoSQL, and embedded categories. Each engine uses the real wire protocol -- your application connects to Mori with its standard driver, no code changes required.
+
+## Engine Matrix
+
+| Engine | Category | Wire Protocol | Default Port | Shadow Strategy | Status |
+|--------|----------|---------------|-------------|-----------------|--------|
+| PostgreSQL | SQL | pgwire v3 | 5432 | Docker container | **Stable** |
+| CockroachDB | SQL | pgwire v3 | 26257 | Docker container | **Stable** |
+| MySQL | SQL | MySQL wire | 3306 | Docker container | Supported |
+| MariaDB | SQL | MySQL wire | 3306 | Docker container | Supported |
+| MS SQL Server | SQL | TDS | 1433 | Docker container | Supported |
+| SQLite | Embedded | pgwire (exposed) | N/A | Local file copy | Supported |
+| DuckDB | Embedded | pgwire (exposed) | N/A | Local file copy | Supported |
+| Redis | NoSQL | RESP | 6379 | Docker container | Supported |
+| Firestore | NoSQL | gRPC | N/A | Emulator container | Supported |
+
+## By Category
+
+### SQL Engines (pgwire)
+
+PostgreSQL and CockroachDB speak the pgwire protocol. Mori uses `pg_query_go` (PostgreSQL's actual parser internals) for AST-based query classification. These engines have the most mature proxy implementation with full extended query protocol support and zero known limitations.
+
+CockroachDB reuses the entire PostgreSQL engine — it's a thin adapter that overrides only the engine ID. All proxy logic, classification, and merging is shared.
+
+### SQL Engines (MySQL wire)
+
+MySQL and MariaDB use the MySQL wire protocol. Mori uses `vitess/sqlparser` for AST-based classification. MariaDB reuses the MySQL engine implementation — the only difference is that MariaDB uses a `mariadb:` Docker image for the shadow container (MySQL's `mysqldump` queries `COLUMN_STATISTICS` which MariaDB doesn't support).
+
+### SQL Engines (TDS)
+
+MS SQL Server speaks the TDS (Tabular Data Stream) protocol. Mori uses regex-based classification for T-SQL since no Go-native TDS parser exists. Supports `sp_executesql` RPC calls alongside standard SQL batches.
+
+### Embedded Engines
+
+SQLite and DuckDB are embedded databases (no server process). Mori exposes them over the pgwire protocol so applications can connect with any PostgreSQL driver. The shadow is a local file copy rather than a Docker container — no Docker needed.
+
+### NoSQL Engines
+
+Redis uses the RESP protocol with a command-based classifier (static lookup table mapping 100+ Redis commands). Firestore uses gRPC with a method-name classifier. Both support full copy-on-write semantics with delta tracking.
+
+<Info>
+All 9 engines share the same copy-on-write model: reads from prod, writes to shadow, transparent merging. The wire protocol and classification strategy differ per engine, but the [core invariants](/docs/concepts/safety) are identical.
+</Info>
+
+## Engine Details
+
+<AccordionGroup>
+  <Accordion title="PostgreSQL">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `postgres` |
+    | Classifier | AST-based (`pg_query_go`) |
+    | Shadow | Docker `postgres:<version>` (version-matched) |
+    | Extended Protocol | Full Parse/Bind/Describe/Execute support |
+
+    **Connection Parameters:**
+
+    | Field | Description | Default |
+    |-------|-------------|---------|
+    | `host` | Database host | — |
+    | `port` | Database port | `5432` |
+    | `user` | Username | — |
+    | `password` | Password | — |
+    | `database` | Database name | — |
+    | `ssl_mode` | `disable`, `require`, `verify-ca`, `verify-full` | `disable` |
+
+    **Special features:** Full pgwire v3, extended query protocol with parameterized queries (`$1`, `$2`), DDL tracking, transaction support with savepoints, auto-detected PostgreSQL version, extension replication, sequence offset for PK collision prevention.
+
+    **Known limitations:** None. All E2E tests pass without skips.
+
+    ```bash
+    mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
+    ```
+  </Accordion>
+
+  <Accordion title="CockroachDB">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `cockroachdb` |
+    | Classifier | AST-based (`pg_query_go`) — shared with PostgreSQL |
+    | Shadow | Docker CockroachDB container |
+
+    Thin adapter wrapping the PostgreSQL engine. All proxy logic is shared — CockroachDB overrides only the engine ID and Docker image.
+
+    **Connection Parameters:** Same as PostgreSQL (port default: `26257`).
+
+    **Known limitations:** None.
+
+    ```bash
+    mori init --from "postgres://user:pass@crdb-host:26257/mydb?sslmode=require"
+    ```
+  </Accordion>
+
+  <Accordion title="MySQL">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `mysql` |
+    | Classifier | AST-based (`vitess/sqlparser`) |
+    | Shadow | Docker `mysql:<version>` (version-matched) |
+    | Extended Protocol | COM_STMT_PREPARE/EXECUTE/CLOSE |
+
+    **Connection Parameters:**
+
+    | Field | Description | Default |
+    |-------|-------------|---------|
+    | `host` | Database host | — |
+    | `port` | Database port | `3306` |
+    | `user` | Username | — |
+    | `password` | Password | — |
+    | `database` | Database name | — |
+    | `ssl_mode` | SSL mode | — |
+
+    Supports MySQL-specific constructs: INSERT ... ON DUPLICATE KEY UPDATE, REPLACE INTO, SHOW commands.
+
+    **Known limitations:** Merged read breaks aggregate-only queries with `only_full_group_by` mode. Workaround: disable the mode with `SET sql_mode = ''` or use MariaDB.
+
+    ```bash
+    mori init --from "mysql://user:pass@host:3306/mydb"
+    ```
+  </Accordion>
+
+  <Accordion title="MariaDB">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `mariadb` |
+    | Classifier | AST-based (`vitess/sqlparser`) — shared with MySQL |
+    | Shadow | Docker `mariadb:<version>` |
+
+    Reuses the MySQL engine. The only difference: uses a MariaDB Docker image for the shadow to avoid MySQL 8.0 `COLUMN_STATISTICS` incompatibility.
+
+    **Connection Parameters:** Same as MySQL.
+
+    **Known limitations:** None. Avoids MySQL's `only_full_group_by` issue by default.
+
+    ```bash
+    mori init --from "mysql://user:pass@host:3306/mydb"
+    ```
+  </Accordion>
+
+  <Accordion title="MS SQL Server">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `mssql` |
+    | Classifier | Regex-based |
+    | Shadow | Docker `mcr.microsoft.com/mssql/server:2022-latest` |
+
+    **Connection Parameters:**
+
+    | Field | Description | Default |
+    |-------|-------------|---------|
+    | `host` | Database host | — |
+    | `port` | Database port | `1433` |
+    | `user` | Username | — |
+    | `password` | Password | — |
+    | `database` | Database name | — |
+    | `encrypt` | Encryption setting | — |
+    | `trust_server_cert` | Trust server certificate | — |
+
+    Handles TDS login7 packets, SQL batch messages, RPC requests (including `sp_executesql`), attention signals, and SSL/TLS negotiation.
+
+    **Known limitations (6):**
+    - Transaction COMMIT discards shadow writes in explicit transaction blocks
+    - `sp_executesql` SELECT with parameters not resolved for merged reads
+    - `sp_executesql` UPDATE parameters not hydrated
+    - JOIN_PATCH doesn't reflect shadow UPDATEs or INSERTs
+    - `sp_rename` fails on shadow tables
+
+    <Tip>
+    For .NET applications: use `CommandType.Text` with inline parameters instead of `CommandType.StoredProcedure` for queries routed through Mori.
+    </Tip>
+
+    ```bash
+    mori init --from "sqlserver://sa:password@host:1433?database=mydb&encrypt=true&trustservercertificate=true"
+    ```
+  </Accordion>
+
+  <Accordion title="SQLite">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `sqlite` |
+    | Classifier | Regex-based |
+    | Shadow | Local file copy (`.mori/shadow.db`) |
+
+    No Docker required. Mori opens both prod and shadow SQLite files directly and exposes them through a pgwire listener. Connect with any PostgreSQL client.
+
+    **Connection Parameters:**
+
+    | Field | Description |
+    |-------|------------|
+    | `file_path` | Path to the SQLite database file |
+
+    **Known limitations:** Transaction COMMIT discards shadow writes in explicit transaction blocks. Use auto-commit writes instead.
+
+    ```bash
+    mori init --from "/path/to/prod.db"
+    ```
+  </Accordion>
+
+  <Accordion title="DuckDB">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `duckdb` |
+    | Classifier | Regex-based |
+    | Shadow | Local file copy (`.mori/shadow.db`) |
+
+    No Docker required. Same embedded strategy as SQLite — exposes DuckDB over pgwire.
+
+    **Connection Parameters:**
+
+    | Field | Description |
+    |-------|------------|
+    | `file_path` | Path to the DuckDB file (also supports `duckdb:///path` and `:memory:`) |
+
+    **Known limitations:**
+    - Transaction COMMIT discards shadow writes
+    - JOIN_PATCH doesn't reflect shadow UPDATEs
+    - `LIST()` aggregate returns unscannable array type
+
+    ```bash
+    mori init --from "/path/to/analytics.duckdb"
+    ```
+  </Accordion>
+
+  <Accordion title="Redis">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `redis` |
+    | Classifier | Command-based (static lookup table, 100+ commands) |
+    | Shadow | Docker `redis:<version>` (version-matched) |
+
+    **Connection Parameters:**
+
+    | Field | Description | Default |
+    |-------|-------------|---------|
+    | `host` | Redis host | — |
+    | `port` | Redis port | `6379` |
+    | `password` | Password | — |
+    | `db_number` | Database number | `0` |
+    | `ssl` | Enable SSL/TLS | `false` |
+
+    Delta tracking works at the key level. All Redis data types are supported: strings, hashes, lists, sets, sorted sets, streams. AUTH is handled transparently.
+
+    **Known limitations:** RENAME delta tracking misses destination key — `RENAME src dst` doesn't register `dst` as a shadow key.
+
+    ```bash
+    mori init --from "redis://:password@host:6379/0"
+    ```
+  </Accordion>
+
+  <Accordion title="Firestore">
+    | Property | Value |
+    |----------|-------|
+    | Engine ID | `firestore` |
+    | Classifier | gRPC method-name based |
+    | Shadow | Firestore emulator (Docker `gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators`) |
+
+    **Connection Parameters:**
+
+    | Field | Description |
+    |-------|------------|
+    | `project_id` | GCP project ID |
+    | `credentials_file` | Path to service account JSON (optional if using ADC) |
+
+    Applications connect using the standard Firestore SDK by setting `FIRESTORE_EMULATOR_HOST=127.0.0.1:<mori-port>`. No code changes required.
+
+    **Known limitations:** None.
+
+    ```bash
+    mori init --from "firestore://my-project?credentials=./sa.json"
+    ```
+  </Accordion>
+</AccordionGroup>

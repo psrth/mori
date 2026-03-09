@@ -1,0 +1,53 @@
+---
+title: "Ports"
+description: "How Mori assigns and manages ports for the proxy, MCP server, and shadow containers."
+sidebarTitle: "Ports"
+---
+
+## Proxy Port
+
+The proxy port is where your application connects to Mori. It's assigned in this priority order:
+
+1. **`--port` flag** — explicit port on `mori start --port 5433`
+2. **Persisted config** — port from a previous session (stored in `.mori/`)
+3. **Auto-assign** — starting from `9002`, finds the next available port
+
+```bash
+mori start                # Auto-assign (9002, 9003, ...)
+mori start --port 5433    # Explicit port
+```
+
+## Engine Default Ports
+
+These are the default ports for each database engine. When connecting your app through Mori, use the proxy port instead.
+
+| Engine | Default Prod Port |
+|--------|------------------|
+| PostgreSQL | 5432 |
+| CockroachDB | 26257 |
+| MySQL / MariaDB | 3306 |
+| MS SQL Server | 1433 |
+| Redis | 6379 |
+| SQLite | N/A (embedded) |
+| DuckDB | N/A (embedded) |
+| Firestore | N/A (gRPC) |
+
+## MCP Server Port
+
+The MCP server runs on a separate port from the proxy, default `9000`.
+
+```bash
+mori start --mcp --mcp-port 9000
+```
+
+The MCP endpoint is available at `http://127.0.0.1:9000/mcp`.
+
+## Shadow Container Ports
+
+Shadow database containers use dynamically allocated ports. The OS assigns an available port when the container starts. You don't need to manage these — Mori handles port allocation and stores the assigned port in `.mori/` config.
+
+Shadow ports are internal to Mori. Your application never connects to the shadow directly — it connects to the proxy, which routes to shadow as needed.
+
+## Multi-Connection Port Allocation
+
+If you have multiple connections configured (via `mori ls`), each connection gets its own proxy port. Auto-assignment increments from `9002` for each active connection.

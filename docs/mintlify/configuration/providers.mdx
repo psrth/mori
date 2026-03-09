@@ -1,0 +1,200 @@
+---
+title: "Providers"
+description: "Supported cloud providers and managed database platforms."
+sidebarTitle: "Providers"
+---
+
+Providers handle authentication and connection configuration for managed database platforms. Each provider knows how to construct connection strings, manage SSL, and — where supported — obtain IAM tokens automatically.
+
+## Provider Matrix
+
+| Provider | Compatible Engines | SSL Default | Auth Method |
+|----------|-------------------|-------------|-------------|
+| Direct / Self-Hosted | All 9 engines | Engine default | Password |
+| GCP Cloud SQL | PostgreSQL, MySQL, MSSQL | `require` | Password or `gcloud` IAM token |
+| AWS RDS / Aurora | PostgreSQL, MySQL, MariaDB, MSSQL | `require` | Password or AWS IAM token |
+| Neon | PostgreSQL | `require` | Password |
+| Supabase | PostgreSQL | `require` | Password |
+| Azure Database | PostgreSQL, MySQL, MariaDB, MSSQL | `require` | Password or Azure CLI token |
+| PlanetScale | MySQL | `require` (TLS always) | Password |
+| Vercel Postgres | PostgreSQL | `require` | Password |
+| DigitalOcean | PostgreSQL, MySQL, Redis | `require` | Password |
+| Railway | PostgreSQL, MySQL, Redis | `require` | Password |
+| Upstash | Redis | TLS (`rediss://`) | Password |
+| Cloudflare D1 / KV | SQLite, Redis | N/A (HTTPS API) | API token |
+| Firebase | Firestore | N/A (gRPC with TLS) | Service account or ADC |
+
+## Provider Details
+
+<AccordionGroup>
+  <Accordion title="Direct / Self-Hosted">
+    **Provider ID:** `direct`
+
+    The fallback for any database not hosted on a specific managed platform. Passes connection parameters through without modification. No SSL override.
+
+    **When to use:** Self-hosted databases, Docker/Kubernetes-hosted, local dev databases, any provider not listed above.
+
+    ```bash
+    mori init --from "postgres://user:pass@my-server:5432/mydb"
+    ```
+  </Accordion>
+
+  <Accordion title="GCP Cloud SQL">
+    **Provider ID:** `gcp-cloud-sql`
+
+    **With password:** Provide host, user, and password as normal. SSL enforced to `require`.
+
+    **With IAM auth:** Omit the password. Mori obtains a token via `gcloud auth print-access-token`. Requires Google Cloud SDK installed and authenticated (`gcloud auth login`).
+
+    <Tip>
+    When using Cloud SQL Proxy, the host is typically `127.0.0.1`. Mori skips SSL enforcement when a tunnel is configured.
+    </Tip>
+
+    ```bash
+    mori init --from "postgres://user:pass@10.0.0.1:5432/mydb"
+    ```
+  </Accordion>
+
+  <Accordion title="AWS RDS / Aurora">
+    **Provider ID:** `aws-rds`
+
+    **With password:** Provide host, user, and password. SSL enforced.
+
+    **With IAM auth:** Omit the password. Mori generates an IAM auth token via `aws rds generate-db-auth-token`. Requires AWS CLI configured and IAM policy granting `rds-db:connect`.
+
+    **Extra field:** `aws_region` (required for IAM auth only).
+
+    ```bash
+    mori init --from "postgres://user:pass@mydb.abc123.us-east-1.rds.amazonaws.com:5432/mydb"
+    ```
+  </Accordion>
+
+  <Accordion title="Neon">
+    **Provider ID:** `neon`
+
+    Serverless PostgreSQL. SSL enforced. Default database `neondb`, default user `neondb_owner`.
+
+    <Tip>Copy the connection string directly from the Neon dashboard.</Tip>
+
+    ```bash
+    mori init --from "postgres://neondb_owner:pass@ep-cool-darkness-123456.us-east-2.aws.neon.tech:5432/neondb?sslmode=require"
+    ```
+  </Accordion>
+
+  <Accordion title="Supabase">
+    **Provider ID:** `supabase`
+
+    Managed PostgreSQL. SSL enforced. Default database `postgres`.
+
+    <Tip>Use the "Direct" connection string from Supabase Settings > Database (not the pooled PgBouncer one).</Tip>
+
+    ```bash
+    mori init --from "postgres://postgres:pass@db.abcdefghijklmnop.supabase.co:5432/postgres?sslmode=require"
+    ```
+  </Accordion>
+
+  <Accordion title="Azure Database">
+    **Provider ID:** `azure`
+
+    **With password:** Provide host, user, and password. SSL enforced.
+
+    **With Azure AD auth:** Omit the password. Mori obtains a token via `az account get-access-token`. Requires Azure CLI installed and authenticated (`az login`).
+
+    ```bash
+    mori init --from "postgres://user:pass@myserver.postgres.database.azure.com:5432/mydb"
+    ```
+  </Accordion>
+
+  <Accordion title="PlanetScale">
+    **Provider ID:** `planetscale`
+
+    Serverless MySQL. TLS always enabled — the provider hardcodes `tls=true` in the DSN.
+
+    ```bash
+    mori init --from "mysql://user:pass@aws.connect.psdb.cloud:3306/mydb"
+    ```
+  </Accordion>
+
+  <Accordion title="Vercel Postgres">
+    **Provider ID:** `vercel-postgres`
+
+    Powered by Neon. SSL enforced. Supports a `connection_url` extra field for the full URL.
+
+    <Tip>Copy the `POSTGRES_URL` from your Vercel project's environment variables.</Tip>
+
+    ```bash
+    mori init --from "postgres://user:pass@ep-something.us-east-1.aws.neon.tech:5432/verceldb?sslmode=require"
+    ```
+  </Accordion>
+
+  <Accordion title="DigitalOcean">
+    **Provider ID:** `digitalocean`
+
+    Non-standard defaults auto-applied: port `25060`, database `defaultdb`, user `doadmin`.
+
+    <Tip>Copy the connection string from the DigitalOcean dashboard under Databases > Connection Details.</Tip>
+
+    ```bash
+    mori init --from "postgres://doadmin:pass@db-postgresql-nyc1-12345-do-user-123456-0.b.db.ondigitalocean.com:25060/defaultdb?sslmode=require"
+    ```
+  </Accordion>
+
+  <Accordion title="Railway">
+    **Provider ID:** `railway`
+
+    One-click database deployments. SSL enforced. Supports a `connection_url` extra field.
+
+    <Tip>In the Railway dashboard, go to your database service and copy the connection string from the "Connect" tab.</Tip>
+
+    ```bash
+    mori init --from "postgres://postgres:pass@containers-us-west-123.railway.app:5432/railway"
+    ```
+  </Accordion>
+
+  <Accordion title="Upstash">
+    **Provider ID:** `upstash`
+
+    Serverless Redis. Always uses TLS — connection strings use `rediss://` (double `s`).
+
+    ```bash
+    mori init --from "rediss://default:pass@us1-shining-condor-12345.upstash.io:6379"
+    ```
+  </Accordion>
+
+  <Accordion title="Cloudflare D1 / KV">
+    **Provider ID:** `cloudflare`
+
+    Cloudflare D1 (SQLite at the edge) and Workers KV. Accessed via the Cloudflare API.
+
+    **Extra fields:**
+
+    | Field | Description |
+    |-------|-------------|
+    | `cf_account_id` | Cloudflare Account ID |
+    | `cf_database_id` | D1 Database ID |
+
+    ```bash
+    # Interactive setup required for API credentials
+    mori init
+    ```
+  </Accordion>
+
+  <Accordion title="Firebase / Firestore">
+    **Provider ID:** `firebase`
+
+    Google Cloud Firestore via Firebase. Provide a GCP project ID and optionally a service account credentials file.
+
+    **Fields:**
+
+    | Field | Description | Required |
+    |-------|-------------|----------|
+    | `project_id` | GCP Project ID | Yes |
+    | `credentials_file` | Path to service account JSON | No (uses ADC if omitted) |
+
+    <Tip>If `GOOGLE_APPLICATION_CREDENTIALS` is set, you can omit the credentials file.</Tip>
+
+    ```bash
+    mori init --from "firestore://my-project?credentials=./sa.json"
+    ```
+  </Accordion>
+</AccordionGroup>

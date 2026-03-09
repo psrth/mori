@@ -62,13 +62,13 @@ Mori sits between your application and two databases: the production database (r
 
 **Classifier** — Parses each query to determine operation type (`READ`, `WRITE`, `DDL`, `TRANSACTION`), affected tables, extractable primary keys, and whether it's a JOIN. Lightweight syntactic analysis — fast, sits in the hot path.
 
-**Router** — Takes classifier output + delta/tombstone state and selects an execution strategy. The core decision point.
+**Router** — Takes classifier output + [delta/tombstone state](/docs/concepts/components) and selects an execution [strategy](/docs/concepts/strategies). The core decision point.
 
-**Delta Manager** — Maintains the Delta Map and Tombstone Set. Supports transaction staging: additions are staged within a transaction, promoted on COMMIT, discarded on ROLLBACK.
+**[Delta Manager](/docs/concepts/components)** — Maintains the Delta Map and Tombstone Set. Supports transaction staging: additions are staged within a transaction, promoted on COMMIT, discarded on ROLLBACK.
 
-**Schema Registry** — Tracks per-table schema divergence. Used to adapt Prod rows during reads (inject NULLs for new columns, strip dropped columns, rename, cast types) and during hydration.
+**[Schema Registry](/docs/concepts/components#schema-registry)** — Tracks per-table schema divergence. Used to adapt Prod rows during reads (inject NULLs for new columns, strip dropped columns, rename, cast types) and during hydration.
 
-**Transaction Manager** — Per-connection transaction state. Coordinates transactions across Prod (read-only) and Shadow (read-write). Enforces staged delta semantics.
+**Transaction Manager** — Per-connection transaction state. Coordinates transactions across Prod (read-only) and Shadow (read-write). Enforces [staged delta semantics](/docs/concepts/strategies#transaction-management).
 
 **Engine Manager** — Connection pools to Prod and Shadow. Each app connection gets one dedicated Prod connection (read-only) and one dedicated Shadow connection (read-write).
 
@@ -76,18 +76,15 @@ Mori sits between your application and two databases: the production database (r
 
 **Write Engine** — INSERT (Shadow-only), UPDATE (hydrate + Shadow), DELETE (Shadow + tombstone). Coordinates with Delta Manager on every mutation.
 
-## Routing Table
+## Routing Overview
 
-| Operation | Condition | Strategy |
-|-----------|-----------|----------|
-| `SELECT` (single table) | No deltas/tombstones for table | **Prod Direct** — forward to Prod |
-| `SELECT` (single table) | Table has deltas or tombstones | **Merged Read** — query both, filter, adapt, merge |
-| `SELECT` (JOIN) | No table has deltas/tombstones | **Prod Direct** — forward to Prod |
-| `SELECT` (JOIN) | Any table has deltas/tombstones | **Join Patch** — execute on Prod, patch from Shadow |
-| `INSERT` | -- | **Shadow Write** — execute on Shadow only |
-| `UPDATE` | -- | **Hydrate + Shadow Write** — hydrate if needed, update Shadow |
-| `DELETE` | -- | **Shadow Delete** — delete from Shadow, add tombstone |
-| `DDL` | -- | **Shadow DDL** — execute on Shadow, update Schema Registry |
-| `BEGIN` | -- | Open transactions on both Prod and Shadow |
-| `COMMIT` | -- | Commit Shadow, close Prod, promote staged deltas |
-| `ROLLBACK` | -- | Rollback Shadow, close Prod, discard staged deltas |
+The Router decides which backend(s) handle each query based on the operation type and whether the affected tables have local changes. See the [Strategies](/docs/concepts/strategies) page for the complete routing decision matrix and detailed execution paths.
+
+| Operation | Clean Tables | Dirty Tables |
+|-----------|-------------|--------------|
+| `SELECT` | Prod Direct | Merged Read / Join Patch |
+| `INSERT` | Shadow Write | Shadow Write |
+| `UPDATE` | Hydrate + Shadow | Hydrate + Shadow |
+| `DELETE` | Shadow Delete | Shadow Delete |
+| `DDL` | Shadow DDL | Shadow DDL |
+| `BEGIN/COMMIT/ROLLBACK` | Both | Both |

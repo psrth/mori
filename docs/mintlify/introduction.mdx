@@ -19,12 +19,35 @@ The result: developers and AI agents test against real production data, mutate f
 - **MCP server** -- Built-in Model Context Protocol server for AI agent integration.
 - **Instant reset** -- Wipe shadow state and get a clean view of production in seconds.
 
+## Quick Links
+
+<CardGroup cols={3}>
+  <Card title="Quick Start" icon="rocket" href="/docs/quickstart">
+    Get Mori running in under 5 minutes.
+  </Card>
+  <Card title="Core Concepts" icon="diagram-project" href="/docs/concepts/architecture">
+    Architecture, components, and routing strategies.
+  </Card>
+  <Card title="Safety" icon="shield" href="/docs/concepts/safety">
+    How Mori guarantees production is never written to.
+  </Card>
+  <Card title="Motivation" icon="lightbulb" href="/docs/resources/motivation">
+    Why database virtualization exists.
+  </Card>
+  <Card title="Name" icon="tag" href="/docs/resources/name">
+    The meaning behind "mori".
+  </Card>
+  <Card title="Roadmap" icon="map" href="/docs/resources/roadmap">
+    What's coming next.
+  </Card>
+</CardGroup>
+
 ## Core Invariants
 
 These hold at all times, without exception.
 
 <Note>
-**Production is read-only.** Mori never issues a write to the upstream database. The prod connection is opened in read-only mode. There is no code path that writes to prod.
+**Production is read-only.** Mori never issues a write to the upstream database. A [multi-layer write guard](/docs/concepts/safety) enforces this invariant even if bugs exist in any single layer.
 </Note>
 
 <Note>
@@ -38,17 +61,3 @@ These hold at all times, without exception.
 <Note>
 **Reset is instant.** Wiping the shadow and its metadata restores a clean view of production. No migration, no rollback -- just a clean slate.
 </Note>
-
-## Terminology
-
-| Term | Definition |
-|------|-----------|
-| **Prod** | The upstream production database. Read-only from Mori's perspective. Source of truth for all unmodified data. |
-| **Shadow** | A local database instance (same engine and version as prod) holding all local mutations. Starts schema-only with zero rows -- a transparent overlay on prod. |
-| **Proxy** | The Mori process. Intercepts wire protocol traffic, classifies queries, routes them, merges results, manages state. |
-| **Delta Map** | Set of `(table, primary_key)` pairs identifying locally modified rows. When a row is delta, shadow holds the authoritative version. |
-| **Tombstone Set** | Set of `(table, primary_key)` pairs identifying locally deleted rows. Tombstoned rows are filtered from prod results. |
-| **Schema Registry** | Record of structural differences between shadow and prod schemas, introduced by local DDL. Tracks added/dropped/renamed columns and type changes per table. |
-| **Hydration** | Copying a row from prod into shadow so it can be mutated locally. Happens transparently on UPDATE/DELETE of rows that only exist in prod. |
-| **Classification** | Parsing an incoming statement to determine operation type (READ, WRITE, DDL, TRANSACTION), affected tables, and extractable PKs. |
-| **Merged Read** | A read where results from both prod and shadow are combined, with delta/tombstoned rows filtered from prod results. |

@@ -4,17 +4,31 @@ description: "Get Mori running in under 5 minutes."
 sidebarTitle: "Quick Start"
 ---
 
-## Prerequisites
+## For AI Agents
+
+If you're setting up Mori with an AI coding agent, download the [`agents.md`](https://github.com/psrth/mori/blob/main/agents.md) file and add it to your project root. Point your agent at it -- it contains everything needed to build, initialize, and start Mori.
+
+```bash
+curl -o agents.md https://raw.githubusercontent.com/psrth/mori/main/agents.md
+```
+
+Your agent can read `agents.md` and handle the rest autonomously.
+
+---
+
+## Manual Setup
+
+### Prerequisites
 
 - **Go 1.21+** (for building from source)
 - **Docker** (for shadow containers -- required for all engines except SQLite and DuckDB)
 
-## Setup
+### Steps
 
 <Steps>
   <Step title="Build from source">
     ```bash
-    git clone https://github.com/mori-dev/mori.git
+    git clone https://github.com/psrth/mori.git
     cd mori
     go build -o mori ./cmd/mori
     ```
@@ -55,7 +69,7 @@ sidebarTitle: "Quick Start"
     ```bash
     ./mori start
     ```
-    Mori listens on the same port as your database engine's default (e.g., 5432 for PostgreSQL, 3306 for MySQL, 6379 for Redis).
+    Mori listens on a local port. Use `--port` to pick a specific one, or let Mori auto-assign.
   </Step>
   <Step title="Point your app at Mori">
     Swap your application's connection string to point at `127.0.0.1` on the proxy port. Same driver, same protocol -- your app won't know the difference.

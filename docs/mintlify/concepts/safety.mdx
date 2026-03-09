@@ -1,0 +1,53 @@
+---
+title: "Safety"
+description: "The multi-layer defense system that ensures production is never written to."
+sidebarTitle: "Safety"
+---
+
+## Core Invariant
+
+<Warning>
+**Production is read-only.** Mori never issues a write to the upstream database. The prod connection is opened in read-only mode. There is no code path that writes to prod.
+</Warning>
+
+This is not a single check — it's a defense-in-depth system. Four independent layers each prevent writes from reaching production. Even if bugs exist in the router or any single layer, the remaining layers catch it.
+
+## The Four Layers
+
+<Steps>
+  <Step title="Strict Mode">
+    Refuse to serve any requests if the Shadow database is unavailable. Without Shadow, writes have nowhere to go — so Mori shuts down rather than risk routing to Prod.
+  </Step>
+  <Step title="L1: Routing Assertion">
+    After the Router selects a strategy, verify that write and DDL operations **never** receive the `ProdDirect` strategy. If they do, the request is blocked before execution and a CRITICAL error is logged.
+  </Step>
+  <Step title="L2: Connection Wrapper">
+    Inspect outbound bytes on the Prod connection. If the payload contains write SQL (INSERT, UPDATE, DELETE, DDL), the connection wrapper blocks it. This catches bugs where the Router incorrectly assigns a strategy.
+  </Step>
+  <Step title="L3: Dispatch Gate">
+    Final check at the point of execution. If a write or DDL operation reaches `targetProd` in the dispatch layer, it is blocked and returns an error. This is the last line of defense.
+  </Step>
+</Steps>
+
+## Write Detection
+
+The connection wrapper (L2) inspects outgoing SQL for mutation patterns:
+
+**Blocked prefixes:** INSERT, UPDATE, DELETE, TRUNCATE, CREATE, ALTER, DROP, GRANT, REVOKE
+
+**CTE writes:** Detects `WITH ... INSERT/UPDATE/DELETE` patterns
+
+**Safe prefixes:** SELECT, SET, SHOW, EXPLAIN, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, LISTEN, PREPARE, EXECUTE, DEALLOCATE, DECLARE, FETCH, CLOSE
+
+## NoSQL Engines
+
+For NoSQL engines, the write guard is adapted to the protocol:
+
+- **Redis**: Inspects commands for mutating operations (`SET`, `DEL`, `HSET`, `LPUSH`, etc.) on the Prod connection
+- **Firestore**: Intercepts write RPCs (`Create`, `Update`, `Delete`, `Commit`, `BatchWrite`) before they reach the Prod client
+
+The principle is the same: multiple independent layers, each capable of blocking writes to production on its own.
+
+## Error Response
+
+When a write guard triggers, the client receives an error response with SQLSTATE code `MR001` (Mori write guard violation). The client connection remains open — only the offending query is rejected.
