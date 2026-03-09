@@ -29,12 +29,13 @@ type Proxy struct {
 	port       int
 	verbose    bool
 
-	deltaMap       *delta.Map
-	tombstones     *delta.TombstoneSet
-	tables         map[string]schema.TableMeta
-	schemaRegistry *coreSchema.Registry
-	moriDir        string
-	logger         *logging.Logger
+	deltaMap        *delta.Map
+	tombstones      *delta.TombstoneSet
+	tables          map[string]schema.TableMeta
+	schemaRegistry  *coreSchema.Registry
+	moriDir         string
+	logger          *logging.Logger
+	maxRowsHydrate  int
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -70,6 +71,12 @@ func New(prodDSN, shadowDSN string, listenPort int, verbose bool,
 	}
 }
 
+// SetMaxRowsHydrate configures the maximum number of rows that can be hydrated
+// from Prod in a single operation. 0 means unlimited.
+func (p *Proxy) SetMaxRowsHydrate(n int) {
+	p.maxRowsHydrate = n
+}
+
 // ListenAndServe opens the SQLite databases, binds the TCP listener,
 // and enters the accept loop.
 func (p *Proxy) ListenAndServe(ctx context.Context) error {
@@ -97,6 +104,21 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 		}
 		p.shadowDB.Exec("PRAGMA journal_mode=WAL")
 		p.shadowDB.Exec("PRAGMA foreign_keys=OFF")
+	}
+
+	// P1 2.5: Discover foreign keys from the prod database and register them.
+	if p.schemaRegistry != nil && p.prodDB != nil {
+		var tableNames []string
+		for name := range p.tables {
+			tableNames = append(tableNames, name)
+		}
+		if err := DetectForeignKeys(ctx, p.prodDB, p.schemaRegistry, tableNames); err != nil {
+			if p.verbose {
+				log.Printf("FK discovery warning: %v", err)
+			}
+		} else if p.verbose && len(tableNames) > 0 {
+			log.Printf("FK discovery complete for %d tables", len(tableNames))
+		}
 	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", p.port)
