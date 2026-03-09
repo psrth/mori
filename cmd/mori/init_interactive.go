@@ -439,29 +439,33 @@ func saveConnection(projectRoot string, existingCfg *config.ProjectConfig,
 
 	fmt.Println()
 	ui.StepDone(fmt.Sprintf("Connection %s saved to mori.yaml", ui.Cyan(connName)))
-	ui.Info(fmt.Sprintf("Engine:   %s", engine.DisplayName))
+
+	const labelW = 8
+	var boxLines []string
+	boxLines = append(boxLines, ui.BoxLine("Engine", engine.DisplayName, labelW))
 	if p, ok := registry.ProviderByID(registry.ProviderID(providerID)); ok {
-		ui.Info(fmt.Sprintf("Provider: %s", p.DisplayName))
+		boxLines = append(boxLines, ui.BoxLine("Provider", p.DisplayName, labelW))
 	}
 	if conn.Host != "" {
-		ui.Info(fmt.Sprintf("Host:     %s", conn.Host))
+		boxLines = append(boxLines, ui.BoxLine("Host", conn.Host, labelW))
 	}
 	if conn.Database != "" {
-		ui.Info(fmt.Sprintf("Database: %s", conn.Database))
+		boxLines = append(boxLines, ui.BoxLine("Database", conn.Database, labelW))
 	}
 	if conn.Tunnel != nil {
 		if t, ok := tunnel.Lookup(conn.Tunnel.Type); ok {
-			ui.Info(fmt.Sprintf("Tunnel:   %s", t.DisplayName()))
+			boxLines = append(boxLines, ui.BoxLine("Tunnel", t.DisplayName(), labelW))
 		}
 	}
+
+	fmt.Println(ui.Box(connName, strings.Join(boxLines, "\n")))
+
 	if engine.Supported {
+		fmt.Println()
 		ui.Info(fmt.Sprintf("Next: run 'mori start %s' to begin proxying.", connName))
 	} else {
-		ui.Info(fmt.Sprintf("Note: %s support is coming soon. Config saved for future use.", engine.DisplayName))
-	}
-
-	if !engine.Supported {
-		fmt.Printf("\n  %s is not yet supported — config will be saved for future use.\n", engine.DisplayName)
+		fmt.Println()
+		ui.Info(fmt.Sprintf("%s is not yet supported — config saved for future use.", engine.DisplayName))
 	}
 	fmt.Println()
 
@@ -521,8 +525,12 @@ func buildFieldInputs(fields []registry.ConnectionField, fieldPtrs []*string) *h
 			}
 		}
 
+		title := f.Label
+		if !f.Required {
+			title += ui.Dim(" (optional)")
+		}
 		input := huh.NewInput().
-			Title(f.Label).
+			Title(title).
 			Inline(true).
 			Prompt("> ").
 			Placeholder(placeholder).

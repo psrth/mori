@@ -110,8 +110,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 6. Check if this connection is already running.
 	connDir := config.ConnDir(projectRoot, connName)
 	pidPath := config.ConnPidFilePath(projectRoot, connName)
-	if pid, running := isProxyRunning(pidPath); running {
-		return fmt.Errorf("connection %q is already running (PID %d) — run 'mori stop %s' first", connName, pid, connName)
+	if _, running := isProxyRunning(pidPath); running {
+		return fmt.Errorf("connection %q is already running — run 'mori stop %s' first, or 'mori status' to see details", connName, connName)
 	}
 
 	// 7. Start tunnel if configured.
@@ -248,7 +248,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		if pid, err := strconv.Atoi(string(data)); err == nil {
 			if process, err := os.FindProcess(pid); err == nil {
 				if err := process.Signal(syscall.Signal(0)); err == nil {
-					return fmt.Errorf("mori proxy already running (PID %d) — run 'mori stop %s' first", pid, connName)
+					return fmt.Errorf("mori proxy already running — run 'mori stop %s' first", connName)
 				}
 			}
 		}
@@ -374,12 +374,25 @@ func runStart(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	ui.StepDone(fmt.Sprintf("Proxy listening on 127.0.0.1:%d %s %s", port, ui.IconArrow, prodAddr))
-	ui.Info(fmt.Sprintf("Prod:   %s", cfg.RedactedProdConnection()))
-	ui.Info(fmt.Sprintf("Shadow: %s", shadowAddr))
-	if mcpEnabled {
-		ui.Info(fmt.Sprintf("MCP:    http://127.0.0.1:%d/mcp", mcpPort))
+	// Build box content.
+	labelW := 7 // "Shadow " is the longest label
+	boxLines := []string{
+		ui.BoxLine("Proxy", fmt.Sprintf("127.0.0.1:%d", port), labelW),
+		ui.BoxLine("Prod", cfg.RedactedProdConnection(), labelW),
+		ui.BoxLine("Shadow", shadowAddr, labelW),
 	}
+	if mcpEnabled {
+		boxLines = append(boxLines, ui.BoxLine("MCP", fmt.Sprintf("http://127.0.0.1:%d/mcp", mcpPort), labelW))
+	}
+
+	fmt.Println()
+	fmt.Println(ui.Box(connName, strings.Join(boxLines, "\n")))
+	fmt.Println()
+
+	// Show copyable connection string for the app.
+	appConnStr := fmt.Sprintf("%s://%s@127.0.0.1:%d/%s", cfg.Engine, connInfo.User, port, connInfo.DBName)
+	ui.Info(fmt.Sprintf("Connect your app: %s", ui.Cyan(appConnStr)))
+
 	if verbose {
 		ui.Info("Verbose logging enabled.")
 	}

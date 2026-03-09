@@ -11,17 +11,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/logging"
+	"github.com/mori-dev/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 
 var logCmd = &cobra.Command{
-	Use:   "log",
+	Use:   "log [connection-name]",
 	Short: "Show proxy activity log",
 	Long: `Stream or dump recent proxy activity: queries, routing decisions,
 hydration events, and timing information. Useful for debugging and
 understanding how Mori routes your application's queries.`,
+	Args: cobra.MaximumNArgs(1),
 	RunE: runLog,
 }
 
@@ -38,11 +41,13 @@ func runLog(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to determine project root: %w", err)
 	}
-	if !config.IsInitialized(projectRoot) {
-		return fmt.Errorf("mori is not initialized — run 'mori init --from <conn_string>' first")
+
+	connName, err := resolveInitializedConnection(projectRoot, args)
+	if err != nil {
+		return err
 	}
 
-	logPath := config.LogFilePath(projectRoot)
+	logPath := config.ConnLogFilePath(projectRoot, connName)
 	if _, err := os.Stat(logPath); os.IsNotExist(err) {
 		fmt.Println("No log file found. Start the proxy with 'mori start' to generate logs.")
 		return nil
@@ -136,13 +141,13 @@ func printLogEntry(line string) {
 	ts := entry.Timestamp.Local().Format("15:04:05.000")
 
 	var parts []string
-	parts = append(parts, ts)
+	parts = append(parts, ui.Dim(ts))
 
 	if entry.ConnID > 0 {
-		parts = append(parts, fmt.Sprintf("[conn %d]", entry.ConnID))
+		parts = append(parts, ui.Dim(fmt.Sprintf("[conn %d]", entry.ConnID)))
 	}
 
-	parts = append(parts, strings.ToUpper(entry.Event))
+	parts = append(parts, ui.Bold(strings.ToUpper(entry.Event)))
 
 	if entry.OpType != "" {
 		routeInfo := entry.OpType
@@ -155,11 +160,17 @@ func printLogEntry(line string) {
 		if entry.Strategy != "" {
 			routeInfo += " -> " + entry.Strategy
 		}
-		parts = append(parts, routeInfo)
+		if strings.Contains(routeInfo, "prod") {
+			parts = append(parts, ui.Green(routeInfo))
+		} else if strings.Contains(routeInfo, "shadow") {
+			parts = append(parts, ui.Yellow(routeInfo))
+		} else {
+			parts = append(parts, routeInfo)
+		}
 	}
 
 	if entry.DurationMs > 0 {
-		parts = append(parts, fmt.Sprintf("%.1fms", entry.DurationMs))
+		parts = append(parts, ui.Cyan(fmt.Sprintf("%.1fms", entry.DurationMs)))
 	}
 
 	if entry.Detail != "" {
@@ -167,7 +178,7 @@ func printLogEntry(line string) {
 	}
 
 	if entry.Error != "" {
-		parts = append(parts, "error="+entry.Error)
+		parts = append(parts, ui.Red("error="+entry.Error))
 	}
 
 	fmt.Println(strings.Join(parts, "  "))
@@ -178,7 +189,7 @@ func printLogEntry(line string) {
 		if len(sql) > 120 {
 			sql = sql[:120] + "..."
 		}
-		fmt.Printf("  %s\n", sql)
+		fmt.Printf("  %s\n", ui.Dim(sql))
 	}
 }
 
@@ -190,20 +201,67 @@ func followLog(logPath string) error {
 	}
 	defer f.Close()
 
-	// Seek to end.
 	if _, err := f.Seek(0, io.SeekEnd); err != nil {
 		return err
 	}
 
 	reader := bufio.NewReader(f)
 
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		// Fall back to polling if fsnotify fails.
+		return followLogPoll(f, reader)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(logPath); err != nil {
+		return followLogPoll(f, reader)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	fmt.Println("--- following log (Ctrl+C to stop) ---")
+
+	for {
+		select {
+		case <-sigCh:
+			fmt.Println()
+			return nil
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+			if event.Has(fsnotify.Write) {
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						break
+					}
+					line = strings.TrimSpace(line)
+					if line != "" {
+						printLogEntry(line)
+					}
+				}
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "watcher error: %v\n", err)
+		}
+	}
+}
+
+// followLogPoll is the fallback polling implementation.
+func followLogPoll(_ *os.File, reader *bufio.Reader) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	fmt.Println("--- following log (Ctrl+C to stop) ---")
+
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -214,7 +272,7 @@ func followLog(logPath string) error {
 			for {
 				line, err := reader.ReadString('\n')
 				if err != nil {
-					break // no more data yet
+					break
 				}
 				line = strings.TrimSpace(line)
 				if line != "" {
