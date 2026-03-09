@@ -52,7 +52,7 @@ func TestClassify_Writes(t *testing.T) {
 		{"update", "UPDATE users SET name = 'bob' WHERE id = 1", core.OpWrite, core.SubUpdate},
 		{"delete", "DELETE FROM users WHERE id = 1", core.OpWrite, core.SubDelete},
 		{"replace", "REPLACE INTO users (id, name) VALUES (1, 'alice')", core.OpWrite, core.SubInsert},
-		{"truncate", "TRUNCATE TABLE users", core.OpWrite, core.SubOther},
+		{"truncate", "TRUNCATE TABLE users", core.OpWrite, core.SubTruncate},
 	}
 
 	for _, tt := range tests {
@@ -85,6 +85,8 @@ func TestClassify_DDL(t *testing.T) {
 		{"drop table", "DROP TABLE users", core.OpDDL, core.SubDrop},
 		{"drop if exists", "DROP TABLE IF EXISTS users", core.OpDDL, core.SubDrop},
 		{"create index", "CREATE INDEX idx_name ON users (name)", core.OpDDL, core.SubCreate},
+		{"rename table", "RENAME TABLE users TO users_old", core.OpDDL, core.SubAlter},
+		{"rename table backtick", "RENAME TABLE `users` TO `users_archive`", core.OpDDL, core.SubAlter},
 	}
 
 	for _, tt := range tests {
@@ -135,14 +137,16 @@ func TestClassify_Transactions(t *testing.T) {
 func TestClassify_Other(t *testing.T) {
 	c := New(nil)
 	tests := []struct {
-		name string
-		sql  string
+		name    string
+		sql     string
+		wantOp  core.OpType
+		wantSub core.SubType
 	}{
-		{"set", "SET NAMES utf8mb4"},
-		{"show", "SHOW TABLES"},
-		{"explain", "EXPLAIN SELECT * FROM users"},
-		{"describe", "DESCRIBE users"},
-		{"use", "USE mydb"},
+		{"set", "SET NAMES utf8mb4", core.OpOther, core.SubSet},
+		{"show", "SHOW TABLES", core.OpOther, core.SubShow},
+		{"explain", "EXPLAIN SELECT * FROM users", core.OpOther, core.SubExplain},
+		{"describe", "DESCRIBE users", core.OpOther, core.SubExplain},
+		{"use", "USE mydb", core.OpOther, core.SubOther},
 	}
 
 	for _, tt := range tests {
@@ -151,8 +155,58 @@ func TestClassify_Other(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Classify(%q) error: %v", tt.sql, err)
 			}
-			if cl.OpType != core.OpOther {
-				t.Errorf("OpType = %v, want OpOther", cl.OpType)
+			if cl.OpType != tt.wantOp {
+				t.Errorf("OpType = %v, want %v", cl.OpType, tt.wantOp)
+			}
+			if cl.SubType != tt.wantSub {
+				t.Errorf("SubType = %v, want %v", cl.SubType, tt.wantSub)
+			}
+		})
+	}
+}
+
+func TestClassify_ExplainAnalyze(t *testing.T) {
+	c := New(nil)
+	cl, err := c.Classify("EXPLAIN ANALYZE SELECT * FROM users")
+	if err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+	if cl.OpType != core.OpOther {
+		t.Errorf("OpType = %v, want OpOther", cl.OpType)
+	}
+	if cl.SubType != core.SubNotSupported {
+		t.Errorf("SubType = %v, want SubNotSupported", cl.SubType)
+	}
+	if cl.NotSupportedMsg == "" {
+		t.Error("NotSupportedMsg should not be empty for EXPLAIN ANALYZE")
+	}
+}
+
+func TestClassify_Savepoint(t *testing.T) {
+	c := New(nil)
+	tests := []struct {
+		name    string
+		sql     string
+		wantOp  core.OpType
+		wantSub core.SubType
+	}{
+		{"savepoint", "SAVEPOINT sp1", core.OpTransaction, core.SubSavepoint},
+		{"release savepoint", "RELEASE SAVEPOINT sp1", core.OpTransaction, core.SubRelease},
+		{"rollback to", "ROLLBACK TO sp1", core.OpTransaction, core.SubRollback},
+		{"rollback to savepoint", "ROLLBACK TO SAVEPOINT sp1", core.OpTransaction, core.SubRollback},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl, err := c.Classify(tt.sql)
+			if err != nil {
+				t.Fatalf("Classify(%q) error: %v", tt.sql, err)
+			}
+			if cl.OpType != tt.wantOp {
+				t.Errorf("OpType = %v, want %v", cl.OpType, tt.wantOp)
+			}
+			if cl.SubType != tt.wantSub {
+				t.Errorf("SubType = %v, want %v", cl.SubType, tt.wantSub)
 			}
 		})
 	}
@@ -172,6 +226,7 @@ func TestClassify_TableExtraction(t *testing.T) {
 		{"delete", "DELETE FROM logs WHERE created_at < '2024-01-01'", []string{"logs"}},
 		{"create", "CREATE TABLE items (id INT PRIMARY KEY)", []string{"items"}},
 		{"backtick quoted", "SELECT * FROM `users`", []string{"users"}},
+		{"rename table", "RENAME TABLE users TO users_old", []string{"users"}},
 	}
 
 	for _, tt := range tests {

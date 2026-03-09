@@ -31,6 +31,7 @@ type Proxy struct {
 	tables         map[string]schema.TableMeta
 	schemaRegistry *coreSchema.Registry
 	moriDir        string
+	maxRowsHydrate int
 	logger         *logging.Logger
 
 	listenerMu sync.Mutex
@@ -49,6 +50,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	tables map[string]schema.TableMeta, moriDir string,
 	schemaRegistry *coreSchema.Registry,
 	logger *logging.Logger,
+	maxRowsHydrate int,
 ) *Proxy {
 	return &Proxy{
 		prodAddr:       prodAddr,
@@ -63,6 +65,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		tables:         tables,
 		schemaRegistry: schemaRegistry,
 		moriDir:        moriDir,
+		maxRowsHydrate: maxRowsHydrate,
 		logger:         logger,
 		shutdownCh:     make(chan struct{}),
 	}

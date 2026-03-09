@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/engine/mysql/connstr"
 )
 
@@ -61,26 +63,58 @@ func StripForeignKeys(schemaSQL string) string {
 	return strings.Join(result, "\n")
 }
 
+// retryOnLockConflict retries a function on MySQL lock-related errors.
+// Retries up to maxRetries times with exponential backoff starting at 200ms.
+func retryOnLockConflict(fn func() error, maxRetries int) error {
+	var err error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if !isLockConflict(err) {
+			return err
+		}
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(200*(attempt+1)) * time.Millisecond)
+		}
+	}
+	return err
+}
+
+func isLockConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "1205") || strings.Contains(s, "1213") ||
+		strings.Contains(s, "Lock wait timeout") || strings.Contains(s, "Deadlock")
+}
+
 // DetectTableMetadata queries the MySQL INFORMATION_SCHEMA for all user tables
 // and their PK info.
 func DetectTableMetadata(ctx context.Context, db *sql.DB, dbName string) (map[string]TableMeta, error) {
-	rows, err := db.QueryContext(ctx,
-		"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
-		dbName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query tables: %w", err)
-	}
-	defer rows.Close()
-
 	var tableNames []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("failed to scan table name: %w", err)
+	err := retryOnLockConflict(func() error {
+		tableNames = nil
+		rows, err := db.QueryContext(ctx,
+			"SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+			dbName)
+		if err != nil {
+			return fmt.Errorf("failed to query tables: %w", err)
 		}
-		tableNames = append(tableNames, name)
-	}
-	if err := rows.Err(); err != nil {
+		defer rows.Close()
+
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return fmt.Errorf("failed to scan table name: %w", err)
+			}
+			tableNames = append(tableNames, name)
+		}
+		return rows.Err()
+	}, 5)
+	if err != nil {
 		return nil, err
 	}
 
@@ -178,6 +212,41 @@ func classifyPKType(dataTypes []string, extras []string) string {
 	return dt
 }
 
+// DetectGeneratedColumns queries INFORMATION_SCHEMA for columns with GENERATED expressions
+// and populates the GeneratedCols field in the provided tables map.
+func DetectGeneratedColumns(ctx context.Context, db *sql.DB, dbName string, tables map[string]TableMeta) error {
+	return retryOnLockConflict(func() error {
+		query := `SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+			WHERE TABLE_SCHEMA = ? AND EXTRA LIKE '%GENERATED%'`
+		rows, err := db.QueryContext(ctx, query, dbName)
+		if err != nil {
+			return fmt.Errorf("detect generated columns: %w", err)
+		}
+		defer rows.Close()
+
+		// Clear any previously accumulated generated cols on retry.
+		for tbl, meta := range tables {
+			if len(meta.GeneratedCols) > 0 {
+				meta.GeneratedCols = nil
+				tables[tbl] = meta
+			}
+		}
+
+		for rows.Next() {
+			var tableName, colName string
+			if err := rows.Scan(&tableName, &colName); err != nil {
+				return fmt.Errorf("scan generated column: %w", err)
+			}
+			tableName = strings.ToLower(tableName)
+			if meta, ok := tables[tableName]; ok {
+				meta.GeneratedCols = append(meta.GeneratedCols, colName)
+				tables[tableName] = meta
+			}
+		}
+		return rows.Err()
+	}, 5)
+}
+
 // ApplySchema connects to Shadow MySQL and executes the schema SQL.
 func ApplySchema(ctx context.Context, db *sql.DB, schemaSQL string) error {
 	// Split by semicolons and execute each statement.
@@ -260,15 +329,21 @@ func DetectAutoIncrementOffsets(ctx context.Context, db *sql.DB, tables map[stri
 		}
 
 		pkCol := meta.PKColumns[0]
-		var maxVal sql.NullInt64
-		query := fmt.Sprintf("SELECT MAX(`%s`) FROM `%s`", pkCol, tableName)
-		if err := db.QueryRowContext(ctx, query).Scan(&maxVal); err != nil {
-			return nil, fmt.Errorf("failed to get max PK for table %q: %w", tableName, err)
-		}
-
-		prodMax := int64(0)
-		if maxVal.Valid {
-			prodMax = maxVal.Int64
+		var prodMax int64
+		err := retryOnLockConflict(func() error {
+			var maxVal sql.NullInt64
+			query := fmt.Sprintf("SELECT MAX(`%s`) FROM `%s`", pkCol, tableName)
+			if err := db.QueryRowContext(ctx, query).Scan(&maxVal); err != nil {
+				return fmt.Errorf("failed to get max PK for table %q: %w", tableName, err)
+			}
+			prodMax = 0
+			if maxVal.Valid {
+				prodMax = maxVal.Int64
+			}
+			return nil
+		}, 5)
+		if err != nil {
+			return nil, err
 		}
 
 		offsets[tableName] = computeOffset(prodMax)
@@ -283,6 +358,86 @@ func computeOffset(prodMax int64) int64 {
 		return a
 	}
 	return b
+}
+
+// DetectForeignKeys queries INFORMATION_SCHEMA for foreign key constraints
+// and records them in the schema registry.
+func DetectForeignKeys(ctx context.Context, db *sql.DB, dbName string, registry *coreSchema.Registry) error {
+	type fkData struct {
+		constraintName string
+		childTable     string
+		childColumns   []string
+		parentTable    string
+		parentColumns  []string
+		onDelete       string
+		onUpdate       string
+	}
+
+	var fkMap map[string]*fkData
+	var fkOrder []string
+
+	err := retryOnLockConflict(func() error {
+		query := `SELECT kcu.CONSTRAINT_NAME, kcu.TABLE_NAME, kcu.COLUMN_NAME,
+			kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME,
+			rc.DELETE_RULE, rc.UPDATE_RULE
+		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+		JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+			ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+			AND kcu.CONSTRAINT_SCHEMA = rc.CONSTRAINT_SCHEMA
+		WHERE kcu.TABLE_SCHEMA = ? AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+		ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION`
+
+		rows, err := db.QueryContext(ctx, query, dbName)
+		if err != nil {
+			return fmt.Errorf("detect foreign keys: %w", err)
+		}
+		defer rows.Close()
+
+		fkMap = make(map[string]*fkData)
+		fkOrder = nil
+
+		for rows.Next() {
+			var constraintName, childTable, childCol, parentTable, parentCol, deleteRule, updateRule string
+			if err := rows.Scan(&constraintName, &childTable, &childCol, &parentTable, &parentCol, &deleteRule, &updateRule); err != nil {
+				return fmt.Errorf("scan foreign key: %w", err)
+			}
+			key := childTable + "." + constraintName
+			fd, ok := fkMap[key]
+			if !ok {
+				fd = &fkData{
+					constraintName: constraintName,
+					childTable:     childTable,
+					parentTable:    parentTable,
+					onDelete:       deleteRule,
+					onUpdate:       updateRule,
+				}
+				fkMap[key] = fd
+				fkOrder = append(fkOrder, key)
+			}
+			fd.childColumns = append(fd.childColumns, childCol)
+			fd.parentColumns = append(fd.parentColumns, parentCol)
+		}
+		return rows.Err()
+	}, 5)
+	if err != nil {
+		return err
+	}
+
+	for _, key := range fkOrder {
+		fd := fkMap[key]
+		fk := coreSchema.ForeignKey{
+			ConstraintName: fd.constraintName,
+			ChildTable:     fd.childTable,
+			ChildColumns:   fd.childColumns,
+			ParentTable:    fd.parentTable,
+			ParentColumns:  fd.parentColumns,
+			OnDelete:       fd.onDelete,
+			OnUpdate:       fd.onUpdate,
+		}
+		registry.RecordForeignKey(fd.childTable, fk)
+	}
+
+	return nil
 }
 
 // ApplyAutoIncrementOffsets sets the AUTO_INCREMENT values on Shadow tables.

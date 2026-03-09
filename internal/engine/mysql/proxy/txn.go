@@ -4,25 +4,40 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
+	coreSchema "github.com/mori-dev/mori/internal/core/schema"
 	"github.com/mori-dev/mori/internal/logging"
 )
+
+// savepointSnapshot captures the delta/tombstone/insert/schema state at the time
+// a SAVEPOINT is created, so it can be restored on ROLLBACK TO.
+type savepointSnapshot struct {
+	name       string
+	deltaSnap  map[string][]string
+	tombSnap   map[string][]string
+	insertSnap map[string]int
+	schemaSnap map[string]*coreSchema.TableDiff
+}
 
 // TxnHandler manages transaction state for a single MySQL connection.
 // It coordinates BEGIN/COMMIT/ROLLBACK across both Prod and Shadow backends
 // and controls delta/tombstone staging.
 type TxnHandler struct {
-	prodConn   net.Conn
-	shadowConn net.Conn
-	deltaMap   *delta.Map
-	tombstones *delta.TombstoneSet
-	moriDir    string
-	connID     int64
-	verbose    bool
-	logger     *logging.Logger
-	inTxn      bool
+	prodConn        net.Conn
+	shadowConn      net.Conn
+	deltaMap        *delta.Map
+	tombstones      *delta.TombstoneSet
+	schemaRegistry  *coreSchema.Registry
+	moriDir         string
+	connID          int64
+	verbose         bool
+	logger          *logging.Logger
+	inTxn           bool
+	beginSchemaSnap map[string]*coreSchema.TableDiff // schema state at BEGIN
+	savepointStack  []savepointSnapshot
 }
 
 // InTxn reports whether this connection is inside an explicit transaction.
@@ -42,9 +57,17 @@ func (th *TxnHandler) HandleTxn(
 	case core.SubCommit:
 		return th.handleCommit(clientConn, rawPkt)
 	case core.SubRollback:
+		// Distinguish full ROLLBACK from ROLLBACK TO SAVEPOINT.
+		if isRollbackTo(cl.RawSQL) {
+			return th.handleRollbackTo(clientConn, rawPkt, cl.RawSQL)
+		}
 		return th.handleRollback(clientConn, rawPkt)
+	case core.SubSavepoint:
+		return th.handleSavepoint(clientConn, rawPkt, cl.RawSQL)
+	case core.SubRelease:
+		return th.handleRelease(clientConn, rawPkt, cl.RawSQL)
 	default:
-		// SAVEPOINT, RELEASE, etc. — forward to both backends without state change.
+		// Forward to both backends without state change.
 		return th.forwardToBoth(clientConn, rawPkt)
 	}
 }
@@ -76,6 +99,10 @@ func (th *TxnHandler) handleBegin(clientConn net.Conn, rawPkt []byte) error {
 
 	if !hadProdError {
 		th.inTxn = true
+		// Snapshot schema registry state so we can restore on ROLLBACK.
+		if th.schemaRegistry != nil {
+			th.beginSchemaSnap = th.schemaRegistry.SnapshotAll()
+		}
 		if th.verbose {
 			log.Printf("[conn %d] BEGIN: Shadow=ok Prod=ok", th.connID)
 		}
@@ -100,6 +127,8 @@ func (th *TxnHandler) handleCommit(clientConn net.Conn, rawPkt []byte) error {
 	}
 
 	th.inTxn = false
+	th.savepointStack = nil  // Clear savepoint stack on commit.
+	th.beginSchemaSnap = nil // Schema changes are now permanent.
 
 	// Only promote staged deltas if both backends committed successfully.
 	if !shadowHadError && !prodHadError {
@@ -149,17 +178,185 @@ func (th *TxnHandler) handleRollback(clientConn net.Conn, rawPkt []byte) error {
 	}
 
 	th.inTxn = false
+	th.savepointStack = nil // Clear savepoint stack on full rollback.
 
 	// Discard staged entries.
 	th.deltaMap.Rollback()
 	th.tombstones.Rollback()
 
+	// Restore schema registry to pre-BEGIN state so rolled-back DDL
+	// doesn't leave stale schema diffs.
+	if th.schemaRegistry != nil && th.beginSchemaSnap != nil {
+		th.schemaRegistry.RestoreAll(th.beginSchemaSnap)
+		th.beginSchemaSnap = nil
+		if err := coreSchema.WriteRegistry(th.moriDir, th.schemaRegistry); err != nil {
+			if th.verbose {
+				log.Printf("[conn %d] failed to persist schema registry after ROLLBACK: %v", th.connID, err)
+			}
+		}
+	}
+
 	if th.verbose {
-		log.Printf("[conn %d] ROLLBACK: staged deltas discarded", th.connID)
+		log.Printf("[conn %d] ROLLBACK: staged deltas and schema changes discarded", th.connID)
 	}
 	th.logger.Event(th.connID, "txn", "ROLLBACK")
 
 	return nil
+}
+
+// handleSavepoint pushes a snapshot of the current delta/tombstone/insert/schema
+// state onto the savepoint stack, then forwards SAVEPOINT to both backends.
+func (th *TxnHandler) handleSavepoint(clientConn net.Conn, rawPkt []byte, rawSQL string) error {
+	// Forward to both backends first.
+	if err := th.forwardToBoth(clientConn, rawPkt); err != nil {
+		return err
+	}
+
+	name := parseSavepointName(rawSQL)
+	snap := savepointSnapshot{
+		name:       name,
+		deltaSnap:  th.deltaMap.SnapshotAll(),
+		tombSnap:   th.tombstones.SnapshotAll(),
+		insertSnap: th.deltaMap.SnapshotInsertedTables(),
+	}
+	if th.schemaRegistry != nil {
+		snap.schemaSnap = th.schemaRegistry.SnapshotAll()
+	}
+	th.savepointStack = append(th.savepointStack, snap)
+
+	if th.verbose {
+		log.Printf("[conn %d] SAVEPOINT %s: snapshot pushed (depth=%d)",
+			th.connID, name, len(th.savepointStack))
+	}
+	th.logger.Event(th.connID, "txn", fmt.Sprintf("SAVEPOINT %s", name))
+	return nil
+}
+
+// handleRelease pops the matching savepoint snapshot from the stack (discards it),
+// then forwards RELEASE to both backends.
+func (th *TxnHandler) handleRelease(clientConn net.Conn, rawPkt []byte, rawSQL string) error {
+	if err := th.forwardToBoth(clientConn, rawPkt); err != nil {
+		return err
+	}
+
+	name := parseReleaseName(rawSQL)
+	// Pop the matching snapshot and everything above it.
+	if idx := th.findSavepoint(name); idx >= 0 {
+		th.savepointStack = th.savepointStack[:idx]
+	}
+
+	if th.verbose {
+		log.Printf("[conn %d] RELEASE SAVEPOINT %s: snapshot popped (depth=%d)",
+			th.connID, name, len(th.savepointStack))
+	}
+	th.logger.Event(th.connID, "txn", fmt.Sprintf("RELEASE SAVEPOINT %s", name))
+	return nil
+}
+
+// handleRollbackTo restores delta/tombstone/insert/schema state from the matching
+// savepoint snapshot, then forwards ROLLBACK TO to both backends.
+// The snapshot is kept on the stack (MySQL allows repeated ROLLBACK TO).
+func (th *TxnHandler) handleRollbackTo(clientConn net.Conn, rawPkt []byte, rawSQL string) error {
+	if err := th.forwardToBoth(clientConn, rawPkt); err != nil {
+		return err
+	}
+
+	name := parseRollbackToName(rawSQL)
+	idx := th.findSavepoint(name)
+	if idx < 0 {
+		if th.verbose {
+			log.Printf("[conn %d] ROLLBACK TO %s: no matching savepoint in stack", th.connID, name)
+		}
+		return nil
+	}
+
+	snap := th.savepointStack[idx]
+
+	// Restore delta/tombstone/insert state to the savepoint.
+	th.deltaMap.RestoreAll(snap.deltaSnap)
+	th.tombstones.RestoreAll(snap.tombSnap)
+	th.deltaMap.RestoreInsertedTables(snap.insertSnap)
+
+	// Restore schema registry to savepoint state.
+	if th.schemaRegistry != nil && snap.schemaSnap != nil {
+		th.schemaRegistry.RestoreAll(snap.schemaSnap)
+		if err := coreSchema.WriteRegistry(th.moriDir, th.schemaRegistry); err != nil {
+			if th.verbose {
+				log.Printf("[conn %d] failed to persist schema registry after ROLLBACK TO: %v", th.connID, err)
+			}
+		}
+	}
+
+	// Trim the stack: keep up to and including the matched savepoint,
+	// discard anything pushed after it.
+	th.savepointStack = th.savepointStack[:idx+1]
+
+	if th.verbose {
+		log.Printf("[conn %d] ROLLBACK TO SAVEPOINT %s: state restored (depth=%d)",
+			th.connID, name, len(th.savepointStack))
+	}
+	th.logger.Event(th.connID, "txn", fmt.Sprintf("ROLLBACK TO SAVEPOINT %s: restored", name))
+	return nil
+}
+
+// findSavepoint returns the index of the named savepoint in the stack, or -1 if not found.
+// Searches from the top of the stack (most recent) to the bottom.
+func (th *TxnHandler) findSavepoint(name string) int {
+	for i := len(th.savepointStack) - 1; i >= 0; i-- {
+		if strings.EqualFold(th.savepointStack[i].name, name) {
+			return i
+		}
+	}
+	return -1
+}
+
+// isRollbackTo checks if a ROLLBACK statement is actually ROLLBACK TO [SAVEPOINT].
+func isRollbackTo(rawSQL string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(rawSQL))
+	return strings.Contains(upper, " TO ")
+}
+
+// parseSavepointName extracts the savepoint name from "SAVEPOINT <name>".
+func parseSavepointName(rawSQL string) string {
+	parts := strings.Fields(strings.TrimSpace(rawSQL))
+	if len(parts) >= 2 {
+		return strings.Trim(parts[1], "`'\"")
+	}
+	return ""
+}
+
+// parseReleaseName extracts the savepoint name from "RELEASE [SAVEPOINT] <name>".
+func parseReleaseName(rawSQL string) string {
+	parts := strings.Fields(strings.TrimSpace(rawSQL))
+	// "RELEASE SAVEPOINT sp1" -> parts[2]
+	// "RELEASE sp1" -> parts[1]
+	if len(parts) >= 3 && strings.EqualFold(parts[1], "SAVEPOINT") {
+		return strings.Trim(parts[2], "`'\"")
+	}
+	if len(parts) >= 2 {
+		return strings.Trim(parts[1], "`'\"")
+	}
+	return ""
+}
+
+// parseRollbackToName extracts the savepoint name from "ROLLBACK TO [SAVEPOINT] <name>".
+func parseRollbackToName(rawSQL string) string {
+	upper := strings.ToUpper(strings.TrimSpace(rawSQL))
+	idx := strings.Index(upper, " TO ")
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(rawSQL[idx+4:])
+	parts := strings.Fields(rest)
+	// "ROLLBACK TO SAVEPOINT sp1" -> parts = ["SAVEPOINT", "sp1"]
+	// "ROLLBACK TO sp1" -> parts = ["sp1"]
+	if len(parts) >= 2 && strings.EqualFold(parts[0], "SAVEPOINT") {
+		return strings.Trim(parts[1], "`'\"")
+	}
+	if len(parts) >= 1 {
+		return strings.Trim(parts[0], "`'\"")
+	}
+	return ""
 }
 
 // forwardToBoth sends a packet to Shadow (drain response) then to Prod (relay to client).

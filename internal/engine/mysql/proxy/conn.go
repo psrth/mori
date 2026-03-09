@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -87,19 +88,38 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	}
 	defer closeAll()
 
+	// Create an FKEnforcer for foreign key validation.
+	var fke *FKEnforcer
+	if p.deltaMap != nil && p.tombstones != nil && p.schemaRegistry != nil {
+		fke = &FKEnforcer{
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+		}
+	}
+
 	// Create a WriteHandler for delta-tracking writes.
 	var wh *WriteHandler
 	if p.deltaMap != nil && p.tombstones != nil {
 		wh = &WriteHandler{
-			prodConn:   prodConn,
-			shadowConn: shadowConn,
-			deltaMap:   p.deltaMap,
-			tombstones: p.tombstones,
-			tables:     p.tables,
-			moriDir:    p.moriDir,
-			connID:     connID,
-			verbose:    p.verbose,
-			logger:     p.logger,
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			tables:         p.tables,
+			schemaRegistry: p.schemaRegistry,
+			fkEnforcer:     fke,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
+			maxRowsHydrate: p.maxRowsHydrate,
 		}
 	}
 
@@ -138,14 +158,15 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 	var txh *TxnHandler
 	if p.deltaMap != nil && p.tombstones != nil {
 		txh = &TxnHandler{
-			prodConn:   prodConn,
-			shadowConn: shadowConn,
-			deltaMap:   p.deltaMap,
-			tombstones: p.tombstones,
-			moriDir:    p.moriDir,
-			connID:     connID,
-			verbose:    p.verbose,
-			logger:     p.logger,
+			prodConn:       prodConn,
+			shadowConn:     shadowConn,
+			deltaMap:       p.deltaMap,
+			tombstones:     p.tombstones,
+			schemaRegistry: p.schemaRegistry,
+			moriDir:        p.moriDir,
+			connID:         connID,
+			verbose:        p.verbose,
+			logger:         p.logger,
 		}
 	}
 
@@ -168,6 +189,13 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			writeHandler: wh,
 			readHandler:  rh,
 			stmtCache:    make(map[string]stmtCacheEntry),
+		}
+	}
+
+	// Wire ExtHandler into the L2 write guard so it can inspect COM_STMT_EXECUTE.
+	if exh != nil {
+		if spc, ok := prodConn.(*SafeProdConn); ok {
+			spc.SetExtHandler(exh)
 		}
 	}
 
@@ -209,6 +237,49 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			if err := forwardAndRelay(pkt.Raw, prodConn, clientConn); err != nil {
 				if p.verbose {
 					log.Printf("[conn %d] COM_INIT_DB relay error: %v", connID, err)
+				}
+				return
+			}
+			continue
+		}
+
+		// COM_FIELD_LIST: forward to prod, relay response.
+		if cmd == comFieldList {
+			if err := forwardAndRelay(pkt.Raw, prodConn, clientConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] COM_FIELD_LIST relay error: %v", connID, err)
+				}
+				return
+			}
+			continue
+		}
+
+		// COM_STMT_RESET: forward to both backends (reset state on both).
+		if cmd == comStmtReset {
+			shadowConn.Write(pkt.Raw)
+			drainResponse(shadowConn)
+			if err := forwardAndRelay(pkt.Raw, prodConn, clientConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] COM_STMT_RESET relay error: %v", connID, err)
+				}
+				return
+			}
+			continue
+		}
+
+		// COM_STMT_SEND_LONG_DATA: forward to both backends (buffer chunks before EXECUTE).
+		// No response is sent for this command.
+		if cmd == comStmtSendLongData {
+			shadowConn.Write(pkt.Raw)
+			prodConn.Write(pkt.Raw)
+			continue
+		}
+
+		// COM_STMT_FETCH: forward to shadow (where prepared statements live).
+		if cmd == comStmtFetch {
+			if err := forwardAndRelay(pkt.Raw, shadowConn, clientConn); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] COM_STMT_FETCH relay error: %v", connID, err)
 				}
 				return
 			}
@@ -283,6 +354,27 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			if rh != nil && decision.classification != nil {
 				switch decision.strategy {
 				case core.StrategyMergedRead, core.StrategyJoinPatch:
+					// Shadow-only shortcut: if any table is fully shadowed, execute on Shadow only.
+					// This prevents the merged read path from trying to query Prod for tables
+					// that don't exist there (e.g., tables created via DDL on Shadow).
+					if p.schemaRegistry != nil && decision.classification != nil {
+						allShadow := false
+						for _, t := range decision.classification.Tables {
+							if p.schemaRegistry.IsFullyShadowed(t) {
+								allShadow = true
+								break
+							}
+						}
+						if allShadow {
+							if err := forwardAndRelay(pkt.Raw, shadowConn, clientConn); err != nil {
+								if p.verbose {
+									log.Printf("[conn %d] shadow-only read relay error: %v", connID, err)
+								}
+								return
+							}
+							continue
+						}
+					}
 					if err := rh.HandleRead(clientConn, pkt.Raw, decision.classification, decision.strategy); err != nil {
 						if p.verbose {
 							log.Printf("[conn %d] read handler error: %v", connID, err)
@@ -301,6 +393,41 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 					}
 					return
 				}
+				continue
+			}
+
+			// Handle TRUNCATE: forward to Shadow, mark fully shadowed.
+			if decision.strategy == core.StrategyTruncate && p.schemaRegistry != nil {
+				if err := forwardAndRelay(pkt.Raw, shadowConn, clientConn); err != nil {
+					if p.verbose {
+						log.Printf("[conn %d] truncate relay error: %v", connID, err)
+					}
+					return
+				}
+				for _, table := range decision.classification.Tables {
+					p.schemaRegistry.MarkFullyShadowed(table)
+					if p.deltaMap != nil {
+						p.deltaMap.ClearTable(table)
+					}
+					if p.tombstones != nil {
+						p.tombstones.ClearTable(table)
+					}
+				}
+				if p.verbose {
+					log.Printf("[conn %d] TRUNCATE: tables %v marked fully shadowed", connID, decision.classification.Tables)
+				}
+				p.logger.Event(connID, "truncate", fmt.Sprintf("tables=%v", decision.classification.Tables))
+				continue
+			}
+
+			// Handle NotSupported: return error to client.
+			if decision.strategy == core.StrategyNotSupported && decision.classification != nil {
+				msg := decision.classification.NotSupportedMsg
+				if msg == "" {
+					msg = "this operation is not supported through Mori"
+				}
+				errPkt := buildGuardErrorResponse(1, msg)
+				clientConn.Write(errPkt)
 				continue
 			}
 
@@ -381,13 +508,26 @@ func handleTxnWrite(
 		return nil
 	}
 
+	// For upserts (INSERT ... ON DUPLICATE KEY UPDATE inside a transaction):
+	// delegate to handleUpsert which does its own hydration and delta tracking,
+	// but use Stage instead of Add for transactional safety.
+	if strategy == core.StrategyHydrateAndWrite && cl.SubType == core.SubInsert && cl.HasOnConflict {
+		// handleUpsert does hydration + forward + delta Add internally.
+		// For txn, we call it directly — it uses deltaMap.Add, but TxnHandler
+		// will snapshot/restore on ROLLBACK.
+		return wh.handleUpsert(clientConn, rawPkt, cl)
+	}
+
 	// For updates: hydrate, forward, then stage.
 	if strategy == core.StrategyHydrateAndWrite {
+		if len(cl.PKs) == 0 {
+			return wh.handleBulkUpdate(clientConn, rawPkt, cl)
+		}
 		for _, pk := range cl.PKs {
 			if wh.deltaMap.IsDelta(pk.Table, pk.PK) {
 				continue
 			}
-			if err := wh.hydrateRow(pk.Table, pk.PK); err != nil {
+			if err := wh.hydrateRow(pk.Table, pkValuesFromSingle(wh.tables[pk.Table], pk.PK)); err != nil {
 				if wh.verbose {
 					log.Printf("[conn %d] txn hydration failed for (%s, %s): %v", wh.connID, pk.Table, pk.PK, err)
 				}
@@ -404,6 +544,9 @@ func handleTxnWrite(
 
 	// For deletes: forward, then stage tombstones.
 	if strategy == core.StrategyShadowDelete {
+		if len(cl.PKs) == 0 {
+			return wh.handleBulkDelete(clientConn, rawPkt, cl)
+		}
 		if err := forwardAndRelay(rawPkt, wh.shadowConn, clientConn); err != nil {
 			return err
 		}
@@ -472,6 +615,27 @@ func (p *Proxy) classifyAndRoute(sql string, connID int64) routeDecision {
 	case core.StrategyMergedRead, core.StrategyJoinPatch:
 		return routeDecision{
 			target:         targetProd, // fallback if ReadHandler is nil
+			classification: classification,
+			strategy:       strategy,
+		}
+
+	case core.StrategyTruncate:
+		return routeDecision{
+			target:         targetShadow,
+			classification: classification,
+			strategy:       strategy,
+		}
+
+	case core.StrategyForwardBoth:
+		return routeDecision{
+			target:         targetBoth,
+			classification: classification,
+			strategy:       strategy,
+		}
+
+	case core.StrategyNotSupported:
+		return routeDecision{
+			target:         targetProd, // will be intercepted in loop
 			classification: classification,
 			strategy:       strategy,
 		}
