@@ -27,6 +27,7 @@ type FKEnforcer struct {
 	connID         int64
 	verbose        bool
 	logger         *logging.Logger
+	fkDiscovered   map[string]bool // tracks tables where FK discovery from Prod has been attempted
 }
 
 // buildFKErrorResponse constructs a pgwire ErrorResponse + ReadyForQuery for
@@ -155,10 +156,123 @@ func (fke *FKEnforcer) CheckParentExists(fk coreSchema.ForeignKey, childValues m
 		fk.ChildTable, childColStr, valStr, parentTable)
 }
 
+// discoverFKsFromProd queries Prod's information_schema to discover FK constraints
+// for a table that has no FK metadata in the schema registry. Discovered FKs are
+// cached in the registry for future lookups.
+func (fke *FKEnforcer) discoverFKsFromProd(table string) []coreSchema.ForeignKey {
+	// Query information_schema for FK constraints where this table is the child.
+	sql := fmt.Sprintf(`SELECT
+		tc.constraint_name,
+		kcu.column_name AS child_column,
+		ccu.table_name AS parent_table,
+		ccu.column_name AS parent_column,
+		rc.delete_rule,
+		rc.update_rule
+	FROM information_schema.table_constraints tc
+	JOIN information_schema.key_column_usage kcu
+		ON tc.constraint_name = kcu.constraint_name
+		AND tc.table_schema = kcu.table_schema
+	JOIN information_schema.constraint_column_usage ccu
+		ON tc.constraint_name = ccu.constraint_name
+		AND tc.table_schema = ccu.table_schema
+	JOIN information_schema.referential_constraints rc
+		ON tc.constraint_name = rc.constraint_name
+		AND tc.table_schema = rc.constraint_schema
+	WHERE tc.constraint_type = 'FOREIGN KEY'
+		AND tc.table_name = %s
+		AND tc.table_schema = 'public'
+	ORDER BY tc.constraint_name, kcu.ordinal_position`,
+		quoteLiteral(table))
+
+	result, err := execQuery(fke.prodConn, sql)
+	if err != nil || result.Error != "" {
+		if fke.verbose {
+			log.Printf("[conn %d] FK discovery: failed to query Prod for %s: %v %s",
+				fke.connID, table, err, result.Error)
+		}
+		return nil
+	}
+
+	// Group results by constraint name.
+	type fkData struct {
+		constraintName string
+		childColumns   []string
+		parentTable    string
+		parentColumns  []string
+		onDelete       string
+		onUpdate       string
+	}
+	fkMap := make(map[string]*fkData)
+
+	for i, row := range result.RowValues {
+		if len(row) < 6 {
+			continue
+		}
+		// Skip null rows.
+		if result.RowNulls[i][0] {
+			continue
+		}
+		constraintName := row[0]
+		childCol := row[1]
+		parentTable := row[2]
+		parentCol := row[3]
+		deleteRule := row[4]
+		updateRule := row[5]
+
+		fd, ok := fkMap[constraintName]
+		if !ok {
+			fd = &fkData{
+				constraintName: constraintName,
+				parentTable:    parentTable,
+				onDelete:       deleteRule,
+				onUpdate:       updateRule,
+			}
+			fkMap[constraintName] = fd
+		}
+		fd.childColumns = append(fd.childColumns, childCol)
+		fd.parentColumns = append(fd.parentColumns, parentCol)
+	}
+
+	var fks []coreSchema.ForeignKey
+	for _, fd := range fkMap {
+		fk := coreSchema.ForeignKey{
+			ConstraintName: fd.constraintName,
+			ChildTable:     table,
+			ChildColumns:   fd.childColumns,
+			ParentTable:    fd.parentTable,
+			ParentColumns:  fd.parentColumns,
+			OnDelete:       fd.onDelete,
+			OnUpdate:       fd.onUpdate,
+		}
+		fks = append(fks, fk)
+		// Cache in the schema registry for future lookups.
+		fke.schemaRegistry.RecordForeignKey(table, fk)
+	}
+
+	if fke.verbose && len(fks) > 0 {
+		log.Printf("[conn %d] FK discovery: found %d FK constraints for %s from Prod", fke.connID, len(fks), table)
+	}
+
+	return fks
+}
+
 // EnforceInsert checks FK constraints for an INSERT statement.
 // Returns an error if any FK violation is detected.
 func (fke *FKEnforcer) EnforceInsert(table string, rawSQL string) error {
 	fks := fke.schemaRegistry.GetForeignKeys(table)
+	if len(fks) == 0 {
+		// No FK metadata cached — try discovering from Prod (only once per table).
+		// Only attempt discovery for tables we have metadata for (known from init).
+		if _, known := fke.tables[table]; known {
+			if fke.fkDiscovered == nil {
+				fke.fkDiscovered = make(map[string]bool)
+			}
+			if !fke.fkDiscovered[table] {
+				fke.fkDiscovered[table] = true
+				fks = fke.discoverFKsFromProd(table)
+			}
+		}
+	}
 	if len(fks) == 0 {
 		return nil
 	}
@@ -201,6 +315,17 @@ func (fke *FKEnforcer) EnforceInsert(table string, rawSQL string) error {
 // Only checks FK columns that are being modified (appear in SET clause).
 func (fke *FKEnforcer) EnforceUpdate(table string, rawSQL string) error {
 	fks := fke.schemaRegistry.GetForeignKeys(table)
+	if len(fks) == 0 {
+		if _, known := fke.tables[table]; known {
+			if fke.fkDiscovered == nil {
+				fke.fkDiscovered = make(map[string]bool)
+			}
+			if !fke.fkDiscovered[table] {
+				fke.fkDiscovered[table] = true
+				fks = fke.discoverFKsFromProd(table)
+			}
+		}
+	}
 	if len(fks) == 0 {
 		return nil
 	}

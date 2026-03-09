@@ -215,6 +215,10 @@ func (rh *ReadHandler) joinPatchWithSchemaDiffs(cl *core.Classification, querySQ
 // which can corrupt CROSS JOIN structure (dropping the right-hand table from
 // the FROM clause). Instead, we only rewrite RangeVar table names — which is
 // safe because it doesn't change the JOIN structure.
+//
+// Scoped materialization: instead of materializing entire tables, single-table
+// WHERE predicates from the original query are pushed down into the materialization
+// query. This reduces data volume dramatically for filtered JOINs.
 func (rh *ReadHandler) handleJoinWithMaterialization(cl *core.Classification, querySQL string) (
 	columns []ColumnInfo, values [][]string, nulls [][]bool, err error,
 ) {
@@ -234,13 +238,19 @@ func (rh *ReadHandler) handleJoinWithMaterialization(cl *core.Classification, qu
 		}
 	}()
 
-	// Materialize each dirty table with schema diffs into a temp table.
+	// Extract single-table predicates from the query's WHERE clause for pushdown.
+	tablePredicates, tableToAlias := extractSingleTablePredicates(querySQL)
+
+	// Materialize each dirty table into a temp table, scoped by pushed-down predicates.
 	tableMap := make(map[string]string)
 	for _, table := range cl.Tables {
 		if !rh.isTableDirty(table) {
 			continue
 		}
-		selectSQL := fmt.Sprintf("SELECT * FROM %s", quoteIdent(table))
+
+		// Build materialization query with pushed-down predicates if available.
+		selectSQL := rh.buildScopedMaterializationSQL(table, tablePredicates, tableToAlias)
+
 		utilName, mErr := rh.materializeSubquery(selectSQL, table)
 		if mErr != nil {
 			if rh.verbose {
@@ -288,6 +298,244 @@ func (rh *ReadHandler) handleJoinWithMaterialization(cl *core.Classification, qu
 	}
 
 	return shadowResult.Columns, shadowResult.RowValues, shadowResult.RowNulls, nil
+}
+
+// buildScopedMaterializationSQL builds a SELECT query for materializing a table,
+// scoped by any pushed-down WHERE predicates from the original JOIN query.
+// If predicates are available, the query is: SELECT * FROM <table> AS <alias> WHERE <predicates>
+// Otherwise, falls back to: SELECT * FROM <table>
+func (rh *ReadHandler) buildScopedMaterializationSQL(
+	table string,
+	predicates map[string]string,
+	tableToAlias map[string]string,
+) string {
+	predSQL, hasPred := predicates[table]
+	if !hasPred || predSQL == "" {
+		return fmt.Sprintf("SELECT * FROM %s", quoteIdent(table))
+	}
+
+	// Use the alias from the original query so qualified column refs in the
+	// predicate resolve correctly (e.g., m.created_at when alias is "m").
+	alias := tableToAlias[table]
+	if alias != "" && alias != table {
+		return fmt.Sprintf("SELECT * FROM %s AS %s WHERE %s",
+			quoteIdent(table), quoteIdent(alias), predSQL)
+	}
+	return fmt.Sprintf("SELECT * FROM %s WHERE %s", quoteIdent(table), predSQL)
+}
+
+// extractSingleTablePredicates parses a SELECT query's WHERE clause and
+// identifies AND-terms that reference only a single table. Returns:
+//   - predicates: map from table name to deparsed WHERE SQL for that table
+//   - tableToAlias: map from table name to its alias in the query
+func extractSingleTablePredicates(querySQL string) (predicates map[string]string, tableToAlias map[string]string) {
+	result, err := pg_query.Parse(querySQL)
+	if err != nil {
+		return nil, nil
+	}
+	stmts := result.GetStmts()
+	if len(stmts) == 0 {
+		return nil, nil
+	}
+	sel := stmts[0].GetStmt().GetSelectStmt()
+	if sel == nil {
+		return nil, nil
+	}
+	where := sel.GetWhereClause()
+	if where == nil {
+		return nil, nil
+	}
+
+	// Build bidirectional alias maps.
+	aliasToTable := make(map[string]string) // alias → table name
+	tableToAlias = make(map[string]string)  // table name → alias
+	for _, node := range sel.GetFromClause() {
+		collectBidirectionalAliases(node, aliasToTable, tableToAlias)
+	}
+
+	// Decompose WHERE into AND terms.
+	terms := decomposeAND(where)
+
+	// Group terms by the single table they reference.
+	tableTerms := make(map[string][]*pg_query.Node)
+	for _, term := range terms {
+		refs := collectQualifiedColumnRefs(term)
+		if len(refs) == 0 {
+			continue // no qualified column refs — can't determine table, skip
+		}
+		tableName := ""
+		singleTable := true
+		for ref := range refs {
+			tbl := ref
+			if mapped, ok := aliasToTable[ref]; ok {
+				tbl = mapped
+			}
+			if tableName == "" {
+				tableName = tbl
+			} else if tableName != tbl {
+				singleTable = false
+				break
+			}
+		}
+		if singleTable && tableName != "" {
+			tableTerms[tableName] = append(tableTerms[tableName], term)
+		}
+	}
+
+	// Deparse each table's combined predicates.
+	predicates = make(map[string]string)
+	for table, terms := range tableTerms {
+		var combined *pg_query.Node
+		if len(terms) == 1 {
+			combined = terms[0]
+		} else {
+			combined = &pg_query.Node{
+				Node: &pg_query.Node_BoolExpr{BoolExpr: &pg_query.BoolExpr{
+					Boolop: pg_query.BoolExprType_AND_EXPR,
+					Args:   terms,
+				}},
+			}
+		}
+
+		// Deparse using the alias so qualified refs resolve correctly.
+		alias := tableToAlias[table]
+		if alias == "" {
+			alias = table
+		}
+		predSQL, dErr := deparsePredicateWithAlias(combined, table, alias)
+		if dErr != nil {
+			continue
+		}
+		predicates[table] = predSQL
+	}
+
+	return predicates, tableToAlias
+}
+
+// collectBidirectionalAliases walks FROM clause nodes and builds both
+// alias→table and table→alias mappings.
+func collectBidirectionalAliases(node *pg_query.Node, aliasToTable, tableToAlias map[string]string) {
+	if node == nil {
+		return
+	}
+	if rv := node.GetRangeVar(); rv != nil {
+		tableName := rv.GetRelname()
+		if s := rv.GetSchemaname(); s != "" {
+			tableName = s + "." + tableName
+		}
+		alias := tableName
+		if a := rv.GetAlias(); a != nil && a.GetAliasname() != "" {
+			alias = a.GetAliasname()
+		}
+		aliasToTable[alias] = tableName
+		tableToAlias[tableName] = alias
+		return
+	}
+	if je := node.GetJoinExpr(); je != nil {
+		collectBidirectionalAliases(je.GetLarg(), aliasToTable, tableToAlias)
+		collectBidirectionalAliases(je.GetRarg(), aliasToTable, tableToAlias)
+	}
+}
+
+// decomposeAND splits a WHERE clause into AND-terms. If the top-level node is
+// a BoolExpr AND, returns its arguments. Otherwise returns a single-element slice.
+func decomposeAND(node *pg_query.Node) []*pg_query.Node {
+	if node == nil {
+		return nil
+	}
+	if be := node.GetBoolExpr(); be != nil && be.GetBoolop() == pg_query.BoolExprType_AND_EXPR {
+		return be.GetArgs()
+	}
+	return []*pg_query.Node{node}
+}
+
+// collectQualifiedColumnRefs walks an AST node and returns the set of table
+// qualifiers from qualified column references (e.g., "m" from "m.created_at").
+// Unqualified column refs are ignored since they can't be mapped to a table.
+func collectQualifiedColumnRefs(node *pg_query.Node) map[string]bool {
+	refs := make(map[string]bool)
+	walkQualifiedColumnRefs(node, refs)
+	return refs
+}
+
+func walkQualifiedColumnRefs(node *pg_query.Node, refs map[string]bool) {
+	if node == nil {
+		return
+	}
+	if cr := node.GetColumnRef(); cr != nil {
+		fields := cr.GetFields()
+		if len(fields) >= 2 {
+			if s := fields[0].GetString_(); s != nil {
+				refs[s.GetSval()] = true
+			}
+		}
+		return
+	}
+	if be := node.GetBoolExpr(); be != nil {
+		for _, arg := range be.GetArgs() {
+			walkQualifiedColumnRefs(arg, refs)
+		}
+		return
+	}
+	if ae := node.GetAExpr(); ae != nil {
+		walkQualifiedColumnRefs(ae.GetLexpr(), refs)
+		walkQualifiedColumnRefs(ae.GetRexpr(), refs)
+		return
+	}
+	if nt := node.GetNullTest(); nt != nil {
+		walkQualifiedColumnRefs(nt.GetArg(), refs)
+		return
+	}
+	if fc := node.GetFuncCall(); fc != nil {
+		for _, arg := range fc.GetArgs() {
+			walkQualifiedColumnRefs(arg, refs)
+		}
+		return
+	}
+	if tc := node.GetTypeCast(); tc != nil {
+		walkQualifiedColumnRefs(tc.GetArg(), refs)
+		return
+	}
+}
+
+// deparsePredicateWithAlias deparses a WHERE clause node back to SQL text.
+// Uses a dummy SELECT to deparse, with the FROM clause including the alias
+// so qualified column refs (e.g., m.col) resolve correctly.
+func deparsePredicateWithAlias(where *pg_query.Node, tableName, alias string) (string, error) {
+	rv := &pg_query.RangeVar{Relname: tableName, Inh: true}
+	if alias != "" && alias != tableName {
+		rv.Alias = &pg_query.Alias{Aliasname: alias}
+	}
+
+	sel := &pg_query.SelectStmt{
+		TargetList: []*pg_query.Node{
+			{Node: &pg_query.Node_ResTarget{ResTarget: &pg_query.ResTarget{
+				Val: &pg_query.Node{Node: &pg_query.Node_AConst{AConst: &pg_query.A_Const{
+					Val: &pg_query.A_Const_Ival{Ival: &pg_query.Integer{Ival: 1}},
+				}}},
+			}}},
+		},
+		FromClause: []*pg_query.Node{
+			{Node: &pg_query.Node_RangeVar{RangeVar: rv}},
+		},
+		WhereClause: where,
+	}
+
+	deparsed, err := pg_query.Deparse(&pg_query.ParseResult{
+		Stmts: []*pg_query.RawStmt{{Stmt: &pg_query.Node{
+			Node: &pg_query.Node_SelectStmt{SelectStmt: sel},
+		}}},
+	})
+	if err != nil {
+		return "", fmt.Errorf("deparse predicate: %w", err)
+	}
+
+	upper := strings.ToUpper(deparsed)
+	whereIdx := strings.Index(upper, "WHERE ")
+	if whereIdx < 0 {
+		return "", fmt.Errorf("no WHERE in deparsed output")
+	}
+	return strings.TrimSpace(deparsed[whereIdx+len("WHERE "):]), nil
 }
 
 // anyTableSchemaModified reports whether any of the given tables have schema diffs.

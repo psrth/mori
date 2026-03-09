@@ -137,9 +137,11 @@ func (rh *ReadHandler) complexReadCore(cl *core.Classification, querySQL string)
 	// Materialize dirty plain RangeVar tables in FROM clause.
 	// This handles cases like LATERAL joins or CROSS JOINs where the outer
 	// table is a plain RangeVar (not a derived table or CTE) but is dirty.
+	// Uses scoped materialization with pushed-down WHERE predicates to reduce data volume.
 	{
+		tablePredicates, tableToAlias := extractSingleTablePredicates(querySQL)
 		tableMap := make(map[string]string)
-		rh.collectDirtyRangeVarsFromNodes(sel.GetFromClause(), tableMap, &utilTables)
+		rh.collectDirtyRangeVarsFromNodes(sel.GetFromClause(), tableMap, &utilTables, tablePredicates, tableToAlias)
 		if len(tableMap) > 0 {
 			rewriteTableRefsInNode(stmts[0].GetStmt(), tableMap)
 			modified = true
@@ -406,13 +408,14 @@ func (rh *ReadHandler) materializeDirtyBaseTables(
 // dirty plain RangeVar tables into temp tables. It recurses into JoinExpr
 // children to find nested RangeVar nodes. The tableMap is populated with
 // original→temp table mappings and utilTables is appended with new temp names.
-func (rh *ReadHandler) collectDirtyRangeVarsFromNodes(nodes []*pg_query.Node, tableMap map[string]string, utilTables *[]string) {
+// Uses scoped materialization with pushed-down WHERE predicates when available.
+func (rh *ReadHandler) collectDirtyRangeVarsFromNodes(nodes []*pg_query.Node, tableMap map[string]string, utilTables *[]string, tablePredicates map[string]string, tableToAlias map[string]string) {
 	for _, node := range nodes {
-		rh.collectDirtyRangeVarsFromNode(node, tableMap, utilTables)
+		rh.collectDirtyRangeVarsFromNode(node, tableMap, utilTables, tablePredicates, tableToAlias)
 	}
 }
 
-func (rh *ReadHandler) collectDirtyRangeVarsFromNode(node *pg_query.Node, tableMap map[string]string, utilTables *[]string) {
+func (rh *ReadHandler) collectDirtyRangeVarsFromNode(node *pg_query.Node, tableMap map[string]string, utilTables *[]string, tablePredicates map[string]string, tableToAlias map[string]string) {
 	if node == nil {
 		return
 	}
@@ -425,7 +428,7 @@ func (rh *ReadHandler) collectDirtyRangeVarsFromNode(node *pg_query.Node, tableM
 			return
 		}
 		if rh.isTableDirty(tableName) {
-			selectSQL := fmt.Sprintf("SELECT * FROM %s", quoteIdent(tableName))
+			selectSQL := rh.buildScopedMaterializationSQL(tableName, tablePredicates, tableToAlias)
 			utilName, mErr := rh.materializeSubquery(selectSQL, tableName)
 			if mErr != nil {
 				if rh.verbose {
@@ -438,8 +441,8 @@ func (rh *ReadHandler) collectDirtyRangeVarsFromNode(node *pg_query.Node, tableM
 		}
 	}
 	if je := node.GetJoinExpr(); je != nil {
-		rh.collectDirtyRangeVarsFromNode(je.GetLarg(), tableMap, utilTables)
-		rh.collectDirtyRangeVarsFromNode(je.GetRarg(), tableMap, utilTables)
+		rh.collectDirtyRangeVarsFromNode(je.GetLarg(), tableMap, utilTables, tablePredicates, tableToAlias)
+		rh.collectDirtyRangeVarsFromNode(je.GetRarg(), tableMap, utilTables, tablePredicates, tableToAlias)
 	}
 }
 
