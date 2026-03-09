@@ -215,11 +215,19 @@ func (r *Registry) IsFullyShadowed(table string) bool {
 }
 
 // HasDiff reports whether the table has any schema divergence.
+// Entries that only contain FK metadata (no actual structural changes) are
+// not considered diffs — they are created by FK discovery and should not
+// cause read-path routing changes.
 func (r *Registry) HasDiff(table string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	_, ok := r.diffs[table]
-	return ok
+	d, ok := r.diffs[table]
+	if !ok {
+		return false
+	}
+	return d.IsNewTable || d.IsFullyShadowed ||
+		len(d.Added) > 0 || len(d.Dropped) > 0 ||
+		len(d.Renamed) > 0 || len(d.TypeChanged) > 0
 }
 
 // Tables returns all table names that have schema diffs, sorted.
@@ -235,6 +243,44 @@ func (r *Registry) Tables() []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// SnapshotAll returns a deep copy of the entire registry state for transactional rollback.
+func (r *Registry) SnapshotAll() map[string]*TableDiff {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	snap := make(map[string]*TableDiff, len(r.diffs))
+	for table, d := range r.diffs {
+		cp := &TableDiff{
+			Added:           make([]Column, len(d.Added)),
+			Dropped:         make([]string, len(d.Dropped)),
+			Renamed:         make(map[string]string, len(d.Renamed)),
+			TypeChanged:     make(map[string][2]string, len(d.TypeChanged)),
+			IsNewTable:      d.IsNewTable,
+			IsFullyShadowed: d.IsFullyShadowed,
+		}
+		copy(cp.Added, d.Added)
+		copy(cp.Dropped, d.Dropped)
+		for k, v := range d.Renamed {
+			cp.Renamed[k] = v
+		}
+		for k, v := range d.TypeChanged {
+			cp.TypeChanged[k] = v
+		}
+		if len(d.ForeignKeys) > 0 {
+			cp.ForeignKeys = make([]ForeignKey, len(d.ForeignKeys))
+			copy(cp.ForeignKeys, d.ForeignKeys)
+		}
+		snap[table] = cp
+	}
+	return snap
+}
+
+// RestoreAll replaces the entire registry state from a snapshot (used on ROLLBACK).
+func (r *Registry) RestoreAll(snap map[string]*TableDiff) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.diffs = snap
 }
 
 // WriteRegistry persists the schema registry to .mori/schema_registry.json.
