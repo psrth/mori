@@ -126,6 +126,7 @@ func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerIn
 		"--name", name,
 		"-p", portMapping,
 		image,
+		"--save", "", "--appendonly", "no",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

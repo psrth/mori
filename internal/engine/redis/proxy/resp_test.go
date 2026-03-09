@@ -246,3 +246,133 @@ func TestParseScanResponse(t *testing.T) {
 		}
 	})
 }
+
+func TestRESP3Null(t *testing.T) {
+	input := "_\r\n"
+	r := bufio.NewReader(bytes.NewReader([]byte(input)))
+	v, err := ReadRESPValue(r)
+	if err != nil {
+		t.Fatalf("ReadRESPValue: %v", err)
+	}
+	if v.Type != '$' || !v.IsNull {
+		t.Errorf("RESP3 null: type=%c null=%v, want null bulk string", v.Type, v.IsNull)
+	}
+}
+
+func TestRESP3Boolean(t *testing.T) {
+	tests := []struct {
+		input string
+		want  int64
+	}{
+		{"#t\r\n", 1},
+		{"#f\r\n", 0},
+	}
+	for _, tt := range tests {
+		r := bufio.NewReader(bytes.NewReader([]byte(tt.input)))
+		v, err := ReadRESPValue(r)
+		if err != nil {
+			t.Fatalf("ReadRESPValue(%q): %v", tt.input, err)
+		}
+		if v.Type != ':' || v.Int != tt.want {
+			t.Errorf("RESP3 boolean %q: type=%c int=%d, want int=%d", tt.input, v.Type, v.Int, tt.want)
+		}
+	}
+}
+
+func TestRESP3Double(t *testing.T) {
+	input := ",3.14\r\n"
+	r := bufio.NewReader(bytes.NewReader([]byte(input)))
+	v, err := ReadRESPValue(r)
+	if err != nil {
+		t.Fatalf("ReadRESPValue: %v", err)
+	}
+	if v.Type != '$' || v.Str != "3.14" {
+		t.Errorf("RESP3 double: type=%c str=%q, want bulk string '3.14'", v.Type, v.Str)
+	}
+}
+
+func TestRESP3BigNumber(t *testing.T) {
+	input := "(123456789012345678901234567890\r\n"
+	r := bufio.NewReader(bytes.NewReader([]byte(input)))
+	v, err := ReadRESPValue(r)
+	if err != nil {
+		t.Fatalf("ReadRESPValue: %v", err)
+	}
+	if v.Type != '$' || v.Str != "123456789012345678901234567890" {
+		t.Errorf("RESP3 big number: type=%c str=%q", v.Type, v.Str)
+	}
+}
+
+func TestRESP3VerbatimString(t *testing.T) {
+	// Verbatim string: =<len>\r\n<encoding>:<data>\r\n
+	content := "txt:Hello world"
+	input := "=" + "15" + "\r\n" + content + "\r\n"
+	r := bufio.NewReader(bytes.NewReader([]byte(input)))
+	v, err := ReadRESPValue(r)
+	if err != nil {
+		t.Fatalf("ReadRESPValue: %v", err)
+	}
+	if v.Type != '$' || v.Str != "Hello world" {
+		t.Errorf("RESP3 verbatim string: type=%c str=%q, want 'Hello world'", v.Type, v.Str)
+	}
+}
+
+func TestRESP3Map(t *testing.T) {
+	// Map with 2 entries: %2\r\n$3\r\nfoo\r\n:1\r\n$3\r\nbar\r\n:2\r\n
+	input := "%2\r\n$3\r\nfoo\r\n:1\r\n$3\r\nbar\r\n:2\r\n"
+	r := bufio.NewReader(bytes.NewReader([]byte(input)))
+	v, err := ReadRESPValue(r)
+	if err != nil {
+		t.Fatalf("ReadRESPValue: %v", err)
+	}
+	if v.Type != '*' || len(v.Array) != 4 {
+		t.Fatalf("RESP3 map: type=%c len=%d, want array of 4", v.Type, len(v.Array))
+	}
+	if v.Array[0].Str != "foo" || v.Array[1].Int != 1 || v.Array[2].Str != "bar" || v.Array[3].Int != 2 {
+		t.Errorf("RESP3 map contents: %v", v.Array)
+	}
+}
+
+func TestRESP3Set(t *testing.T) {
+	// Set with 2 elements: ~2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n
+	input := "~2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+	r := bufio.NewReader(bytes.NewReader([]byte(input)))
+	v, err := ReadRESPValue(r)
+	if err != nil {
+		t.Fatalf("ReadRESPValue: %v", err)
+	}
+	if v.Type != '*' || len(v.Array) != 2 {
+		t.Fatalf("RESP3 set: type=%c len=%d, want array of 2", v.Type, len(v.Array))
+	}
+	if v.Array[0].Str != "foo" || v.Array[1].Str != "bar" {
+		t.Errorf("RESP3 set contents: %v", v.Array)
+	}
+}
+
+func TestRESP3BlobError(t *testing.T) {
+	// Blob error: !<len>\r\n<data>\r\n
+	input := "!10\r\nSYNTAX err\r\n"
+	r := bufio.NewReader(bytes.NewReader([]byte(input)))
+	v, err := ReadRESPValue(r)
+	if err != nil {
+		t.Fatalf("ReadRESPValue: %v", err)
+	}
+	if v.Type != '-' || v.Str != "SYNTAX err" {
+		t.Errorf("RESP3 blob error: type=%c str=%q, want error 'SYNTAX err'", v.Type, v.Str)
+	}
+}
+
+func TestRESP3Attribute(t *testing.T) {
+	// Attribute with 1 key-value pair, followed by the actual value.
+	// |1\r\n$3\r\nttl\r\n:300\r\n$5\r\nhello\r\n
+	input := "|1\r\n$3\r\nttl\r\n:300\r\n$5\r\nhello\r\n"
+	r := bufio.NewReader(bytes.NewReader([]byte(input)))
+	v, err := ReadRESPValue(r)
+	if err != nil {
+		t.Fatalf("ReadRESPValue: %v", err)
+	}
+	// Attribute should be discarded, returning the actual value.
+	if v.Type != '$' || v.Str != "hello" {
+		t.Errorf("RESP3 attribute: type=%c str=%q, want bulk string 'hello'", v.Type, v.Str)
+	}
+}

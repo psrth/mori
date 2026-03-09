@@ -33,9 +33,7 @@ var commandMap = map[string]opInfo{
 	"SCAN":      {core.OpRead, core.SubSelect, 0, false},
 	"DBSIZE":    {core.OpRead, core.SubSelect, 0, false},
 	"RANDOMKEY": {core.OpRead, core.SubSelect, 0, false},
-	"OBJECT":    {core.OpRead, core.SubSelect, 0, false},
 	"DUMP":      {core.OpRead, core.SubSelect, 1, false},
-	"GETDEL":    {core.OpWrite, core.SubDelete, 1, false},
 
 	// --- Reads: hash ---
 	"HGET":      {core.OpRead, core.SubSelect, 1, false},
@@ -90,90 +88,154 @@ var commandMap = map[string]opInfo{
 	"XREAD":     {core.OpRead, core.SubSelect, 0, false},
 	"XPENDING":  {core.OpRead, core.SubSelect, 1, false},
 
-	// --- Writes: string ---
-	"SET":          {core.OpWrite, core.SubInsert, 1, false},
-	"SETNX":        {core.OpWrite, core.SubInsert, 1, false},
-	"SETEX":        {core.OpWrite, core.SubInsert, 1, false},
-	"PSETEX":       {core.OpWrite, core.SubInsert, 1, false},
-	"MSET":         {core.OpWrite, core.SubInsert, 1, true},
-	"MSETNX":       {core.OpWrite, core.SubInsert, 1, true},
-	"APPEND":       {core.OpWrite, core.SubInsert, 1, false},
-	"INCR":         {core.OpWrite, core.SubInsert, 1, false},
-	"INCRBY":       {core.OpWrite, core.SubInsert, 1, false},
-	"INCRBYFLOAT":  {core.OpWrite, core.SubInsert, 1, false},
-	"DECR":         {core.OpWrite, core.SubInsert, 1, false},
-	"DECRBY":       {core.OpWrite, core.SubInsert, 1, false},
-	"GETSET":       {core.OpWrite, core.SubInsert, 1, false},
-	"SETRANGE":     {core.OpWrite, core.SubInsert, 1, false},
+	// --- Writes: string (insert) ---
+	"SET":    {core.OpWrite, core.SubInsert, 1, false},
+	"SETNX":  {core.OpWrite, core.SubInsert, 1, false},
+	"SETEX":  {core.OpWrite, core.SubInsert, 1, false},
+	"PSETEX": {core.OpWrite, core.SubInsert, 1, false},
+	"MSET":   {core.OpWrite, core.SubInsert, 1, true},
+	"MSETNX": {core.OpWrite, core.SubInsert, 1, true},
 
-	// --- Writes: hash ---
-	"HSET":          {core.OpWrite, core.SubInsert, 1, false},
-	"HSETNX":        {core.OpWrite, core.SubInsert, 1, false},
-	"HMSET":         {core.OpWrite, core.SubInsert, 1, false},
-	"HINCRBY":       {core.OpWrite, core.SubInsert, 1, false},
-	"HINCRBYFLOAT":  {core.OpWrite, core.SubInsert, 1, false},
-	"HDEL":          {core.OpWrite, core.SubInsert, 1, false},
+	// --- Writes: string (update — hydrate before write) ---
+	"APPEND":      {core.OpWrite, core.SubUpdate, 1, false},
+	"INCR":        {core.OpWrite, core.SubUpdate, 1, false},
+	"INCRBY":      {core.OpWrite, core.SubUpdate, 1, false},
+	"INCRBYFLOAT": {core.OpWrite, core.SubUpdate, 1, false},
+	"DECR":        {core.OpWrite, core.SubUpdate, 1, false},
+	"DECRBY":      {core.OpWrite, core.SubUpdate, 1, false},
+	"GETSET":      {core.OpWrite, core.SubUpdate, 1, false},
+	"SETRANGE":    {core.OpWrite, core.SubUpdate, 1, false},
 
-	// --- Writes: list ---
-	"LPUSH":     {core.OpWrite, core.SubInsert, 1, false},
-	"RPUSH":     {core.OpWrite, core.SubInsert, 1, false},
-	"LPUSHX":    {core.OpWrite, core.SubInsert, 1, false},
-	"RPUSHX":    {core.OpWrite, core.SubInsert, 1, false},
-	"LPOP":      {core.OpWrite, core.SubInsert, 1, false},
-	"RPOP":      {core.OpWrite, core.SubInsert, 1, false},
-	"LSET":      {core.OpWrite, core.SubInsert, 1, false},
-	"LINSERT":   {core.OpWrite, core.SubInsert, 1, false},
-	"LTRIM":     {core.OpWrite, core.SubInsert, 1, false},
-	"LREM":      {core.OpWrite, core.SubInsert, 1, false},
-	"RPOPLPUSH": {core.OpWrite, core.SubInsert, 1, false},
-	"LMOVE":     {core.OpWrite, core.SubInsert, 1, false},
-	"BLPOP":     {core.OpWrite, core.SubInsert, 1, true},
-	"BRPOP":     {core.OpWrite, core.SubInsert, 1, true},
-	"BLMOVE":    {core.OpWrite, core.SubInsert, 1, false},
+	// --- Writes: hash (update — hydrate before write) ---
+	"HSET":         {core.OpWrite, core.SubUpdate, 1, false},
+	"HSETNX":       {core.OpWrite, core.SubUpdate, 1, false},
+	"HMSET":        {core.OpWrite, core.SubUpdate, 1, false},
+	"HINCRBY":      {core.OpWrite, core.SubUpdate, 1, false},
+	"HINCRBYFLOAT": {core.OpWrite, core.SubUpdate, 1, false},
 
-	// --- Writes: set ---
-	"SADD":         {core.OpWrite, core.SubInsert, 1, false},
-	"SREM":         {core.OpWrite, core.SubInsert, 1, false},
-	"SMOVE":        {core.OpWrite, core.SubInsert, 1, false},
-	"SPOP":         {core.OpWrite, core.SubInsert, 1, false},
-	"SDIFFSTORE":   {core.OpWrite, core.SubInsert, 1, true},
-	"SINTERSTORE":  {core.OpWrite, core.SubInsert, 1, true},
-	"SUNIONSTORE":  {core.OpWrite, core.SubInsert, 1, true},
+	// --- Writes: hash (delete — tombstone) ---
+	"HDEL": {core.OpWrite, core.SubDelete, 1, false},
 
-	// --- Writes: sorted set ---
-	"ZADD":              {core.OpWrite, core.SubInsert, 1, false},
-	"ZREM":              {core.OpWrite, core.SubInsert, 1, false},
-	"ZINCRBY":           {core.OpWrite, core.SubInsert, 1, false},
-	"ZREMRANGEBYSCORE":  {core.OpWrite, core.SubInsert, 1, false},
-	"ZREMRANGEBYRANK":   {core.OpWrite, core.SubInsert, 1, false},
-	"ZREMRANGEBYLEX":    {core.OpWrite, core.SubInsert, 1, false},
-	"ZUNIONSTORE":       {core.OpWrite, core.SubInsert, 1, true},
-	"ZINTERSTORE":       {core.OpWrite, core.SubInsert, 1, true},
-	"ZPOPMIN":           {core.OpWrite, core.SubInsert, 1, false},
-	"ZPOPMAX":           {core.OpWrite, core.SubInsert, 1, false},
-	"BZPOPMIN":          {core.OpWrite, core.SubInsert, 1, true},
-	"BZPOPMAX":          {core.OpWrite, core.SubInsert, 1, true},
+	// --- Writes: list (update — hydrate before write) ---
+	"LPUSH":  {core.OpWrite, core.SubUpdate, 1, false},
+	"RPUSH":  {core.OpWrite, core.SubUpdate, 1, false},
+	"LPUSHX": {core.OpWrite, core.SubUpdate, 1, false},
+	"RPUSHX": {core.OpWrite, core.SubUpdate, 1, false},
+	"LSET":   {core.OpWrite, core.SubUpdate, 1, false},
+	"LINSERT": {core.OpWrite, core.SubUpdate, 1, false},
 
-	// --- Writes: stream ---
-	"XADD":    {core.OpWrite, core.SubInsert, 1, false},
-	"XDEL":    {core.OpWrite, core.SubInsert, 1, false},
-	"XTRIM":   {core.OpWrite, core.SubInsert, 1, false},
-	"XGROUP":  {core.OpWrite, core.SubInsert, 0, false},
-	"XACK":    {core.OpWrite, core.SubInsert, 1, false},
-	"XCLAIM":  {core.OpWrite, core.SubInsert, 1, false},
+	// --- Writes: list (delete — tombstone) ---
+	"LPOP": {core.OpWrite, core.SubDelete, 1, false},
+	"RPOP": {core.OpWrite, core.SubDelete, 1, false},
+	"LREM": {core.OpWrite, core.SubDelete, 1, false},
+
+	// --- Writes: list (truncate) ---
+	"LTRIM": {core.OpWrite, core.SubTruncate, 1, false},
+
+	// --- Writes: list (insert — multi-key) ---
+	"RPOPLPUSH": {core.OpWrite, core.SubUpdate, 1, false},
+	"LMOVE":     {core.OpWrite, core.SubUpdate, 1, false},
+	"BLPOP":     {core.OpWrite, core.SubDelete, 1, true},
+	"BRPOP":     {core.OpWrite, core.SubDelete, 1, true},
+	"BLMOVE":    {core.OpWrite, core.SubUpdate, 1, false},
+
+	// --- Writes: set (update — hydrate before write) ---
+	"SADD":  {core.OpWrite, core.SubUpdate, 1, false},
+	"SMOVE": {core.OpWrite, core.SubUpdate, 1, false},
+
+	// --- Writes: set (delete — tombstone) ---
+	"SREM": {core.OpWrite, core.SubDelete, 1, false},
+	"SPOP": {core.OpWrite, core.SubDelete, 1, false},
+
+	// --- Writes: set (insert — store operations) ---
+	"SDIFFSTORE":  {core.OpWrite, core.SubInsert, 1, true},
+	"SINTERSTORE": {core.OpWrite, core.SubInsert, 1, true},
+	"SUNIONSTORE": {core.OpWrite, core.SubInsert, 1, true},
+
+	// --- Writes: sorted set (update — hydrate before write) ---
+	"ZADD":    {core.OpWrite, core.SubUpdate, 1, false},
+	"ZINCRBY": {core.OpWrite, core.SubUpdate, 1, false},
+
+	// --- Writes: sorted set (delete — tombstone) ---
+	"ZREM":             {core.OpWrite, core.SubDelete, 1, false},
+	"ZREMRANGEBYSCORE": {core.OpWrite, core.SubDelete, 1, false},
+	"ZREMRANGEBYRANK":  {core.OpWrite, core.SubDelete, 1, false},
+	"ZREMRANGEBYLEX":   {core.OpWrite, core.SubDelete, 1, false},
+	"ZPOPMIN":          {core.OpWrite, core.SubDelete, 1, false},
+	"ZPOPMAX":          {core.OpWrite, core.SubDelete, 1, false},
+	"BZPOPMIN":         {core.OpWrite, core.SubDelete, 1, true},
+	"BZPOPMAX":         {core.OpWrite, core.SubDelete, 1, true},
+
+	// --- Writes: sorted set (insert — store operations) ---
+	"ZUNIONSTORE": {core.OpWrite, core.SubInsert, 1, true},
+	"ZINTERSTORE": {core.OpWrite, core.SubInsert, 1, true},
+
+	// --- Writes: stream (update — hydrate before write) ---
+	"XADD": {core.OpWrite, core.SubUpdate, 1, false},
+
+	// --- Writes: stream (delete — tombstone) ---
+	"XDEL": {core.OpWrite, core.SubDelete, 1, false},
+
+	// --- Writes: stream (truncate) ---
+	"XTRIM": {core.OpWrite, core.SubTruncate, 1, false},
+
+	// --- Writes: stream (insert — group management) ---
+	"XGROUP": {core.OpWrite, core.SubInsert, 0, false},
+	"XACK":   {core.OpWrite, core.SubInsert, 1, false},
+	"XCLAIM": {core.OpWrite, core.SubInsert, 1, false},
+
+	// --- Writes: HyperLogLog ---
+	"PFADD":   {core.OpWrite, core.SubUpdate, 1, false},
+	"PFCOUNT": {core.OpRead, core.SubSelect, 1, true},
+	"PFMERGE": {core.OpWrite, core.SubInsert, 1, true},
+
+	// --- Writes: bitmap ---
+	"SETBIT":   {core.OpWrite, core.SubUpdate, 1, false},
+	"GETBIT":   {core.OpRead, core.SubSelect, 1, false},
+	"BITCOUNT": {core.OpRead, core.SubSelect, 1, false},
+	"BITPOS":   {core.OpRead, core.SubSelect, 1, false},
+	"BITFIELD": {core.OpWrite, core.SubUpdate, 1, false},
+	"BITFIELD_RO": {core.OpRead, core.SubSelect, 1, false},
+	"BITOP":    {core.OpWrite, core.SubInsert, 0, true}, // dest is args[2]
+
+	// --- Writes: geospatial ---
+	"GEOADD":          {core.OpWrite, core.SubUpdate, 1, false},
+	"GEODIST":         {core.OpRead, core.SubSelect, 1, false},
+	"GEOHASH":         {core.OpRead, core.SubSelect, 1, false},
+	"GEOPOS":          {core.OpRead, core.SubSelect, 1, false},
+	"GEOSEARCH":       {core.OpRead, core.SubSelect, 1, false},
+	"GEOSEARCHSTORE":  {core.OpWrite, core.SubInsert, 1, false},
+	"GEORADIUS":       {core.OpRead, core.SubSelect, 1, false},
+	"GEORADIUSBYMEMBER": {core.OpRead, core.SubSelect, 1, false},
+
+	// --- Redis 7.0+ ---
+	"LMPOP":       {core.OpWrite, core.SubDelete, 0, true},
+	"ZMPOP":       {core.OpWrite, core.SubDelete, 0, true},
+	"GETEX":       {core.OpWrite, core.SubUpdate, 1, false},
+	"GETDEL":      {core.OpWrite, core.SubDelete, 1, false},
+	"SINTERCARD":  {core.OpRead, core.SubSelect, 0, true},
+	"LCS":         {core.OpRead, core.SubSelect, 1, false},
+	"EXPIRETIME":  {core.OpRead, core.SubSelect, 1, false},
+	"PEXPIRETIME": {core.OpRead, core.SubSelect, 1, false},
+	"OBJECT":      {core.OpRead, core.SubSelect, 0, false},
+
+	// --- Function API (Redis 7.0+) ---
+	"FUNCTION": {core.OpOther, core.SubOther, 0, false},
+	"FCALL":    {core.OpWrite, core.SubInsert, 0, true},
+	"FCALL_RO": {core.OpRead, core.SubSelect, 0, true},
 
 	// --- Writes: key management ---
 	"DEL":       {core.OpWrite, core.SubDelete, 1, true},
 	"UNLINK":    {core.OpWrite, core.SubDelete, 1, true},
-	"RENAME":    {core.OpWrite, core.SubInsert, 1, false},
-	"RENAMENX":  {core.OpWrite, core.SubInsert, 1, false},
+	"RENAME":    {core.OpWrite, core.SubUpdate, 1, false},
+	"RENAMENX":  {core.OpWrite, core.SubUpdate, 1, false},
 	"COPY":      {core.OpWrite, core.SubInsert, 1, false},
 	"MOVE":      {core.OpWrite, core.SubInsert, 1, false},
-	"PERSIST":   {core.OpWrite, core.SubInsert, 1, false},
-	"EXPIRE":    {core.OpWrite, core.SubInsert, 1, false},
-	"EXPIREAT":  {core.OpWrite, core.SubInsert, 1, false},
-	"PEXPIRE":   {core.OpWrite, core.SubInsert, 1, false},
-	"PEXPIREAT": {core.OpWrite, core.SubInsert, 1, false},
+	"PERSIST":   {core.OpWrite, core.SubUpdate, 1, false},
+	"EXPIRE":    {core.OpWrite, core.SubUpdate, 1, false},
+	"EXPIREAT":  {core.OpWrite, core.SubUpdate, 1, false},
+	"PEXPIRE":   {core.OpWrite, core.SubUpdate, 1, false},
+	"PEXPIREAT": {core.OpWrite, core.SubUpdate, 1, false},
 	"RESTORE":   {core.OpWrite, core.SubInsert, 1, false},
 	"SORT":      {core.OpRead, core.SubSelect, 1, false}, // read by default; write if STORE present
 
@@ -201,7 +263,7 @@ var commandMap = map[string]opInfo{
 	"COMMAND":   {core.OpOther, core.SubOther, 0, false},
 	"CLIENT":    {core.OpOther, core.SubOther, 0, false},
 	"CLUSTER":   {core.OpOther, core.SubOther, 0, false},
-	"DEBUG":     {core.OpOther, core.SubOther, 0, false},
+	"DEBUG":     {core.OpOther, core.SubNotSupported, 0, false},
 	"WAIT":      {core.OpOther, core.SubOther, 0, false},
 	"SUBSCRIBE":    {core.OpOther, core.SubOther, 0, true},  // routed to both prod+shadow
 	"PSUBSCRIBE":   {core.OpOther, core.SubOther, 0, true},  // routed to both prod+shadow
@@ -209,6 +271,14 @@ var commandMap = map[string]opInfo{
 	"PUNSUBSCRIBE": {core.OpOther, core.SubOther, 0, false},
 	"PUBLISH":      {core.OpWrite, core.SubInsert, 0, false}, // shadow-only (write guard)
 	"PUBSUB":       {core.OpOther, core.SubOther, 0, false},
+
+	// --- Dangerous: blocked through Mori ---
+	"SHUTDOWN":   {core.OpOther, core.SubNotSupported, 0, false},
+	"REPLICAOF":  {core.OpOther, core.SubNotSupported, 0, false},
+	"SLAVEOF":    {core.OpOther, core.SubNotSupported, 0, false},
+	"FAILOVER":   {core.OpOther, core.SubNotSupported, 0, false},
+	"BGSAVE":     {core.OpOther, core.SubNotSupported, 0, false},
+	"BGREWRITEAOF": {core.OpOther, core.SubNotSupported, 0, false},
 
 	// --- Lua scripting ---
 	"EVAL":      {core.OpWrite, core.SubInsert, 0, true},

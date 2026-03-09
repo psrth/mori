@@ -2,6 +2,7 @@ package schema
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -10,10 +11,18 @@ import (
 	"github.com/mori-dev/mori/internal/engine/redis/connstr"
 )
 
+// dialRedis connects to a Redis instance, using TLS if info.SSL is true.
+func dialRedis(info *connstr.ConnInfo) (net.Conn, error) {
+	if info.SSL {
+		return tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", info.Addr(), &tls.Config{})
+	}
+	return net.DialTimeout("tcp", info.Addr(), 10*time.Second)
+}
+
 // DetectKeyMetadata connects to a Redis instance and discovers key patterns.
 // Uses SCAN to iterate keys and TYPE to classify them by prefix.
 func DetectKeyMetadata(info *connstr.ConnInfo) (map[string]KeyMeta, error) {
-	conn, err := net.DialTimeout("tcp", info.Addr(), 10*time.Second)
+	conn, err := dialRedis(info)
 	if err != nil {
 		return nil, fmt.Errorf("connect to Redis: %w", err)
 	}
@@ -263,7 +272,7 @@ func formatCommand(args ...string) string {
 
 // GetRedisInfo connects to Redis and returns INFO server output.
 func GetRedisInfo(info *connstr.ConnInfo) (string, error) {
-	conn, err := net.DialTimeout("tcp", info.Addr(), 10*time.Second)
+	conn, err := dialRedis(info)
 	if err != nil {
 		return "", fmt.Errorf("connect to Redis: %w", err)
 	}
@@ -323,7 +332,7 @@ func ParseRedisVersion(infoOutput string) string {
 
 // PingRedis checks connectivity to a Redis instance.
 func PingRedis(info *connstr.ConnInfo) error {
-	conn, err := net.DialTimeout("tcp", info.Addr(), 10*time.Second)
+	conn, err := dialRedis(info)
 	if err != nil {
 		return fmt.Errorf("connect to Redis: %w", err)
 	}
