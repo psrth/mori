@@ -11,6 +11,7 @@ import (
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/mori-dev/mori/internal/logging"
 )
@@ -28,6 +29,7 @@ type Proxy struct {
 	port         int
 	verbose      bool
 
+	tlsParams       tlsutil.TLSParams
 	deltaMap        *delta.Map
 	tombstones      *delta.TombstoneSet
 	tables          map[string]schema.TableMeta
@@ -56,6 +58,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	schemaRegistry *coreSchema.Registry,
 	logger *logging.Logger,
 	maxRowsHydrate int,
+	tlsParams tlsutil.TLSParams,
 ) *Proxy {
 	return &Proxy{
 		prodAddr:       prodAddr,
@@ -65,6 +68,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		router:         router,
 		port:           listenPort,
 		verbose:        verbose,
+		tlsParams:      tlsParams,
 		deltaMap:       deltaMap,
 		tombstones:     tombstones,
 		tables:         tables,

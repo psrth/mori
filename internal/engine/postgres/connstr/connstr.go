@@ -52,7 +52,7 @@ func Parse(connStr string) (*ProdDSN, error) {
 		dsn.Port = 5432
 	}
 	if dsn.SSLMode == "" {
-		dsn.SSLMode = "disable"
+		dsn.SSLMode = "verify-full"
 	}
 	if dsn.User == "" {
 		dsn.User = "postgres"

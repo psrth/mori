@@ -55,7 +55,7 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	}
 
 	// Relay TDS handshake between client and prod.
-	if err := relayHandshake(clientConn, prodConn); err != nil {
+	if err := relayHandshake(clientConn, prodConn, p.tlsParams); err != nil {
 		log.Printf("[conn %d] handshake failed: %v", connID, err)
 		clientConn.Close()
 		prodConn.Close()

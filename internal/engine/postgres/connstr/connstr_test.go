@@ -40,8 +40,8 @@ func TestParseURIDefaults(t *testing.T) {
 	if dsn.User != "postgres" {
 		t.Errorf("user = %q, want default %q", dsn.User, "postgres")
 	}
-	if dsn.SSLMode != "disable" {
-		t.Errorf("sslmode = %q, want default %q", dsn.SSLMode, "disable")
+	if dsn.SSLMode != "verify-full" {
+		t.Errorf("sslmode = %q, want default %q", dsn.SSLMode, "verify-full")
 	}
 }
 

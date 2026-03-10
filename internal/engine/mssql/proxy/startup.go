@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 )
 
 // PRELOGIN encryption negotiation values.
@@ -21,7 +23,16 @@ const (
 // 2. Server -> Client: PRELOGIN response (type 0x12)
 // 3. Client -> Server: LOGIN7 (type 0x10)
 // 4. Server -> Client: Login response (type 0x04, contains LOGINACK + ENVCHANGE + DONE tokens)
-func relayHandshake(clientConn, prodConn net.Conn) error {
+func relayHandshake(clientConn, prodConn net.Conn, tlsParams tlsutil.TLSParams) error {
+	// TODO: Implement TDS-wrapped TLS negotiation for prod connections.
+	// Currently the proxy strips encryption from PRELOGIN, leaving the
+	// prod connection unencrypted. A tdsTransport adapter is needed to
+	// frame TLS handshake bytes inside TDS packets.
+
+	if tlsParams.SSLMode != "" && tlsParams.SSLMode != "disable" {
+		return fmt.Errorf("sslmode=%s requires TLS but MSSQL TDS-wrapped TLS is not yet implemented; set encrypt=false in connection string to proceed without encryption", tlsParams.SSLMode)
+	}
+
 	// 1. Read PRELOGIN from client.
 	preloginReq, err := readTDSMessage(clientConn)
 	if err != nil {
@@ -139,9 +150,10 @@ func connectShadow(shadowAddr, dbName string) (net.Conn, error) {
 	// If the server requires or defaults to encryption, upgrade to TLS.
 	var loginConn net.Conn = shadowConn
 	if encryptionVal == preloginEncryptOn || encryptionVal == preloginEncryptReq {
-		tlsConn := tls.Client(shadowConn, &tls.Config{
-			InsecureSkipVerify: true,
-		})
+		// Shadow runs on localhost — use require mode (encrypt only).
+		shadowTLS := tlsutil.TLSParams{SSLMode: "require"}
+		tlsCfg, _ := tlsutil.BuildConfig(shadowTLS)
+		tlsConn := tls.Client(shadowConn, tlsCfg)
 		if err := tlsConn.Handshake(); err != nil {
 			shadowConn.Close()
 			return nil, fmt.Errorf("TLS handshake with shadow: %w", err)

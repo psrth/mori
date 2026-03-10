@@ -50,6 +50,7 @@ type InitResult struct {
 // ProxyDeps bundles all dependencies needed to create a proxy.
 type ProxyDeps struct {
 	ProdAddr       string
+	ProdHost       string // hostname for SNI and TLS verification
 	ShadowAddr     string
 	DBName         string
 	ListenPort     int
@@ -61,7 +62,11 @@ type ProxyDeps struct {
 	SchemaReg      *coreSchema.Registry
 	MoriDir        string
 	Logger         *logging.Logger
-	MaxRowsHydrate int // cap on rows hydrated from Prod during materialization; 0 = unlimited
+	MaxRowsHydrate int    // cap on rows hydrated from Prod during materialization; 0 = unlimited
+	SSLMode        string // TLS verification mode: "disable", "require", "verify-ca", "verify-full"
+	CACertPath     string // path to CA certificate for verify-ca/verify-full
+	CertPath       string // path to client certificate for mTLS
+	KeyPath        string // path to client key for mTLS
 }
 
 // Engine defines the contract for a database engine implementation.
