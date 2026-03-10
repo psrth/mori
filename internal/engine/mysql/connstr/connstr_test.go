@@ -1,6 +1,7 @@
 package connstr
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -189,6 +190,41 @@ func TestShadowDSN(t *testing.T) {
 	want := "root:mori@tcp(127.0.0.1:9001)/testdb"
 	if got != want {
 		t.Errorf("ShadowDSN() = %q, want %q", got, want)
+	}
+}
+
+func TestSSLModeNotInGoDSN(t *testing.T) {
+	// ssl-mode should be extracted into SSLMode, normalized, and removed from
+	// Params so GoDSN() doesn't emit it (the MySQL driver rejects unknown params).
+	tests := []struct {
+		name        string
+		input       string
+		wantSSLMode string
+	}{
+		{"URI format", "mysql://user:pass@host:3306/db?ssl-mode=REQUIRED", "require"},
+		{"Go DSN format", "user:pass@tcp(host:3306)/db?ssl-mode=REQUIRED", "require"},
+		{"VERIFY_IDENTITY", "mysql://user:pass@host:3306/db?ssl-mode=VERIFY_IDENTITY", "verify-full"},
+		{"VERIFY_CA", "user:pass@tcp(host:3306)/db?ssl-mode=VERIFY_CA", "verify-ca"},
+		{"DISABLED", "mysql://user:pass@host:3306/db?ssl-mode=DISABLED", "disable"},
+		{"PREFERRED", "mysql://user:pass@host:3306/db?ssl-mode=PREFERRED", "prefer"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, err := Parse(tt.input)
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+			if dsn.SSLMode != tt.wantSSLMode {
+				t.Errorf("SSLMode = %q, want %q", dsn.SSLMode, tt.wantSSLMode)
+			}
+			if _, ok := dsn.Params["ssl-mode"]; ok {
+				t.Error("ssl-mode still present in Params after Parse")
+			}
+			goDSN := dsn.GoDSN()
+			if strings.Contains(goDSN, "ssl-mode") {
+				t.Errorf("GoDSN() contains ssl-mode: %s", goDSN)
+			}
+		})
 	}
 }
 

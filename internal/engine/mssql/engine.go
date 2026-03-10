@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/mori-dev/mori/internal/core"
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 	"github.com/mori-dev/mori/internal/engine"
 	"github.com/mori-dev/mori/internal/engine/mssql/classify"
 	"github.com/mori-dev/mori/internal/engine/mssql/connstr"
@@ -55,6 +56,7 @@ func (e *mssqlEngine) ParseConnStr(cs string) (*engine.ConnInfo, error) {
 		DBName:   dsn.DBName,
 		User:     dsn.User,
 		Password: dsn.Password,
+		SSLMode:  dsn.SSLMode,
 		ConnStr:  dsn.GoDSN(),
 	}, nil
 }
@@ -87,6 +89,13 @@ func (e *mssqlEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 		deps.SchemaReg,
 		deps.Logger,
 		deps.MaxRowsHydrate,
+		tlsutil.TLSParams{
+			ServerName: deps.ProdHost,
+			SSLMode:    deps.SSLMode,
+			CACertPath: deps.CACertPath,
+			CertPath:   deps.CertPath,
+			KeyPath:    deps.KeyPath,
+		},
 	)
 }
 

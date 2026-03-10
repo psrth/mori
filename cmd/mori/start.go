@@ -316,6 +316,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// 20. Create proxy.
 	p := eng.NewProxy(engine.ProxyDeps{
 		ProdAddr:       prodAddr,
+		ProdHost:       connInfo.Host,
 		ShadowAddr:     shadowAddr,
 		DBName:         connInfo.DBName,
 		ListenPort:     port,
@@ -328,6 +329,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 		MoriDir:        connDir,
 		Logger:         logger,
 		MaxRowsHydrate: cfg.MaxRowsHydrate,
+		SSLMode:        connInfo.SSLMode,
 	}, tables)
 
 	// 21. Set up signal handling.

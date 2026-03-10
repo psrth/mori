@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/mori-dev/mori/internal/core"
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 	"github.com/mori-dev/mori/internal/engine"
 	"github.com/mori-dev/mori/internal/engine/postgres/classify"
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
@@ -90,6 +91,13 @@ func (e *pgEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.Tabl
 		deps.SchemaReg,
 		deps.Logger,
 		deps.MaxRowsHydrate,
+		tlsutil.TLSParams{
+			ServerName: deps.ProdHost,
+			SSLMode:    deps.SSLMode,
+			CACertPath: deps.CACertPath,
+			CertPath:   deps.CertPath,
+			KeyPath:    deps.KeyPath,
+		},
 	)
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 )
 
 // handleConn manages a single client connection's lifecycle.
@@ -64,8 +65,7 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 // and independently initiates a Shadow connection.
 // Returns the (possibly TLS-upgraded) prodConn and the shadow connection.
 func (p *Proxy) performStartup(clientConn, prodConn net.Conn, connID int64) (net.Conn, net.Conn, error) {
-	prodHost, _, _ := net.SplitHostPort(p.prodAddr)
-	prodConn, err := relayStartup(clientConn, prodConn, prodHost)
+	prodConn, err := relayStartup(clientConn, prodConn, p.tlsParams)
 	if err != nil {
 		return prodConn, nil, fmt.Errorf("prod startup: %w", err)
 	}
@@ -83,7 +83,7 @@ func (p *Proxy) performStartup(clientConn, prodConn net.Conn, connID int64) (net
 // SSL handling: the proxy listens on localhost only, so it declines SSL from
 // the client ('N') and independently negotiates TLS with Prod when the server
 // supports it. This avoids requiring the proxy to present its own TLS certificate.
-func relayStartup(clientConn, prodConn net.Conn, prodHost string) (net.Conn, error) {
+func relayStartup(clientConn, prodConn net.Conn, tlsParams tlsutil.TLSParams) (net.Conn, error) {
 	// Read initial message from client (no type byte).
 	startupRaw, err := readStartupMsg(clientConn)
 	if err != nil {
@@ -105,7 +105,7 @@ func relayStartup(clientConn, prodConn net.Conn, prodHost string) (net.Conn, err
 	}
 
 	// Negotiate TLS with Prod independently of the client.
-	prodConn, err = negotiateProdSSL(prodConn, prodHost)
+	prodConn, err = negotiateProdSSL(prodConn, tlsParams)
 	if err != nil {
 		return prodConn, fmt.Errorf("prod SSL negotiation: %w", err)
 	}
@@ -158,11 +158,17 @@ func relayStartup(clientConn, prodConn net.Conn, prodHost string) (net.Conn, err
 }
 
 // negotiateProdSSL sends an SSLRequest to Prod and upgrades the connection
-// to TLS if the server supports it. prodHost is used as the TLS ServerName
-// for SNI, which is required by cloud providers like Neon that route
-// connections based on the hostname. Returns the original connection unchanged
-// if Prod declines SSL.
-func negotiateProdSSL(prodConn net.Conn, prodHost string) (net.Conn, error) {
+// to TLS based on the configured TLS parameters. Returns the original
+// connection unchanged if SSLMode is "disable" or Prod declines SSL.
+func negotiateProdSSL(prodConn net.Conn, params tlsutil.TLSParams) (net.Conn, error) {
+	tlsCfg, err := tlsutil.BuildConfig(params)
+	if err != nil {
+		return prodConn, fmt.Errorf("building TLS config: %w", err)
+	}
+	if tlsCfg == nil {
+		return prodConn, nil // SSLMode=disable
+	}
+
 	if _, err := prodConn.Write(buildSSLRequest()); err != nil {
 		return prodConn, fmt.Errorf("sending SSLRequest to prod: %w", err)
 	}
@@ -173,17 +179,18 @@ func negotiateProdSSL(prodConn net.Conn, prodHost string) (net.Conn, error) {
 	}
 
 	if resp[0] == 'S' {
-		tlsConn := tls.Client(prodConn, &tls.Config{
-			ServerName:         prodHost,
-			InsecureSkipVerify: true,
-		})
+		tlsConn := tls.Client(prodConn, tlsCfg)
 		if err := tlsConn.Handshake(); err != nil {
 			return prodConn, fmt.Errorf("TLS handshake with prod: %w", err)
 		}
 		return tlsConn, nil
 	}
 
-	// Prod declined SSL — continue with plain TCP.
+	// Prod declined SSL — error if mode requires it.
+	if params.SSLMode == "require" || params.SSLMode == "verify-ca" || params.SSLMode == "verify-full" {
+		return prodConn, fmt.Errorf("server does not support SSL but sslmode=%s requires it", params.SSLMode)
+	}
+
 	return prodConn, nil
 }
 

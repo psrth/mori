@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 )
 
 // clientSSL is the MySQL CLIENT_SSL capability flag.
@@ -21,7 +23,7 @@ const clientSSL uint32 = 0x0800
 // SSL handling: the proxy listens on localhost only, so it strips CLIENT_SSL
 // from the server handshake before forwarding to the client. If the server
 // supports SSL, the proxy independently negotiates TLS with prod.
-func relayHandshake(clientConn, prodConn net.Conn, prodHost string) (net.Conn, error) {
+func relayHandshake(clientConn, prodConn net.Conn, tlsParams tlsutil.TLSParams) (net.Conn, error) {
 	// 1. Read initial handshake from Prod.
 	handshake, err := readMySQLPacket(prodConn)
 	if err != nil {
@@ -37,13 +39,21 @@ func relayHandshake(clientConn, prodConn net.Conn, prodHost string) (net.Conn, e
 		return prodConn, fmt.Errorf("forwarding handshake to client: %w", err)
 	}
 
-	// If Prod supports SSL, negotiate TLS before the client sends its response.
-	if prodSupportsSSL {
+	// If SSLMode is "disable", skip SSL negotiation entirely.
+	if tlsParams.SSLMode == "disable" {
+		// Do not negotiate SSL regardless of prod capabilities.
+	} else if prodSupportsSSL {
+		// Prod supports SSL; negotiate TLS before the client sends its response.
 		charset := handshakeCharset(handshake.Payload)
-		prodConn, err = negotiateMySQLSSL(prodConn, charset, prodHost)
+		prodConn, err = negotiateMySQLSSL(prodConn, charset, tlsParams)
 		if err != nil {
 			return prodConn, fmt.Errorf("prod SSL negotiation: %w", err)
 		}
+	} else if tlsParams.SSLMode == "prefer" {
+		// "prefer" falls back to plaintext when the server doesn't support SSL.
+	} else if tlsParams.SSLMode == "require" || tlsParams.SSLMode == "verify-ca" || tlsParams.SSLMode == "verify-full" {
+		// SSL is required but prod does not support it.
+		return prodConn, fmt.Errorf("sslmode %q requires SSL but prod server does not support it", tlsParams.SSLMode)
 	}
 
 	// 2. Read handshake response from client (plain TCP — client didn't see SSL).
@@ -183,7 +193,7 @@ func handshakeCharset(payload []byte) byte {
 // negotiateMySQLSSL sends a MySQL SSL Request to the server and upgrades
 // the connection to TLS. The SSL Request is a truncated Handshake Response
 // containing only capability flags, max packet size, charset, and reserved bytes.
-func negotiateMySQLSSL(prodConn net.Conn, charset byte, prodHost string) (net.Conn, error) {
+func negotiateMySQLSSL(prodConn net.Conn, charset byte, tlsParams tlsutil.TLSParams) (net.Conn, error) {
 	// Build SSL Request payload (32 bytes):
 	// caps(4 LE) + max_packet(4 LE) + charset(1) + reserved(23 zeros)
 	var payload [32]byte
@@ -197,10 +207,15 @@ func negotiateMySQLSSL(prodConn net.Conn, charset byte, prodHost string) (net.Co
 		return prodConn, fmt.Errorf("sending SSL request to prod: %w", err)
 	}
 
-	tlsConn := tls.Client(prodConn, &tls.Config{
-		ServerName:         prodHost,
-		InsecureSkipVerify: true,
-	})
+	tlsCfg, err := tlsutil.BuildConfig(tlsParams)
+	if err != nil {
+		return prodConn, fmt.Errorf("building TLS config: %w", err)
+	}
+	if tlsCfg == nil {
+		return prodConn, fmt.Errorf("TLS config is nil (SSLMode=%q); caller should not have initiated SSL negotiation", tlsParams.SSLMode)
+	}
+
+	tlsConn := tls.Client(prodConn, tlsCfg)
 	if err := tlsConn.Handshake(); err != nil {
 		return prodConn, fmt.Errorf("TLS handshake with prod: %w", err)
 	}

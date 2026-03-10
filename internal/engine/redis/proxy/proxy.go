@@ -14,6 +14,7 @@ import (
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 	"github.com/mori-dev/mori/internal/engine/redis/classify"
 	"github.com/mori-dev/mori/internal/engine/redis/schema"
 	"github.com/mori-dev/mori/internal/logging"
@@ -39,7 +40,7 @@ type Proxy struct {
 	shadowAddr string
 	prodPass   string // password for prod Redis
 	prodDB     int    // db number for prod Redis
-	prodSSL    bool   // use TLS for prod Redis (rediss://)
+	tlsParams  tlsutil.TLSParams
 	port       int
 	verbose    bool
 
@@ -64,7 +65,7 @@ type Proxy struct {
 // New creates a Redis Proxy.
 func New(
 	prodAddr, shadowAddr string,
-	prodPass string, prodDB int, prodSSL bool,
+	prodPass string, prodDB int, tlsParams tlsutil.TLSParams,
 	listenPort int, verbose bool,
 	classifier core.Classifier, router *core.Router,
 	deltaMap *delta.Map, tombstones *delta.TombstoneSet,
@@ -77,7 +78,7 @@ func New(
 		shadowAddr:     shadowAddr,
 		prodPass:       prodPass,
 		prodDB:         prodDB,
-		prodSSL:        prodSSL,
+		tlsParams:      tlsParams,
 		port:           listenPort,
 		verbose:        verbose,
 		classifier:     classifier,
@@ -185,8 +186,14 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	// Connect to prod Redis.
 	var prodConn net.Conn
 	var err error
-	if p.prodSSL {
-		prodConn, err = tls.Dial("tcp", p.prodAddr, &tls.Config{})
+	tlsCfg, tlsErr := tlsutil.BuildConfig(p.tlsParams)
+	if tlsErr != nil {
+		log.Printf("[conn %d] failed to build TLS config: %v", connID, tlsErr)
+		WriteRESPValue(clientConn, BuildErrorReply("MORI TLS configuration error"))
+		return
+	}
+	if tlsCfg != nil {
+		prodConn, err = tls.Dial("tcp", p.prodAddr, tlsCfg)
 	} else {
 		prodConn, err = net.Dial("tcp", p.prodAddr)
 	}

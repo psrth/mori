@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/mori-dev/mori/internal/core"
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 	"github.com/mori-dev/mori/internal/engine"
 	"github.com/mori-dev/mori/internal/engine/redis/classify"
 	"github.com/mori-dev/mori/internal/engine/redis/connstr"
@@ -49,12 +50,17 @@ func (e *redisEngine) ParseConnStr(cs string) (*engine.ConnInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	sslMode := "disable"
+	if info.SSL {
+		sslMode = "verify-full"
+	}
 	return &engine.ConnInfo{
 		Addr:     info.Addr(),
 		Host:     info.Host,
 		Port:     info.Port,
 		DBName:   fmt.Sprintf("db%d", info.DB),
 		Password: info.Password,
+		SSLMode:  sslMode,
 		ConnStr:  info.Raw,
 	}, nil
 }
@@ -76,13 +82,20 @@ func (e *redisEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 	info, _ := connstr.Parse(deps.ProdAddr)
 	prodPass := ""
 	prodDB := 0
-	prodSSL := false
 	if info != nil {
 		prodPass = info.Password
 		prodDB = info.DB
-		prodSSL = info.SSL
 		// Use the actual addr for connecting.
 		deps.ProdAddr = info.Addr()
+	}
+
+	// Build TLS params: use deps.SSLMode if set, otherwise infer from rediss:// scheme.
+	sslMode := deps.SSLMode
+	if sslMode == "" && info != nil && info.SSL {
+		sslMode = "verify-full"
+	}
+	if sslMode == "" {
+		sslMode = "disable"
 	}
 
 	return proxy.New(
@@ -90,7 +103,13 @@ func (e *redisEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 		deps.ShadowAddr,
 		prodPass,
 		prodDB,
-		prodSSL,
+		tlsutil.TLSParams{
+			ServerName: deps.ProdHost,
+			SSLMode:    sslMode,
+			CACertPath: deps.CACertPath,
+			CertPath:   deps.CertPath,
+			KeyPath:    deps.KeyPath,
+		},
 		deps.ListenPort,
 		deps.Verbose,
 		deps.Classifier,

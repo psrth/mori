@@ -14,6 +14,7 @@ type DSN struct {
 	DBName   string
 	User     string
 	Password string
+	SSLMode  string
 	Params   map[string]string
 	Raw      string
 }
@@ -40,6 +41,13 @@ func Parse(connStr string) (*DSN, error) {
 	}
 
 	dsn.Raw = connStr
+
+	// Normalize MySQL ssl-mode values to canonical lowercase form
+	// used by tlsutil.BuildConfig.
+	dsn.SSLMode = normalizeSSLMode(dsn.SSLMode)
+	if dsn.SSLMode == "" {
+		dsn.SSLMode = "verify-full"
+	}
 
 	if dsn.Host == "" {
 		dsn.Host = "127.0.0.1"
@@ -91,6 +99,9 @@ func parseURI(connStr string) (*DSN, error) {
 			dsn.Params[k] = vals[0]
 		}
 	}
+
+	dsn.SSLMode = u.Query().Get("ssl-mode")
+	delete(dsn.Params, "ssl-mode")
 
 	return dsn, nil
 }
@@ -164,6 +175,11 @@ func parseGoDSN(connStr string) (*DSN, error) {
 				dsn.Port = p
 			}
 		}
+	}
+
+	if v, ok := dsn.Params["ssl-mode"]; ok {
+		dsn.SSLMode = v
+		delete(dsn.Params, "ssl-mode")
 	}
 
 	return dsn, nil
@@ -274,6 +290,27 @@ func (d *DSN) MysqldumpDockerArgs() []string {
 // MysqldumpEnv returns the environment variable for mysqldump password.
 func (d *DSN) MysqldumpEnv() string {
 	return "MYSQL_PWD=" + d.Password
+}
+
+// normalizeSSLMode converts MySQL-convention ssl-mode values (uppercase,
+// underscores) to the canonical lowercase hyphenated form used by
+// tlsutil.BuildConfig.
+func normalizeSSLMode(mode string) string {
+	switch strings.ToUpper(strings.TrimSpace(mode)) {
+	case "DISABLED":
+		return "disable"
+	case "PREFERRED":
+		return "prefer"
+	case "REQUIRED":
+		return "require"
+	case "VERIFY_CA":
+		return "verify-ca"
+	case "VERIFY_IDENTITY":
+		return "verify-full"
+	default:
+		// Already canonical or empty — pass through as-is.
+		return mode
+	}
 }
 
 // Redacted returns the connection string with the password replaced by "***".

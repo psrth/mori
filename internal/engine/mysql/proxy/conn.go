@@ -52,8 +52,7 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	}
 
 	// Relay handshake between client and prod (may upgrade prodConn to TLS).
-	prodHost, _, _ := net.SplitHostPort(p.prodAddr)
-	prodConn, err = relayHandshake(clientConn, prodConn, prodHost)
+	prodConn, err = relayHandshake(clientConn, prodConn, p.tlsParams)
 	if err != nil {
 		log.Printf("[conn %d] handshake failed: %v", connID, err)
 		clientConn.Close()

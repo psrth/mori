@@ -11,6 +11,7 @@ import (
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 	"github.com/mori-dev/mori/internal/engine/mssql/schema"
 	"github.com/mori-dev/mori/internal/logging"
 )
@@ -25,6 +26,7 @@ type Proxy struct {
 	router       *core.Router
 	port         int
 	verbose      bool
+	tlsParams    tlsutil.TLSParams
 
 	deltaMap       *delta.Map
 	tombstones     *delta.TombstoneSet
@@ -50,7 +52,8 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	tables map[string]schema.TableMeta, moriDir string,
 	schemaRegistry *coreSchema.Registry,
 	logger *logging.Logger,
-	maxRowsHydrate ...int,
+	maxRowsHydrate int,
+	tlsParams tlsutil.TLSParams,
 ) *Proxy {
 	p := &Proxy{
 		prodAddr:       prodAddr,
@@ -66,10 +69,9 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		schemaRegistry: schemaRegistry,
 		moriDir:        moriDir,
 		logger:         logger,
+		maxRowsHydrate: maxRowsHydrate,
+		tlsParams:      tlsParams,
 		shutdownCh:     make(chan struct{}),
-	}
-	if len(maxRowsHydrate) > 0 {
-		p.maxRowsHydrate = maxRowsHydrate[0]
 	}
 	return p
 }

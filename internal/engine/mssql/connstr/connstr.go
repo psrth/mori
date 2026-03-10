@@ -14,6 +14,7 @@ type DSN struct {
 	DBName   string
 	User     string
 	Password string
+	SSLMode  string
 	Params   map[string]string
 	Raw      string
 }
@@ -55,6 +56,20 @@ func Parse(connStr string) (*DSN, error) {
 	}
 	if dsn.Params == nil {
 		dsn.Params = make(map[string]string)
+	}
+
+	// Map MSSQL encrypt/trust params to canonical SSLMode.
+	// Default is "disable" because TDS-wrapped TLS is not yet implemented.
+	// When TDS TLS support is added, change the default to "verify-full".
+	encrypt := strings.ToLower(dsn.Params["encrypt"])
+	trust := strings.ToLower(dsn.Params["trustservercertificate"])
+	switch {
+	case encrypt == "false" || encrypt == "no" || encrypt == "":
+		dsn.SSLMode = "disable"
+	case trust == "true" || trust == "yes":
+		dsn.SSLMode = "require"
+	default:
+		dsn.SSLMode = "verify-full"
 	}
 
 	return dsn, nil
