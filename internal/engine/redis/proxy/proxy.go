@@ -38,6 +38,7 @@ type routeDecision struct {
 type Proxy struct {
 	prodAddr   string
 	shadowAddr string
+	prodUser   string // ACL username for prod Redis (Redis 6+); empty = default user
 	prodPass   string // password for prod Redis
 	prodDB     int    // db number for prod Redis
 	tlsParams  tlsutil.TLSParams
@@ -65,7 +66,7 @@ type Proxy struct {
 // New creates a Redis Proxy.
 func New(
 	prodAddr, shadowAddr string,
-	prodPass string, prodDB int, tlsParams tlsutil.TLSParams,
+	prodUser, prodPass string, prodDB int, tlsParams tlsutil.TLSParams,
 	listenPort int, verbose bool,
 	classifier core.Classifier, router *core.Router,
 	deltaMap *delta.Map, tombstones *delta.TombstoneSet,
@@ -76,6 +77,7 @@ func New(
 	return &Proxy{
 		prodAddr:       prodAddr,
 		shadowAddr:     shadowAddr,
+		prodUser:       prodUser,
 		prodPass:       prodPass,
 		prodDB:         prodDB,
 		tlsParams:      tlsParams,
@@ -220,14 +222,27 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	prodReader := bufio.NewReader(prodConn)
 	shadowReader := bufio.NewReader(shadowConn)
 
-	if p.prodPass != "" {
-		authCmd := BuildCommandArray("AUTH", p.prodPass)
+	if p.prodPass != "" || p.prodUser != "" {
+		var authCmd *RESPValue
+		if p.prodUser != "" {
+			// Redis 6+ ACL: AUTH <username> <password>
+			authCmd = BuildCommandArray("AUTH", p.prodUser, p.prodPass)
+		} else {
+			// Legacy: AUTH <password>
+			authCmd = BuildCommandArray("AUTH", p.prodPass)
+		}
 		if _, err := prodConn.Write(authCmd.Bytes()); err != nil {
 			log.Printf("[conn %d] failed to AUTH to prod: %v", connID, err)
 			return
 		}
-		if _, err := ReadRESPValue(prodReader); err != nil {
+		authResp, err := ReadRESPValue(prodReader)
+		if err != nil {
 			log.Printf("[conn %d] failed to read AUTH response from prod: %v", connID, err)
+			return
+		}
+		if authResp.Type == '-' {
+			log.Printf("[conn %d] prod AUTH rejected: %s", connID, authResp.Str)
+			WriteRESPValue(clientConn, BuildErrorReply("MORI prod authentication failed"))
 			return
 		}
 	}
@@ -286,15 +301,108 @@ func (p *Proxy) routeLoop(
 			return
 		}
 
+		// Intercept AUTH: validate credentials match the configured prod
+		// identity to prevent privilege escalation on the shared prod connection.
+		if cmd == "AUTH" {
+			var clientUser, clientPass string
+			switch len(args) {
+			case 1:
+				clientPass = args[0]
+			case 2:
+				clientUser = args[0]
+				clientPass = args[1]
+			default:
+				WriteRESPValue(clientConn, BuildErrorReply("ERR wrong number of arguments for 'auth' command"))
+				continue
+			}
+			if !matchesProdAuth(clientUser, p.prodUser) || clientPass != p.prodPass {
+				WriteRESPValue(clientConn, BuildErrorReply("WRONGPASS invalid username-password pair or user is disabled."))
+				continue
+			}
+			// Credentials match — forward to prod for actual validation.
+			if _, err := rawProdConn.Write(cmdVal.Bytes()); err != nil {
+				log.Printf("[conn %d] failed to forward AUTH to prod: %v", connID, err)
+				return
+			}
+			resp, err := ReadRESPValue(prodReader)
+			if err != nil {
+				log.Printf("[conn %d] failed to read AUTH response from prod: %v", connID, err)
+				return
+			}
+			clientConn.Write(resp.Bytes())
+			continue
+		}
+
 		// Intercept HELLO: force RESP2 protocol (Mori proxy speaks RESP2).
+		// Redis 6+ HELLO supports optional AUTH and SETNAME sub-commands:
+		//   HELLO <proto> [AUTH <username> <password>] [SETNAME <name>]
+		// We must forward the AUTH credentials to prod so ACL validation
+		// actually occurs; otherwise the client sees a fake success while
+		// prod never validates the credentials.
 		if cmd == "HELLO" {
+			// Extract AUTH credentials from HELLO args if present.
+			if authUser, authPass, ok, twoArg := extractHelloAuth(args); ok {
+				// Validate client-supplied credentials match the configured prod
+				// credentials. Without this check a local client could re-AUTH
+				// the shared prod connection as a higher-privilege ACL user.
+				configUser := p.prodUser
+				configPass := p.prodPass
+				clientUser := authUser
+				if !twoArg {
+					// Single-arg AUTH: password only, default user.
+					clientUser = ""
+				}
+				if !matchesProdAuth(clientUser, configUser) || authPass != configPass {
+					log.Printf("[conn %d] HELLO AUTH credentials do not match configured prod credentials", connID)
+					WriteRESPValue(clientConn, BuildErrorReply("WRONGPASS invalid username-password pair or user is disabled."))
+					continue
+				}
+
+				var authCmd *RESPValue
+				if twoArg {
+					authCmd = BuildCommandArray("AUTH", authUser, authPass)
+				} else {
+					authCmd = BuildCommandArray("AUTH", authPass)
+				}
+				if _, err := rawProdConn.Write(authCmd.Bytes()); err != nil {
+					log.Printf("[conn %d] failed to forward HELLO AUTH to prod: %v", connID, err)
+					WriteRESPValue(clientConn, BuildErrorReply("MORI failed to authenticate"))
+					return
+				}
+				authResp, err := ReadRESPValue(prodReader)
+				if err != nil {
+					log.Printf("[conn %d] failed to read HELLO AUTH response from prod: %v", connID, err)
+					WriteRESPValue(clientConn, BuildErrorReply("MORI failed to authenticate"))
+					return
+				}
+				// If prod rejected the credentials, forward the error to the client.
+				if authResp.Type == '-' {
+					clientConn.Write(authResp.Bytes())
+					continue
+				}
+			}
+
 			// Respond with a RESP2 map-like array matching Redis 6+ HELLO response.
-			clientConn.Write(BuildCommandArray(
-				"server", "redis",
-				"version", "6.0.0",
-				"proto", "2",
-				"mode", "standalone",
-			).Bytes())
+			helloResp := &RESPValue{
+				Type: '*',
+				Array: []RESPValue{
+					{Type: '$', Str: "server"},
+					{Type: '$', Str: "redis"},
+					{Type: '$', Str: "version"},
+					{Type: '$', Str: "6.0.0"},
+					{Type: '$', Str: "proto"},
+					{Type: ':', Int: 2},
+					{Type: '$', Str: "id"},
+					{Type: ':', Int: connID},
+					{Type: '$', Str: "mode"},
+					{Type: '$', Str: "standalone"},
+					{Type: '$', Str: "role"},
+					{Type: '$', Str: "master"},
+					{Type: '$', Str: "modules"},
+					{Type: '*', Array: []RESPValue{}},
+				},
+			}
+			clientConn.Write(helloResp.Bytes())
 			continue
 		}
 
@@ -1361,6 +1469,53 @@ func (p *Proxy) handleBlockingCommand(
 	}
 
 	clientConn.Write(resp.Bytes())
+}
+
+// matchesProdAuth returns true if the client-supplied username matches the
+// configured prod username. Redis 6+ defines "default" as the built-in user,
+// so AUTH default <pass> is equivalent to AUTH <pass> when no ACL username is
+// configured (p.prodUser == ""). We treat "" and "default" as interchangeable.
+func matchesProdAuth(clientUser, prodUser string) bool {
+	normalize := func(u string) string {
+		if u == "" {
+			return "default"
+		}
+		return u
+	}
+	return normalize(clientUser) == normalize(prodUser)
+}
+
+// extractHelloAuth parses the AUTH sub-command from HELLO arguments.
+// HELLO syntax: HELLO <proto> [AUTH <username> <password>] [SETNAME <name>]
+// Returns (username, password, hasAuth, twoArg):
+//   - twoArg=true  when AUTH has two args (explicit username, even if empty)
+//   - twoArg=false when AUTH has one arg (password only, legacy form)
+//   - hasAuth=false when no AUTH sub-command is present
+//
+// The parser is grammar-aware: it skips the argument following SETNAME so
+// that a client name of "AUTH" (e.g. HELLO 2 SETNAME AUTH AUTH user pass)
+// is not mistaken for the AUTH keyword.
+func extractHelloAuth(args []string) (user, pass string, hasAuth, twoArg bool) {
+	for i := 0; i < len(args); i++ {
+		upper := strings.ToUpper(args[i])
+
+		// SETNAME consumes the next arg as its value — skip it.
+		if upper == "SETNAME" {
+			i++ // skip the name value
+			continue
+		}
+
+		if upper == "AUTH" {
+			remaining := len(args) - i - 1
+			if remaining >= 2 {
+				return args[i+1], args[i+2], true, true
+			}
+			if remaining == 1 {
+				return "", args[i+1], true, false
+			}
+		}
+	}
+	return "", "", false, false
 }
 
 // parseScanResponse extracts cursor and keys from a SCAN response.

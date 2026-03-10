@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mori-dev/mori/internal/auth"
 	"github.com/mori-dev/mori/internal/core/config"
@@ -27,6 +28,9 @@ type awsRDSProvider struct{}
 func (p *awsRDSProvider) ID() registry.ProviderID { return registry.AWSRDS }
 
 func (p *awsRDSProvider) Fields(registry.EngineID) []registry.ConnectionField { return nil }
+
+// TokenTTL implements auth.Refreshable. AWS RDS IAM tokens are valid for 15 minutes.
+func (p *awsRDSProvider) TokenTTL() time.Duration { return 15 * time.Minute }
 
 func (p *awsRDSProvider) ConnString(ctx context.Context, conn *config.Connection) (string, error) {
 	c := connWithSSL(conn)

@@ -205,10 +205,33 @@ func (c *Connection) toMySQLConnString() string {
 	if port == 0 {
 		port = 3306
 	}
-	// Format: user:pass@tcp(host:port)/database
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s",
+	// Format: user:pass@tcp(host:port)/database[?ssl-mode=mode]
+	// Sanitize database name: strip from first '?' onward to prevent
+	// parameter injection (e.g. "mydb?allowAllFiles=true").
+	dbName := c.Database
+	if i := strings.IndexByte(dbName, '?'); i >= 0 {
+		dbName = dbName[:i]
+	}
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s",
 		url.PathEscape(c.User), url.PathEscape(c.Password),
-		host, port, c.Database)
+		host, port, dbName)
+	if mode := sanitizeSSLMode(c.SSLMode); mode != "" {
+		dsn += "?ssl-mode=" + mode
+	}
+	return dsn
+}
+
+// sanitizeSSLMode validates an SSL mode value against a known allowlist.
+// Returns the canonical mode or "" if the value is empty or unrecognised.
+// This prevents parameter injection through malformed SSLMode values
+// (e.g., "verify-full&allowAllFiles=true").
+func sanitizeSSLMode(mode string) string {
+	switch mode {
+	case "disable", "allow", "prefer", "require", "verify-ca", "verify-full":
+		return mode
+	default:
+		return ""
+	}
 }
 
 func (c *Connection) toSQLiteConnString() string {

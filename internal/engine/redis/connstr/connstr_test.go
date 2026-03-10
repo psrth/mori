@@ -10,6 +10,7 @@ func TestParse(t *testing.T) {
 		input    string
 		wantHost string
 		wantPort int
+		wantUser string
 		wantPW   string
 		wantDB   int
 		wantSSL  bool
@@ -75,6 +76,33 @@ func TestParse(t *testing.T) {
 			wantPW:   "mypassword",
 			wantDB:   0,
 		},
+		{
+			name:     "ACL user and password",
+			input:    "redis://admin:s3cret@myhost:6380/0",
+			wantHost: "myhost",
+			wantPort: 6380,
+			wantUser: "admin",
+			wantPW:   "s3cret",
+			wantDB:   0,
+		},
+		{
+			name:     "ACL empty user with password",
+			input:    "redis://:topSecret@myhost:6379",
+			wantHost: "myhost",
+			wantPort: 6379,
+			wantUser: "",
+			wantPW:   "topSecret",
+		},
+		{
+			name:     "ACL user with password and SSL",
+			input:    "rediss://myuser:mypass@secure.redis.io:6380/3",
+			wantHost: "secure.redis.io",
+			wantPort: 6380,
+			wantUser: "myuser",
+			wantPW:   "mypass",
+			wantDB:   3,
+			wantSSL:  true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -94,6 +122,9 @@ func TestParse(t *testing.T) {
 			}
 			if info.Port != tt.wantPort {
 				t.Errorf("Port = %d, want %d", info.Port, tt.wantPort)
+			}
+			if info.Username != tt.wantUser {
+				t.Errorf("Username = %q, want %q", info.Username, tt.wantUser)
 			}
 			if info.Password != tt.wantPW {
 				t.Errorf("Password = %q, want %q", info.Password, tt.wantPW)

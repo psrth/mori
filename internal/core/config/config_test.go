@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -82,5 +83,62 @@ func TestReadConfigNotInitialized(t *testing.T) {
 	_, err := ReadConfig(dir)
 	if err == nil {
 		t.Error("ReadConfig() on uninitialized dir should return error")
+	}
+}
+
+func TestMySQLConnString_DatabaseInjection(t *testing.T) {
+	c := &Connection{
+		Engine:   "mysql",
+		Host:     "localhost",
+		Port:     3306,
+		User:     "root",
+		Password: "secret",
+		Database: "mydb?allowAllFiles=true",
+		SSLMode:  "verify-full",
+	}
+	dsn := c.ToConnString()
+	// The injected ?allowAllFiles=true must be stripped.
+	if strings.Contains(dsn, "allowAllFiles") {
+		t.Errorf("DSN contains injected parameter: %s", dsn)
+	}
+	// ssl-mode should still be the first (and only) query param.
+	if !strings.Contains(dsn, "?ssl-mode=verify-full") {
+		t.Errorf("DSN missing ssl-mode param: %s", dsn)
+	}
+}
+
+func TestMySQLConnString_CleanDatabase(t *testing.T) {
+	c := &Connection{
+		Engine:   "mysql",
+		Host:     "localhost",
+		Port:     3306,
+		User:     "root",
+		Password: "secret",
+		Database: "mydb",
+		SSLMode:  "verify-full",
+	}
+	dsn := c.ToConnString()
+	if !strings.Contains(dsn, "/mydb?ssl-mode=verify-full") {
+		t.Errorf("DSN format unexpected: %s", dsn)
+	}
+}
+
+func TestSanitizeSSLMode(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"disable", "disable"},
+		{"verify-full", "verify-full"},
+		{"require", "require"},
+		{"verify-full&allowAllFiles=true", ""},
+		{"", ""},
+		{"bogus", ""},
+	}
+	for _, tt := range tests {
+		got := sanitizeSSLMode(tt.input)
+		if got != tt.want {
+			t.Errorf("sanitizeSSLMode(%q) = %q, want %q", tt.input, got, tt.want)
+		}
 	}
 }

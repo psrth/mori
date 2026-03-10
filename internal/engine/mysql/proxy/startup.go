@@ -13,6 +13,12 @@ import (
 // clientSSL is the MySQL CLIENT_SSL capability flag.
 const clientSSL uint32 = 0x0800
 
+// clientDeprecateEOF is the MySQL CLIENT_DEPRECATE_EOF capability flag (bit 24).
+// When set, the server replaces EOF packets with OK packets in result sets.
+// The proxy relies on EOF packets for result-set framing, so this flag must
+// be stripped from both server and client handshake packets.
+const clientDeprecateEOF uint32 = 0x01000000
+
 // relayHandshake relays the MySQL handshake between client and production server.
 // MySQL handshake flow:
 // 1. Server -> Client: Initial Handshake Packet
@@ -62,6 +68,13 @@ func relayHandshake(clientConn, prodConn net.Conn, tlsParams tlsutil.TLSParams) 
 		return prodConn, fmt.Errorf("reading client handshake response: %w", err)
 	}
 
+	// Strip CLIENT_DEPRECATE_EOF from the client's capability flags so the
+	// server always sends EOF-terminated result sets, which the proxy expects.
+	stripClientDeprecateEOF(response.Payload)
+
+	// Rebuild the raw packet since the payload was modified.
+	response.Raw = buildMySQLPacket(response.Sequence, response.Payload)
+
 	// Forward to Prod (possibly over TLS).
 	if _, err := prodConn.Write(response.Raw); err != nil {
 		return prodConn, fmt.Errorf("forwarding handshake response to prod: %w", err)
@@ -90,9 +103,9 @@ func relayHandshake(clientConn, prodConn net.Conn, tlsParams tlsutil.TLSParams) 
 		case iERR:
 			return prodConn, fmt.Errorf("prod auth error: %s", string(authResult.Payload[9:]))
 		case iEOF:
-			// AuthSwitch or old-auth. Relay client response.
+			// 0xFE is both EOF marker and auth switch request.
 			if len(authResult.Payload) == 1 {
-				// Old-auth: client sends password.
+				// Old-auth (EOF with no payload): client sends password.
 				clientAuth, err := readMySQLPacket(clientConn)
 				if err != nil {
 					return prodConn, fmt.Errorf("reading client old-auth: %w", err)
@@ -102,7 +115,17 @@ func relayHandshake(clientConn, prodConn net.Conn, tlsParams tlsutil.TLSParams) 
 				}
 				continue
 			}
-			return prodConn, nil
+			// Auth switch request (0xFE with plugin name and auth data).
+			// The packet was already forwarded to the client above;
+			// now read the client's auth switch response and relay to prod.
+			clientAuth, err := readMySQLPacket(clientConn)
+			if err != nil {
+				return prodConn, fmt.Errorf("reading client auth switch response: %w", err)
+			}
+			if _, err := prodConn.Write(clientAuth.Raw); err != nil {
+				return prodConn, fmt.Errorf("forwarding auth switch response to prod: %w", err)
+			}
+			continue
 		default:
 			if authResult.Payload[0] == 0x01 {
 				// Auth more data (caching_sha2_password).
@@ -122,24 +145,22 @@ func relayHandshake(clientConn, prodConn net.Conn, tlsParams tlsutil.TLSParams) 
 				}
 				continue
 			}
-			if authResult.Payload[0] == 0xfe {
-				// Auth switch request (0xFE with plugin name).
-				clientAuth, err := readMySQLPacket(clientConn)
-				if err != nil {
-					return prodConn, fmt.Errorf("reading client auth switch response: %w", err)
-				}
-				if _, err := prodConn.Write(clientAuth.Raw); err != nil {
-					return prodConn, fmt.Errorf("forwarding auth switch response to prod: %w", err)
-				}
-				continue
-			}
 			return prodConn, nil
 		}
 	}
 }
 
-// stripSSLCapability clears the CLIENT_SSL (0x0800) flag from a MySQL
-// Initial Handshake Packet payload. Returns true if the flag was originally set.
+// stripSSLCapability clears the CLIENT_SSL (0x0800) flag and the
+// CLIENT_DEPRECATE_EOF (0x01000000) flag from a MySQL Initial Handshake
+// Packet (server → client) payload. Returns true if the SSL flag was
+// originally set.
+//
+// CLIENT_DEPRECATE_EOF is stripped here so the client never sees the
+// server advertising the capability — preventing the client from setting
+// it in its HandshakeResponse41. However, a client may set the flag
+// regardless of what the server advertises, so stripClientDeprecateEOF()
+// must also be called on the client's response to guarantee the flag is
+// cleared. Both strips are necessary for correct result-set framing.
 func stripSSLCapability(payload []byte) bool {
 	if len(payload) < 2 {
 		return false
@@ -161,14 +182,42 @@ func stripSSLCapability(payload []byte) bool {
 		return false
 	}
 
+	capsLowerPos := pos
+
 	// Lower capability flags (2 bytes LE).
-	caps := binary.LittleEndian.Uint16(payload[pos : pos+2])
-	hadSSL := caps&uint16(clientSSL) != 0
+	capsLower := binary.LittleEndian.Uint16(payload[capsLowerPos : capsLowerPos+2])
+	hadSSL := capsLower&uint16(clientSSL) != 0
 	if hadSSL {
-		caps &^= uint16(clientSSL)
-		binary.LittleEndian.PutUint16(payload[pos:pos+2], caps)
+		capsLower &^= uint16(clientSSL)
+		binary.LittleEndian.PutUint16(payload[capsLowerPos:capsLowerPos+2], capsLower)
 	}
+
+	// Upper capability flags are at: capsLowerPos + 2 (lower caps) + 1 (charset) + 2 (status flags).
+	capsUpperPos := capsLowerPos + 2 + 1 + 2
+	if capsUpperPos+2 <= len(payload) {
+		capsUpper := binary.LittleEndian.Uint16(payload[capsUpperPos : capsUpperPos+2])
+		// CLIENT_DEPRECATE_EOF = 0x01000000; in upper 16 bits that is 0x0100.
+		deprecateEOFUpper := uint16(clientDeprecateEOF >> 16)
+		if capsUpper&deprecateEOFUpper != 0 {
+			capsUpper &^= deprecateEOFUpper
+			binary.LittleEndian.PutUint16(payload[capsUpperPos:capsUpperPos+2], capsUpper)
+		}
+	}
+
 	return hadSSL
+}
+
+// stripClientDeprecateEOF clears the CLIENT_DEPRECATE_EOF flag from a MySQL
+// HandshakeResponse41 payload. The capability flags are the first 4 bytes (LE).
+func stripClientDeprecateEOF(payload []byte) {
+	if len(payload) < 4 {
+		return
+	}
+	caps := binary.LittleEndian.Uint32(payload[0:4])
+	if caps&clientDeprecateEOF != 0 {
+		caps &^= clientDeprecateEOF
+		binary.LittleEndian.PutUint32(payload[0:4], caps)
+	}
 }
 
 // handshakeCharset extracts the character set byte from a MySQL
