@@ -19,3 +19,5 @@
 
 # Mori project config (contains credentials)
 mori.yaml
+
+audit-docs/

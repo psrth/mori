@@ -36,7 +36,8 @@ type Proxy struct {
 	schemaRegistry  *coreSchema.Registry
 	moriDir         string
 	logger          *logging.Logger
-	maxRowsHydrate  int // cap on rows hydrated from Prod during materialization; 0 = unlimited
+	maxRowsHydrate  int  // cap on rows hydrated from Prod during materialization; 0 = unlimited
+	isCockroachDB   bool // true when proxying CockroachDB (changes txn isolation + virtual PK column)
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -59,6 +60,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	logger *logging.Logger,
 	maxRowsHydrate int,
 	tlsParams tlsutil.TLSParams,
+	isCockroachDB bool,
 ) *Proxy {
 	return &Proxy{
 		prodAddr:       prodAddr,
@@ -76,6 +78,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		moriDir:        moriDir,
 		logger:         logger,
 		maxRowsHydrate: maxRowsHydrate,
+		isCockroachDB:  isCockroachDB,
 		shutdownCh:     make(chan struct{}),
 	}
 }

@@ -33,6 +33,7 @@ func (e *pgEngine) Init(ctx context.Context, opts engine.InitOptions) (*engine.I
 		ImageOverride: opts.ImageOverride,
 		ProjectRoot:   opts.ProjectRoot,
 		ConnName:      opts.ConnName,
+		EngineID:      string(registry.Postgres),
 	})
 	if err != nil {
 		return nil, err
@@ -98,6 +99,7 @@ func (e *pgEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.Tabl
 			CertPath:   deps.CertPath,
 			KeyPath:    deps.KeyPath,
 		},
+		false, // isCockroachDB
 	)
 }
 

@@ -67,10 +67,15 @@ func (rh *ReadHandler) mergedReadCore(cl *core.Classification, querySQL string) 
 				injectedPK = pkCol
 			}
 		} else if meta, ok := rh.tables[table]; ok && meta.PKType == "none" {
-			// No PK — inject ctid as a virtual PK for dedup and tombstone filtering.
-			if needsCtidInjection(querySQL) {
-				effectiveSQL = injectCtidColumn(querySQL)
-				injectedPK = "ctid"
+			// No PK — inject a virtual PK for dedup and tombstone filtering.
+			// CockroachDB uses "rowid" (implicit hidden column); PostgreSQL uses "ctid".
+			virtualPK := "ctid"
+			if rh.isCockroachDB {
+				virtualPK = "rowid"
+			}
+			if needsVirtualPKInjection(querySQL, virtualPK) {
+				effectiveSQL = injectVirtualPKColumn(querySQL, virtualPK)
+				injectedPK = virtualPK
 			}
 		}
 	}
@@ -460,12 +465,13 @@ func containsColumn(selectList, col string) bool {
 	return false
 }
 
-// needsCtidInjection returns true if the query is a simple single-table SELECT
-// where ctid should be injected for dedup on PK-less tables.
-// Unlike needsPKInjection, ctid injection is needed for SELECT * too
-// (ctid is a system column not included in *).
+// needsVirtualPKInjection returns true if the query is a simple single-table SELECT
+// where a virtual PK column (ctid for PostgreSQL, rowid for CockroachDB) should be
+// injected for dedup on PK-less tables.
+// Unlike needsPKInjection, virtual PK injection is needed for SELECT * too
+// (system/hidden columns are not included in *).
 // Returns false for set operations, subqueries in FROM, and CTEs.
-func needsCtidInjection(sql string) bool {
+func needsVirtualPKInjection(sql string, colName string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(sql))
 
 	// Skip for set operations.
@@ -494,16 +500,16 @@ func needsCtidInjection(sql string) bool {
 		return false
 	}
 
-	// Check if ctid is already in the SELECT list.
+	// Check if the virtual PK column is already in the SELECT list.
 	selectList := strings.ToLower(sql[selectIdx+6 : fromIdx])
-	return !containsColumn(selectList, "ctid")
+	return !containsColumn(selectList, strings.ToLower(colName))
 }
 
-// injectCtidColumn adds ctid to the SELECT list for dedup on PK-less tables.
-// Handles both explicit column lists and SELECT *.
-// Rewrites "SELECT col1, col2 FROM ..." to "SELECT ctid, col1, col2 FROM ..."
-// and "SELECT * FROM ..." to "SELECT ctid, * FROM ...".
-func injectCtidColumn(sql string) string {
+// injectVirtualPKColumn adds a virtual PK column to the SELECT list for dedup
+// on PK-less tables. Handles both explicit column lists and SELECT *.
+// Rewrites "SELECT col1, col2 FROM ..." to "SELECT <col>, col1, col2 FROM ..."
+// and "SELECT * FROM ..." to "SELECT <col>, * FROM ...".
+func injectVirtualPKColumn(sql string, colName string) string {
 	upper := strings.ToUpper(sql)
 	selectIdx := strings.Index(upper, "SELECT")
 	if selectIdx < 0 {
@@ -515,7 +521,7 @@ func injectCtidColumn(sql string) string {
 	if strings.HasPrefix(strings.ToUpper(afterSelect), "DISTINCT") {
 		insertPos += (len(sql[insertPos:]) - len(afterSelect)) + 8 // len("DISTINCT")
 	}
-	return sql[:insertPos] + " ctid," + sql[insertPos:]
+	return sql[:insertPos] + " " + colName + "," + sql[insertPos:]
 }
 
 // findColumnIndex returns the index of a named column in the result columns.
@@ -696,10 +702,14 @@ func (rh *ReadHandler) findPKColumnIndex(table string, columns []ColumnInfo) int
 func (rh *ReadHandler) filterProdRows(table string, result *QueryResult) ([][]string, [][]bool) {
 	pkIdx := rh.findPKColumnIndex(table, result.Columns)
 	if pkIdx < 0 {
-		// No PK column found — try ctid as fallback for PK-less tables.
+		// No PK column found — try virtual PK as fallback for PK-less tables.
+		// CockroachDB uses "rowid"; PostgreSQL uses "ctid".
 		pkIdx = findColumnIndex(result.Columns, "ctid")
 		if pkIdx < 0 {
-			// Neither PK nor ctid found — cannot filter, return all rows.
+			pkIdx = findColumnIndex(result.Columns, "rowid")
+		}
+		if pkIdx < 0 {
+			// Neither PK nor virtual PK found — cannot filter, return all rows.
 			return result.RowValues, result.RowNulls
 		}
 	}
@@ -888,9 +898,13 @@ func (rh *ReadHandler) dedup(
 			}
 		}
 	}
-	// No PK column found — try ctid as fallback for PK-less tables.
+	// No PK column found — try virtual PK as fallback for PK-less tables.
+	// CockroachDB uses "rowid"; PostgreSQL uses "ctid".
 	if pkIdx < 0 {
 		pkIdx = findColumnIndex(columns, "ctid")
+	}
+	if pkIdx < 0 {
+		pkIdx = findColumnIndex(columns, "rowid")
 	}
 	if pkIdx < 0 {
 		return values, nulls

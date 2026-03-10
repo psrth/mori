@@ -26,7 +26,8 @@ type ReadHandler struct {
 	connID          int64
 	verbose         bool
 	logger          *logging.Logger
-	maxRowsHydrate  int // cap on rows hydrated from Prod during materialization; 0 = unlimited
+	maxRowsHydrate  int  // cap on rows hydrated from Prod during materialization; 0 = unlimited
+	isCockroachDB   bool // true = use "rowid" instead of "ctid" for PK-less table dedup
 }
 
 // HandleRead dispatches a read operation based on the routing strategy.

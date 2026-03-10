@@ -35,6 +35,7 @@ type TxnHandler struct {
 	connID          int64
 	verbose         bool
 	logger          *logging.Logger
+	isCockroachDB   bool // true = use SERIALIZABLE instead of REPEATABLE READ on prod
 	inTxn           bool
 	savepointStack  []savepointSnapshot
 	beginSchemaSnap map[string]*coreSchema.TableDiff // schema state at BEGIN
@@ -91,8 +92,13 @@ func (th *TxnHandler) handleBegin(clientConn net.Conn, rawMsg []byte) error {
 		return nil
 	}
 
-	// Shadow succeeded — send REPEATABLE READ to Prod and relay to client.
-	prodBeginMsg := buildQueryMsg("BEGIN ISOLATION LEVEL REPEATABLE READ")
+	// Shadow succeeded — send appropriate isolation level to Prod and relay to client.
+	// CockroachDB only supports SERIALIZABLE; PostgreSQL uses REPEATABLE READ.
+	isolationSQL := "BEGIN ISOLATION LEVEL REPEATABLE READ"
+	if th.isCockroachDB {
+		isolationSQL = "BEGIN ISOLATION LEVEL SERIALIZABLE"
+	}
+	prodBeginMsg := buildQueryMsg(isolationSQL)
 	hadProdError, err := forwardAndRelayTxn(prodBeginMsg, th.prodConn, clientConn)
 	if err != nil {
 		return fmt.Errorf("prod BEGIN: %w", err)
@@ -105,7 +111,11 @@ func (th *TxnHandler) handleBegin(clientConn net.Conn, rawMsg []byte) error {
 			th.beginSchemaSnap = th.schemaRegistry.SnapshotAll()
 		}
 		if th.verbose {
-			log.Printf("[conn %d] BEGIN: Shadow=ok Prod=REPEATABLE READ", th.connID)
+			if th.isCockroachDB {
+				log.Printf("[conn %d] BEGIN: Shadow=ok Prod=SERIALIZABLE", th.connID)
+			} else {
+				log.Printf("[conn %d] BEGIN: Shadow=ok Prod=REPEATABLE READ", th.connID)
+			}
 		}
 		th.logger.Event(th.connID, "txn", "BEGIN")
 	}

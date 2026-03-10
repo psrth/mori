@@ -11,62 +11,54 @@ import (
 	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
 	"github.com/mori-dev/mori/internal/engine/postgres/schema"
 	"github.com/mori-dev/mori/internal/engine/postgres/shadow"
+	"github.com/mori-dev/mori/internal/registry"
 	"github.com/mori-dev/mori/internal/ui"
 )
 
-// InitOptions holds the options for initializing a Mori project.
-type InitOptions struct {
-	ProdConnStr   string // Required: production connection string
-	ImageOverride string // Optional: Docker image override
-	ProjectRoot   string // Required: path to the project root directory
-	ConnName      string // Required: connection name for per-connection state
-	EngineID      string // Engine identifier written to config (e.g. "postgres", "cockroachdb")
-}
-
-// InitResult holds the result of a successful initialization.
-type InitResult struct {
-	Config    *config.Config
-	Container *shadow.ContainerInfo
-	Dump      *schema.DumpResult
-}
-
-// Init performs the complete Mori initialization sequence.
-func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
-	// 1. Parse the production connection string
-	dsn, err := connstr.Parse(opts.ProdConnStr)
+// CRDBInit performs the Mori initialization sequence for CockroachDB.
+// It replaces the PostgreSQL Init pipeline with CockroachDB-specific logic:
+//   - Uses SHOW CREATE ALL TABLES instead of pg_dump (which is incompatible)
+//   - Detects unique_rowid() SERIAL columns instead of nextval()
+//   - Skips extension detection (CockroachDB has no extensions)
+//   - Writes engine: "cockroachdb" to config
+//   - Uses the PG-compat version reported by CockroachDB for the shadow image
+func CRDBInit(ctx context.Context, opts InitOptions) (*InitResult, error) {
+	// 1. Parse the production connection string (using CockroachDB default port).
+	dsn, err := connstr.ParseWithDefaultPort(opts.ProdConnStr, crdbDefaultPort)
 	if err != nil {
 		return nil, fmt.Errorf("invalid connection string: %w", err)
 	}
 
-	// 2. Connect to Prod
+	// 2. Connect to Prod.
 	var prodConn *pgx.Conn
-	if err := ui.Spinner("Connecting to production database...", func() error {
+	if err := ui.Spinner("Connecting to CockroachDB...", func() error {
 		var e error
 		prodConn, e = pgx.Connect(ctx, dsn.ConnString())
 		return e
 	}); err != nil {
-		return nil, fmt.Errorf("cannot connect to production database at %s:%d: %w", dsn.Host, dsn.Port, err)
+		return nil, fmt.Errorf("cannot connect to CockroachDB at %s:%d: %w", dsn.Host, dsn.Port, err)
 	}
 	defer prodConn.Close(ctx)
 
-	// 3. Detect PostgreSQL version
+	// 3. Detect CockroachDB's PG-compat version for the shadow image.
+	// CockroachDB reports a PostgreSQL-compatible version (e.g., "13.0.0").
 	var versionStr string
 	if err := prodConn.QueryRow(ctx, "SHOW server_version").Scan(&versionStr); err != nil {
-		return nil, fmt.Errorf("failed to detect PostgreSQL version: %w", err)
+		return nil, fmt.Errorf("failed to detect CockroachDB version: %w", err)
 	}
 	version, err := schema.ParseVersion(versionStr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse PostgreSQL version: %w", err)
+		return nil, fmt.Errorf("failed to parse CockroachDB PG-compat version: %w", err)
 	}
-	ui.StepDone(fmt.Sprintf("Connected — PostgreSQL %s", version.Full))
+	ui.StepDone(fmt.Sprintf("Connected — CockroachDB (PG-compat %s)", version.Full))
 
-	// 4. Determine Docker image
+	// 4. Determine Docker image — use PG compat version for shadow.
 	imageName := version.ImageTag
 	if opts.ImageOverride != "" {
 		imageName = opts.ImageOverride
 	}
 
-	// 5. Set up Docker container
+	// 5. Set up Shadow Docker container (PostgreSQL — schema-compatible shadow).
 	mgr, err := shadow.NewManager()
 	if err != nil {
 		return nil, err
@@ -95,7 +87,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		return nil, fmt.Errorf("failed to create Shadow container: %w", err)
 	}
 
-	// Cleanup on failure: remove container if any subsequent step fails
+	// Cleanup on failure.
 	var initErr error
 	defer func() {
 		if initErr != nil {
@@ -106,41 +98,41 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 
 	ui.StepDone(fmt.Sprintf("Shadow container ready on port %d", containerInfo.HostPort))
 
-	// 6. Dump production schema
+	// 6. Dump production schema using SHOW CREATE ALL TABLES.
 	var dumpResult *schema.DumpResult
-	if err := ui.Spinner("Dumping production schema...", func() error {
+	if err := ui.Spinner("Dumping CockroachDB schema...", func() error {
 		var e error
-		dumpResult, e = schema.FullDump(ctx, prodConn, dsn, imageName)
+		dumpResult, e = schema.CRDBFullDump(ctx, prodConn)
 		return e
 	}); err != nil {
 		initErr = err
 		return nil, err
 	}
-	ui.StepDone(fmt.Sprintf("%d tables, %d extensions dumped", len(dumpResult.Tables), len(dumpResult.Extensions)))
+	ui.StepDone(fmt.Sprintf("%d tables dumped (CockroachDB — no extensions)", len(dumpResult.Tables)))
 
-	// 7. Apply schema to Shadow
+	// 7. Apply schema to Shadow (PostgreSQL).
+	// No extensions to install for CockroachDB.
 	shadowConnStr := connstr.ShadowDSN(containerInfo.HostPort, dsn.DBName)
-	extOpts := &schema.ExtInstallOptions{
-		ContainerID: containerInfo.ContainerID,
-		PGMajor:     version.Major,
-	}
 	if err := ui.Spinner("Applying schema to Shadow...", func() error {
-		return schema.ApplyToShadow(ctx, shadowConnStr, dumpResult, extOpts)
+		return schema.ApplyToShadow(ctx, shadowConnStr, dumpResult, &schema.ExtInstallOptions{
+			ContainerID: containerInfo.ContainerID,
+			PGMajor:     version.Major,
+		})
 	}); err != nil {
 		initErr = err
 		return nil, fmt.Errorf("failed to apply schema to Shadow: %w", err)
 	}
 
-	// 8. Persist configuration
+	// 8. Persist configuration with engine: "cockroachdb".
 	cfg := &config.Config{
 		ProdConnection:  dsn.ConnString(),
 		ShadowPort:      containerInfo.HostPort,
 		ShadowContainer: containerInfo.ContainerName,
 		ShadowImage:     imageName,
-		Engine:          opts.EngineID,
+		Engine:          string(registry.CockroachDB),
 		EngineVersion:   version.Full,
 		ProxyPort:       9002,
-		Extensions:      extensionNames(dumpResult.Extensions),
+		Extensions:      nil, // CockroachDB has no extensions
 		InitializedAt:   time.Now(),
 	}
 
@@ -159,9 +151,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		return nil, fmt.Errorf("failed to write tables: %w", err)
 	}
 
-	// Populate schema registry with FK metadata from the initial dump so
-	// that the proxy-layer FK enforcer can validate referential integrity
-	// from the very first session.
+	// Populate schema registry with FK metadata.
 	if len(dumpResult.ForeignKeys) > 0 {
 		reg := coreSchema.NewRegistry()
 		for _, fk := range dumpResult.ForeignKeys {
@@ -178,12 +168,4 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		Container: containerInfo,
 		Dump:      dumpResult,
 	}, nil
-}
-
-func extensionNames(exts []schema.Extension) []string {
-	names := make([]string, len(exts))
-	for i, e := range exts {
-		names[i] = e.Name
-	}
-	return names
 }
