@@ -467,7 +467,7 @@ func (eh *ExtHandler) dispatchByStrategy(
 	case core.StrategyNotSupported:
 		msg := cl.NotSupportedMsg
 		if msg == "" {
-			msg = "this operation is not supported through the Mori proxy"
+			msg = core.UnsupportedTransactionMsg
 		}
 		errPkt := buildErrorResponse(msg)
 		_, err := clientConn.Write(errPkt)
@@ -491,9 +491,14 @@ func (eh *ExtHandler) dispatchByStrategy(
 		}
 		return nil
 
-	default:
-		// ProdDirect or unknown — forward to prod.
+	case core.StrategyProdDirect:
 		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
+
+	default:
+		msg := core.UnsupportedTransactionMsg
+		errPkt := buildErrorResponse(msg)
+		_, err := clientConn.Write(errPkt)
+		return err
 	}
 }
 

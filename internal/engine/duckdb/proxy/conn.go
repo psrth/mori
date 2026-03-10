@@ -152,7 +152,7 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 
 			// Handle not-supported queries.
 			if decision.strategy == core.StrategyNotSupported {
-				msg := "mori: operation not supported"
+				msg := core.UnsupportedTransactionMsg
 				if decision.classification != nil && decision.classification.NotSupportedMsg != "" {
 					msg = decision.classification.NotSupportedMsg
 				}
@@ -323,8 +323,11 @@ func (p *Proxy) classifyAndRoute(sqlStr string, connID int64) routeDecision {
 			strategy:       strategy,
 		}
 
+	case core.StrategyProdDirect:
+		return routeDecision{target: targetProd, classification: classification, strategy: strategy}
+
 	default:
-		return routeDecision{target: targetProd, strategy: strategy}
+		return routeDecision{target: targetProd, classification: classification, strategy: core.StrategyNotSupported}
 	}
 }
 

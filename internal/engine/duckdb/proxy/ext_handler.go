@@ -370,7 +370,7 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 		clientConn.Write(result)
 
 	case core.StrategyNotSupported:
-		msg := "mori: operation not supported"
+		msg := core.UnsupportedTransactionMsg
 		if cl.NotSupportedMsg != "" {
 			msg = cl.NotSupportedMsg
 		}
@@ -398,7 +398,17 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 		}
 
 	default:
-		eh.extExecOnProd(clientConn, fullSQL)
+		msg := core.UnsupportedTransactionMsg
+		var resp []byte
+		if eh.batchHasParse {
+			resp = append(resp, buildParseCompleteMsg()...)
+		}
+		if eh.batchHasBind {
+			resp = append(resp, buildBindCompleteMsg()...)
+		}
+		resp = append(resp, buildSQLErrorResponseBytes(msg)...)
+		resp = append(resp, buildReadyForQueryMsg()...)
+		clientConn.Write(resp)
 	}
 }
 

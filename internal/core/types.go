@@ -133,6 +133,10 @@ const (
 	StrategyListenOnly                              // Forward LISTEN to Prod only
 )
 
+// UnsupportedTransactionMsg is the standard error returned when an operation
+// does not match any known routing strategy.
+const UnsupportedTransactionMsg = "Unsupported transaction. Please report this at https://github.com/psrth/mori/issues/new."
+
 func (r RoutingStrategy) String() string {
 	switch r {
 	case StrategyProdDirect:

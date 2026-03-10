@@ -211,8 +211,19 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) error {
 	case core.StrategyTransaction:
 		return eh.handleExtTxn(clientConn, batchRaw, cl)
 
+	case core.StrategyNotSupported:
+		msg := core.UnsupportedTransactionMsg
+		if cl.NotSupportedMsg != "" {
+			msg = cl.NotSupportedMsg
+		}
+		errResp := buildGuardErrorResponse(msg)
+		clientConn.Write(errResp)
+		return nil
+
 	default:
-		return forwardAndRelay(batchRaw, eh.prodConn, clientConn)
+		errResp := buildGuardErrorResponse(core.UnsupportedTransactionMsg)
+		clientConn.Write(errResp)
+		return nil
 	}
 }
 
