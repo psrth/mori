@@ -42,9 +42,9 @@ Providers handle authentication and connection configuration for managed databas
   <Accordion title="GCP Cloud SQL">
     **Provider ID:** `gcp-cloud-sql`
 
-    **With password:** Provide host, user, and password as normal. SSL enforced to `require`.
+    **With password:** Provide host, user, and password as normal. SSL enforced to `verify-full`.
 
-    **With IAM auth:** Omit the password. Mori obtains a token via `gcloud auth print-access-token`. Requires Google Cloud SDK installed and authenticated (`gcloud auth login`).
+    **With IAM auth:** Omit the password. Mori obtains a token via `gcloud sql generate-login-token`. Requires Google Cloud SDK installed and authenticated (`gcloud auth login`).
 
     <Tip>
     When using Cloud SQL Proxy, the host is typically `127.0.0.1`. Mori skips SSL enforcement when a tunnel is configured.

@@ -59,6 +59,7 @@ func (e *redisEngine) ParseConnStr(cs string) (*engine.ConnInfo, error) {
 		Host:     info.Host,
 		Port:     info.Port,
 		DBName:   fmt.Sprintf("db%d", info.DB),
+		User:     info.Username,
 		Password: info.Password,
 		SSLMode:  sslMode,
 		ConnStr:  info.Raw,
@@ -78,11 +79,13 @@ func (e *redisEngine) NewClassifier(tables map[string]engine.TableMeta) core.Cla
 }
 
 func (e *redisEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.TableMeta) engine.Proxy {
-	// Parse the prod connection to get password and db number.
+	// Parse the prod connection to get username, password and db number.
 	info, _ := connstr.Parse(deps.ProdAddr)
+	prodUser := ""
 	prodPass := ""
 	prodDB := 0
 	if info != nil {
+		prodUser = info.Username
 		prodPass = info.Password
 		prodDB = info.DB
 		// Use the actual addr for connecting.
@@ -101,6 +104,7 @@ func (e *redisEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 	return proxy.New(
 		deps.ProdAddr,
 		deps.ShadowAddr,
+		prodUser,
 		prodPass,
 		prodDB,
 		tlsutil.TLSParams{

@@ -77,6 +77,28 @@ func TestParseKeyValue(t *testing.T) {
 	}
 }
 
+func TestParseKeyValue_BackslashEscapedQuote(t *testing.T) {
+	// libpq allows \' outside quotes: password=val\'ue should parse as val'ue
+	dsn, err := Parse(`host=prod-host dbname=mydb user=alice password=val\'ue`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dsn.Password != "val'ue" {
+		t.Errorf("password = %q, want %q", dsn.Password, "val'ue")
+	}
+}
+
+func TestParseKeyValue_BackslashEscapedBackslash(t *testing.T) {
+	// libpq allows \\ outside quotes: password=val\\ue should parse as val\ue
+	dsn, err := Parse(`host=prod-host dbname=mydb user=alice password=val\\ue`)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dsn.Password != `val\ue` {
+		t.Errorf("password = %q, want %q", dsn.Password, `val\ue`)
+	}
+}
+
 func TestParseMissingHost(t *testing.T) {
 	_, err := Parse("postgres:///mydb")
 	if err == nil {

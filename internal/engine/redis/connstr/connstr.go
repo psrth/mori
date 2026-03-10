@@ -11,6 +11,7 @@ import (
 type ConnInfo struct {
 	Host     string
 	Port     int
+	Username string // ACL username (Redis 6+); empty = default user
 	Password string
 	DB       int    // database number (0-15)
 	SSL      bool
@@ -89,16 +90,19 @@ func parseRedisURI(connStr string, info *ConnInfo) error {
 		info.Port = p
 	}
 
-	// Password from userinfo.
+	// Username and password from userinfo.
 	if u.User != nil {
 		if pw, ok := u.User.Password(); ok {
+			// redis://user:password@host → username="user", password="password"
+			// redis://:password@host    → username="" (empty), password="password"
+			info.Username = u.User.Username()
 			info.Password = pw
 		} else {
-			// redis://:password@host — username is empty, "password" is in Username().
-			// Or redis://password@host — treat username as password if no colon.
-			username := u.User.Username()
-			if username != "" {
-				info.Password = username
+			// redis://password@host — bare value with no colon; treat as password
+			// for backward compatibility (legacy single-arg AUTH).
+			bare := u.User.Username()
+			if bare != "" {
+				info.Password = bare
 			}
 		}
 	}

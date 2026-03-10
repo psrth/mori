@@ -153,6 +153,8 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	// 8. If no runtime config exists for this connection, run the engine init (first start).
+	authProvider := auth.Lookup(registry.ProviderID(conn.Provider))
+	getConnStr := auth.NewConnStringFunc(authProvider, conn)
 	var cfg *config.Config
 	if config.IsConnInitialized(projectRoot, connName) {
 		cfg, err = config.ReadConnConfig(projectRoot, connName)
@@ -168,8 +170,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 			}
 		}
 	} else {
-		authProvider := auth.Lookup(registry.ProviderID(conn.Provider))
-		connStr, err := authProvider.ConnString(cmd.Context(), conn)
+		connStr, err := getConnStr(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("failed to build connection string: %w", err)
 		}
@@ -193,13 +194,14 @@ func runStart(cmd *cobra.Command, args []string) error {
 		ui.StepDone(fmt.Sprintf("Shadow ready — %s %s · %s", cfg.Engine, cfg.EngineVersion, tableLabel))
 	}
 
-	// 8b. If a tunnel is active, refresh the prod connection string in the config
-	// with the current tunnel address (the ephemeral port changes each restart).
-	if tunnelMgr != nil && cfg != nil {
-		authProvider := auth.Lookup(registry.ProviderID(conn.Provider))
-		freshConnStr, err := authProvider.ConnString(cmd.Context(), conn)
+	// 8b. Refresh the prod connection string in the runtime config.
+	// Token-based providers (AWS RDS, GCP, Azure) generate short-lived tokens
+	// that expire between proxy restarts. Always regenerate for such providers.
+	// Tunnel connections also need refreshing because the ephemeral port changes.
+	if _, isRefreshable := authProvider.(auth.Refreshable); isRefreshable || tunnelMgr != nil {
+		freshConnStr, err := getConnStr(cmd.Context())
 		if err != nil {
-			return fmt.Errorf("failed to rebuild connection string for tunnel: %w", err)
+			return fmt.Errorf("failed to refresh connection string: %w", err)
 		}
 		cfg.ProdConnection = freshConnStr
 	}

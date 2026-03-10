@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mori-dev/mori/internal/auth"
 	_ "github.com/mori-dev/mori/internal/auth/providers" // trigger init() registration
@@ -73,26 +74,26 @@ func TestDirect_ConnString(t *testing.T) {
 func TestNeon_ConnString_EnforcesSSL(t *testing.T) {
 	p := auth.Lookup(registry.Neon)
 	conn := baseConn()
-	conn.SSLMode = "" // should be enforced to require
+	conn.SSLMode = "" // should be enforced to verify-full
 	got, err := p.ConnString(context.Background(), conn)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "sslmode=require") {
-		t.Errorf("Neon should enforce sslmode=require, got %s", got)
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("Neon should enforce sslmode=verify-full, got %s", got)
 	}
 }
 
 func TestSupabase_ConnString_EnforcesSSL(t *testing.T) {
 	p := auth.Lookup(registry.Supabase)
 	conn := baseConn()
-	conn.SSLMode = "disable" // should be overridden to require
+	conn.SSLMode = "disable" // should be overridden to verify-full
 	got, err := p.ConnString(context.Background(), conn)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "sslmode=require") {
-		t.Errorf("Supabase should enforce sslmode=require, got %s", got)
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("Supabase should enforce sslmode=verify-full, got %s", got)
 	}
 }
 
@@ -104,8 +105,8 @@ func TestDigitalOcean_ConnString_EnforcesSSL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "sslmode=require") {
-		t.Errorf("DigitalOcean should enforce sslmode=require, got %s", got)
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("DigitalOcean should enforce sslmode=verify-full, got %s", got)
 	}
 }
 
@@ -117,8 +118,8 @@ func TestVercelPostgres_ConnString_EnforcesSSL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "sslmode=require") {
-		t.Errorf("Vercel Postgres should enforce sslmode=require, got %s", got)
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("Vercel Postgres should enforce sslmode=verify-full, got %s", got)
 	}
 }
 
@@ -130,8 +131,50 @@ func TestVercelPostgres_ConnString_URLPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "postgres://custom:url@host/db" {
-		t.Errorf("expected connection_url passthrough, got %s", got)
+	// URL without sslmode should have sslmode=verify-full enforced.
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("expected SSL enforcement on URL passthrough, got %s", got)
+	}
+}
+
+func TestVercelPostgres_ConnString_URLPassthrough_PreservesExistingSSL(t *testing.T) {
+	p := auth.Lookup(registry.VercelPG)
+	conn := baseConn()
+	conn.Extra["connection_url"] = "postgres://custom:url@host/db?sslmode=verify-full"
+	got, err := p.ConnString(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("expected existing sslmode preserved, got %s", got)
+	}
+}
+
+func TestVercelPostgres_ConnString_URLPassthrough_UpgradesRequire(t *testing.T) {
+	p := auth.Lookup(registry.VercelPG)
+	conn := baseConn()
+	conn.Extra["connection_url"] = "postgres://user:pass@host/db?sslmode=require"
+	got, err := p.ConnString(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// sslmode=require is MITM-vulnerable — must be upgraded to verify-full.
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("expected sslmode=require upgraded to verify-full, got %s", got)
+	}
+}
+
+func TestVercelPostgres_ConnString_URLPassthrough_PreservesVerifyCA(t *testing.T) {
+	p := auth.Lookup(registry.VercelPG)
+	conn := baseConn()
+	conn.Extra["connection_url"] = "postgres://user:pass@host/db?sslmode=verify-ca"
+	got, err := p.ConnString(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// verify-ca performs certificate chain validation — should be preserved.
+	if !strings.Contains(got, "sslmode=verify-ca") {
+		t.Errorf("expected sslmode=verify-ca preserved, got %s", got)
 	}
 }
 
@@ -143,8 +186,8 @@ func TestRailway_ConnString_EnforcesSSL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "sslmode=require") {
-		t.Errorf("Railway should enforce sslmode=require, got %s", got)
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("Railway should enforce sslmode=verify-full, got %s", got)
 	}
 }
 
@@ -156,14 +199,16 @@ func TestRailway_ConnString_URLPassthrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "postgres://railway:pass@host/db" {
-		t.Errorf("expected connection_url passthrough, got %s", got)
+	// URL without sslmode should have sslmode=verify-full enforced.
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("expected SSL enforcement on URL passthrough, got %s", got)
 	}
 }
 
 func TestPlanetScale_ConnString_MySQLDSN(t *testing.T) {
 	p := auth.Lookup(registry.PlanetScale)
 	conn := baseConn()
+	conn.Engine = "mysql"
 	conn.Host = "aws.connect.psdb.cloud"
 	conn.Port = 3306
 	got, err := p.ConnString(context.Background(), conn)
@@ -173,14 +218,33 @@ func TestPlanetScale_ConnString_MySQLDSN(t *testing.T) {
 	if !strings.Contains(got, "tcp(aws.connect.psdb.cloud:3306)") {
 		t.Errorf("expected MySQL DSN tcp() format, got %s", got)
 	}
-	if !strings.Contains(got, "tls=true") {
-		t.Errorf("expected tls=true, got %s", got)
+	if !strings.Contains(got, "ssl-mode=verify-full") {
+		t.Errorf("expected ssl-mode=verify-full in DSN, got %s", got)
+	}
+}
+
+func TestPlanetScale_ConnString_Postgres(t *testing.T) {
+	p := auth.Lookup(registry.PlanetScale)
+	conn := baseConn()
+	conn.Host = "aws.connect.psdb.cloud"
+	conn.Port = 5432
+	// Engine unset — defaults to Postgres path in ToConnString.
+	got, err := p.ConnString(context.Background(), conn)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasPrefix(got, "postgres://") {
+		t.Errorf("expected postgres:// scheme for PlanetScale Postgres, got %s", got)
+	}
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("expected sslmode=verify-full, got %s", got)
 	}
 }
 
 func TestPlanetScale_ConnString_DefaultPort(t *testing.T) {
 	p := auth.Lookup(registry.PlanetScale)
 	conn := baseConn()
+	conn.Engine = "mysql"
 	conn.Port = 0 // should default to 3306
 	got, err := p.ConnString(context.Background(), conn)
 	if err != nil {
@@ -361,8 +425,8 @@ func TestAWSRDS_ConnString_WithPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "sslmode=require") {
-		t.Errorf("AWS RDS should enforce SSL, got %s", got)
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("AWS RDS should enforce SSL verify-full, got %s", got)
 	}
 	if !strings.Contains(got, "explicit-password") {
 		t.Errorf("expected password in conn string, got %s", got)
@@ -377,8 +441,8 @@ func TestGCPCloudSQL_ConnString_WithPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "sslmode=require") {
-		t.Errorf("GCP Cloud SQL should enforce SSL, got %s", got)
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("GCP Cloud SQL should enforce SSL verify-full, got %s", got)
 	}
 	if !strings.Contains(got, "explicit-password") {
 		t.Errorf("expected password in conn string, got %s", got)
@@ -393,8 +457,8 @@ func TestAzure_ConnString_WithPassword(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(got, "sslmode=require") {
-		t.Errorf("Azure should enforce SSL, got %s", got)
+	if !strings.Contains(got, "sslmode=verify-full") {
+		t.Errorf("Azure should enforce SSL verify-full, got %s", got)
 	}
 	if !strings.Contains(got, "explicit-password") {
 		t.Errorf("expected password in conn string, got %s", got)
@@ -432,6 +496,45 @@ func TestRailway_Fields(t *testing.T) {
 	fields := p.Fields(registry.Postgres)
 	if fields != nil {
 		t.Errorf("Railway.Fields() returned non-nil, expected nil (uses registry defaults)")
+	}
+}
+
+// --- Refreshable interface conformance ---
+
+func TestRefreshableProviders(t *testing.T) {
+	cases := []struct {
+		id  registry.ProviderID
+		ttl time.Duration
+	}{
+		{registry.AWSRDS, 15 * time.Minute},
+		{registry.GCPCloudSQL, 1 * time.Hour},
+		{registry.Azure, 1 * time.Hour},
+	}
+	for _, tc := range cases {
+		p := auth.Lookup(tc.id)
+		r, ok := p.(auth.Refreshable)
+		if !ok {
+			t.Errorf("%s does not implement auth.Refreshable", tc.id)
+			continue
+		}
+		if got := r.TokenTTL(); got != tc.ttl {
+			t.Errorf("%s.TokenTTL() = %v, want %v", tc.id, got, tc.ttl)
+		}
+	}
+}
+
+func TestStaticProvidersNotRefreshable(t *testing.T) {
+	staticProviders := []registry.ProviderID{
+		registry.Direct, registry.Neon, registry.Supabase,
+		registry.PlanetScale, registry.VercelPG, registry.DigitalOcean,
+		registry.Railway, registry.Upstash, registry.Cloudflare,
+		registry.Firebase, registry.MongoAtlas,
+	}
+	for _, id := range staticProviders {
+		p := auth.Lookup(id)
+		if _, ok := p.(auth.Refreshable); ok {
+			t.Errorf("%s should NOT implement auth.Refreshable (static credentials)", id)
+		}
 	}
 }
 

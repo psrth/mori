@@ -20,7 +20,7 @@ func (p *vercelPostgresProvider) Fields(engine registry.EngineID) []registry.Con
 
 func (p *vercelPostgresProvider) ConnString(_ context.Context, conn *config.Connection) (string, error) {
 	if u := conn.Extra["connection_url"]; u != "" {
-		return u, nil
+		return enforceSSLInURL(u), nil
 	}
 	return connWithSSL(conn).ToConnString(), nil
 }

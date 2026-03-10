@@ -21,8 +21,16 @@ type ProdDSN struct {
 // Parse accepts a PostgreSQL connection string in URI format
 // (postgres://user:pass@host:port/dbname?sslmode=disable) or
 // keyword=value format (host=... port=... dbname=... user=... password=...)
-// and returns a validated ProdDSN.
+// and returns a validated ProdDSN. It defaults to port 5432.
 func Parse(connStr string) (*ProdDSN, error) {
+	return ParseWithDefaultPort(connStr, 5432)
+}
+
+// ParseWithDefaultPort works like Parse but uses the given defaultPort when
+// the connection string does not specify one. This is useful for engines that
+// reuse the PostgreSQL wire protocol but listen on a different port (e.g.
+// CockroachDB defaults to 26257).
+func ParseWithDefaultPort(connStr string, defaultPort int) (*ProdDSN, error) {
 	connStr = strings.TrimSpace(connStr)
 	if connStr == "" {
 		return nil, fmt.Errorf("connection string is empty")
@@ -49,7 +57,7 @@ func Parse(connStr string) (*ProdDSN, error) {
 		return nil, fmt.Errorf("connection string missing database name")
 	}
 	if dsn.Port == 0 {
-		dsn.Port = 5432
+		dsn.Port = defaultPort
 	}
 	if dsn.SSLMode == "" {
 		dsn.SSLMode = "verify-full"
@@ -89,9 +97,71 @@ func parseURI(connStr string) (*ProdDSN, error) {
 	return dsn, nil
 }
 
+// tokenizeKeyValue splits a libpq key=value connection string into
+// individual "key=value" tokens, respecting single-quoted values that
+// may contain spaces. Inside a quoted value, \' produces a literal
+// single quote and \\ produces a literal backslash.
+func tokenizeKeyValue(connStr string) []string {
+	var tokens []string
+	var cur strings.Builder
+	i := 0
+	for i < len(connStr) {
+		ch := connStr[i]
+
+		// Outside a token: skip whitespace.
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+			if cur.Len() > 0 {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+			}
+			i++
+			continue
+		}
+
+		// If we hit a single quote, consume the quoted segment.
+		if ch == '\'' {
+			i++ // skip opening quote
+			for i < len(connStr) && connStr[i] != '\'' {
+				if connStr[i] == '\\' && i+1 < len(connStr) {
+					// Handle \' and \\ inside quotes.
+					next := connStr[i+1]
+					if next == '\'' || next == '\\' {
+						cur.WriteByte(next)
+						i += 2
+						continue
+					}
+				}
+				cur.WriteByte(connStr[i])
+				i++
+			}
+			if i < len(connStr) {
+				i++ // skip closing quote
+			}
+			continue
+		}
+
+		// Handle \' and \\ outside quotes (libpq allows these at the top level).
+		if ch == '\\' && i+1 < len(connStr) {
+			next := connStr[i+1]
+			if next == '\'' || next == '\\' {
+				cur.WriteByte(next)
+				i += 2
+				continue
+			}
+		}
+
+		cur.WriteByte(ch)
+		i++
+	}
+	if cur.Len() > 0 {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
+}
+
 func parseKeyValue(connStr string) (*ProdDSN, error) {
 	dsn := &ProdDSN{}
-	parts := strings.Fields(connStr)
+	parts := tokenizeKeyValue(connStr)
 	for _, part := range parts {
 		idx := strings.Index(part, "=")
 		if idx < 0 {

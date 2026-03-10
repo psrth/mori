@@ -133,7 +133,10 @@ func parseGoDSN(connStr string) (*DSN, error) {
 	}
 
 	// Split user info from address at "@".
-	if idx := strings.Index(base, "@"); idx >= 0 {
+	// Use LastIndex because passwords may contain "@" characters
+	// (e.g., user:p@ss@tcp(host:3306)/db). The go-sql-driver/mysql
+	// uses the same approach.
+	if idx := strings.LastIndex(base, "@"); idx >= 0 {
 		userInfo := base[:idx]
 		base = base[idx+1:]
 
