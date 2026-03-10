@@ -363,7 +363,7 @@ func (p *Proxy) routeLoop(
 
 		// Handle StrategyNotSupported — return error to client.
 		if decision.strategy == core.StrategyNotSupported {
-			msg := "this command is not supported through Mori"
+			msg := core.UnsupportedTransactionMsg
 			if decision.classification != nil && decision.classification.NotSupportedMsg != "" {
 				msg = decision.classification.NotSupportedMsg
 			}
@@ -527,8 +527,11 @@ func (p *Proxy) classifyAndRoute(inline, cmd string, connID int64) routeDecision
 			strategy:       strategy,
 		}
 
-	default:
+	case core.StrategyProdDirect:
 		return routeDecision{target: targetProd, classification: classification, strategy: strategy}
+
+	default:
+		return routeDecision{target: targetProd, classification: classification, strategy: core.StrategyNotSupported}
 	}
 }
 

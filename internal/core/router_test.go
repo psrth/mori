@@ -134,11 +134,23 @@ func TestRouterRoutingTable(t *testing.T) {
 			cl:   &Classification{OpType: OpTransaction, SubType: SubRollback},
 			want: StrategyTransaction,
 		},
-		// Other: SET → ProdDirect
+		// Other: SubOther → ProdDirect (explicit case)
 		{
-			name: "SET",
+			name: "SubOther",
 			cl:   &Classification{OpType: OpOther, SubType: SubOther},
 			want: StrategyProdDirect,
+		},
+		// Unknown SubType under OpOther → NotSupported
+		{
+			name: "unknown OpOther SubType",
+			cl:   &Classification{OpType: OpOther, SubType: SubType(999)},
+			want: StrategyNotSupported,
+		},
+		// Unknown OpType → NotSupported
+		{
+			name: "unknown OpType",
+			cl:   &Classification{OpType: OpType(999), SubType: SubType(999)},
+			want: StrategyNotSupported,
 		},
 	}
 

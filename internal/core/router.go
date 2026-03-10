@@ -112,12 +112,16 @@ func (r *Router) Route(c *Classification) RoutingStrategy {
 			return StrategyShadowWrite // PREPARE forwarded to Shadow; proxy caches the SQL
 		case SubDeallocate:
 			return StrategyForwardBoth
-		default:
+		case SubOther:
 			return StrategyProdDirect
+		case SubExecute:
+			return StrategyProdDirect
+		default:
+			return StrategyNotSupported
 		}
 
 	default:
-		return StrategyProdDirect
+		return StrategyNotSupported
 	}
 }
 

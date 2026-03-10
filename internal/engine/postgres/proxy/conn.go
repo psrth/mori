@@ -608,7 +608,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 
 		// Handle not-supported features.
 		if decision.classification != nil && decision.strategy == core.StrategyNotSupported {
-			errMsg := "mori: this operation is not supported through the proxy"
+			errMsg := core.UnsupportedTransactionMsg
 			if decision.classification.NotSupportedMsg != "" {
 				errMsg = decision.classification.NotSupportedMsg
 			} else if decision.classification.SubType == core.SubExplain {
@@ -826,15 +826,18 @@ func (p *Proxy) classifyAndRoute(msg *pgMsg, connID int64) routeDecision {
 	case core.StrategyTruncate:
 		return routeDecision{target: targetShadow, classification: classification, strategy: strategy}
 
-	default:
-		// ProdDirect, Other — but override metadata queries about dirty tables
+	case core.StrategyProdDirect:
+		// Override metadata queries about dirty tables
 		// so that \d and information_schema queries reflect Shadow schema.
 		if classification != nil && classification.IsMetadataQuery &&
 			classification.IntrospectedTable != "" && p.schemaRegistry != nil &&
 			p.schemaRegistry.HasDiff(classification.IntrospectedTable) {
 			return routeDecision{target: targetShadow, classification: classification, strategy: strategy}
 		}
-		return routeDecision{target: targetProd, strategy: strategy}
+		return routeDecision{target: targetProd, classification: classification, strategy: strategy}
+
+	default:
+		return routeDecision{target: targetProd, classification: classification, strategy: core.StrategyNotSupported}
 	}
 }
 

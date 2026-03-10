@@ -65,6 +65,15 @@ func (p *Proxy) handler(srv any, serverStream grpc.ServerStream) error {
 		p.logger.Query(connID, method, cl, strategy, 0)
 	}
 
+	// Block unsupported operations before routing.
+	if strategy == core.StrategyNotSupported {
+		msg := core.UnsupportedTransactionMsg
+		if cl.NotSupportedMsg != "" {
+			msg = cl.NotSupportedMsg
+		}
+		return status.Error(codes.Unimplemented, msg)
+	}
+
 	// Determine target using SDK-aware routing.
 	target := p.resolveTargetSDK(cl, strategy, method)
 
@@ -174,8 +183,14 @@ func (p *Proxy) resolveTargetLegacy(cl *core.Classification, strategy core.Routi
 		// Without SDK clients, fall back to shadow-only reads.
 		return targetShadow
 
-	default:
+	case core.StrategyNotSupported:
+		return targetProd // Intercepted by handler before target dispatch.
+
+	case core.StrategyProdDirect:
 		return targetProd
+
+	default:
+		return targetProd // Unknown strategy — will be caught by handler's StrategyNotSupported check.
 	}
 }
 

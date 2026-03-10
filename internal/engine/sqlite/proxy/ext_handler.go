@@ -292,10 +292,10 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 		eh.extHandleTruncate(clientConn, cl)
 
 	case core.StrategyNotSupported:
-		eh.extSendError(clientConn, "mori: this statement is not supported in shadow mode")
+		eh.extSendError(clientConn, core.UnsupportedTransactionMsg)
 
 	default:
-		eh.extExecOnProd(clientConn, fullSQL)
+		eh.extSendError(clientConn, core.UnsupportedTransactionMsg)
 	}
 }
 

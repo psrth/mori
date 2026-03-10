@@ -234,8 +234,19 @@ func (eh *ExtHandler) handleExecute(clientConn net.Conn, pkt *mysqlMsg) error {
 	case core.StrategyTransaction:
 		return eh.handleExtTxn(clientConn, pkt.Raw, cl, entry.sql)
 
+	case core.StrategyNotSupported:
+		msg := core.UnsupportedTransactionMsg
+		if cl.NotSupportedMsg != "" {
+			msg = cl.NotSupportedMsg
+		}
+		errPkt := buildGuardErrorResponse(1, msg)
+		_, err := clientConn.Write(errPkt)
+		return err
+
 	default:
-		return forwardAndRelay(pkt.Raw, eh.prodConn, clientConn)
+		errPkt := buildGuardErrorResponse(1, core.UnsupportedTransactionMsg)
+		_, err := clientConn.Write(errPkt)
+		return err
 	}
 }
 

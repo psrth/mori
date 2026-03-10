@@ -237,7 +237,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			if decision.strategy == core.StrategyNotSupported && decision.classification != nil {
 				msg := decision.classification.NotSupportedMsg
 				if msg == "" {
-					msg = "this operation is not supported through the Mori proxy"
+					msg = core.UnsupportedTransactionMsg
 				}
 				errPkt := buildErrorResponse(msg)
 				clientConn.Write(errPkt)
@@ -503,8 +503,11 @@ func (p *Proxy) classifyAndRoute(sql string, connID int64) routeDecision {
 			strategy:       strategy,
 		}
 
+	case core.StrategyProdDirect:
+		return routeDecision{target: targetProd, classification: classification, strategy: strategy}
+
 	default:
-		return routeDecision{target: targetProd, strategy: strategy}
+		return routeDecision{target: targetProd, classification: classification, strategy: core.StrategyNotSupported}
 	}
 }
 
