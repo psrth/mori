@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -75,6 +76,45 @@ func New(prodDSN, shadowDSN string, listenPort int, verbose bool,
 // from Prod in a single operation. 0 means unlimited.
 func (p *Proxy) SetMaxRowsHydrate(n int) {
 	p.maxRowsHydrate = n
+}
+
+// capSQL appends a LIMIT clause to cap rows fetched from Prod.
+// If maxRowsHydrate is 0 or the outer query already has LIMIT, returns sql unchanged.
+func (p *Proxy) capSQL(sql string) string {
+	if p.maxRowsHydrate <= 0 {
+		return sql
+	}
+	if hasOuterLimit(sql) {
+		return sql
+	}
+	return sql + fmt.Sprintf(" LIMIT %d", p.maxRowsHydrate)
+}
+
+// hasOuterLimit reports whether sql contains a LIMIT keyword at the outermost
+// level (not inside parenthesized subqueries). It handles any whitespace
+// (spaces, tabs, newlines) around the keyword.
+func hasOuterLimit(sql string) bool {
+	upper := strings.ToUpper(sql)
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+5 <= len(upper) && upper[i:i+5] == "LIMIT" {
+				before := i == 0 || upper[i-1] == ' ' || upper[i-1] == '\t' || upper[i-1] == '\n' || upper[i-1] == '\r' || upper[i-1] == ')'
+				after := i+5 == len(upper) || upper[i+5] == ' ' || upper[i+5] == '\t' || upper[i+5] == '\n' || upper[i+5] == '\r'
+				if before && after {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // ListenAndServe opens the SQLite databases, binds the TCP listener,

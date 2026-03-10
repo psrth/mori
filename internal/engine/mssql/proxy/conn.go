@@ -120,6 +120,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			connID:         connID,
 			verbose:        p.verbose,
 			logger:         p.logger,
+			maxRowsHydrate: p.maxRowsHydrate,
 		}
 	}
 

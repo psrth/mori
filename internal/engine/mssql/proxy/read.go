@@ -26,6 +26,33 @@ type ReadHandler struct {
 	connID         int64
 	verbose        bool
 	logger         *logging.Logger
+	maxRowsHydrate int
+}
+
+// capSQL inserts TOP N after SELECT to cap rows fetched from Prod.
+// Handles leading whitespace and parenthesized queries like "(SELECT ...)".
+func (rh *ReadHandler) capSQL(sql string) string {
+	if rh.maxRowsHydrate <= 0 {
+		return sql
+	}
+	trimmed := strings.TrimSpace(sql)
+	// Handle parenthesized queries: strip outer parens, cap, re-wrap.
+	if strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")") {
+		inner := rh.capSQL(trimmed[1 : len(trimmed)-1])
+		if inner == trimmed[1:len(trimmed)-1] {
+			return sql // no change
+		}
+		return "(" + inner + ")"
+	}
+	upper := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(upper, "SELECT") {
+		return sql
+	}
+	afterSelect := strings.TrimSpace(upper[6:])
+	if strings.HasPrefix(afterSelect, "TOP") {
+		return sql
+	}
+	return trimmed[:6] + fmt.Sprintf(" TOP %d", rh.maxRowsHydrate) + trimmed[6:]
 }
 
 // HandleRead dispatches a read operation based on the routing strategy.
@@ -277,6 +304,7 @@ func (rh *ReadHandler) aggregateReadCore(cl *core.Classification, querySQL strin
 	}
 
 	baseSQL := rh.buildAggregateBaseQuery(querySQL, table)
+	baseSQL = rh.capSQL(baseSQL)
 	if baseSQL == "" {
 		// Complex aggregate — try temp table materialization first.
 		cols, vals, nls, mErr := rh.aggregateViaTempTable(cl, querySQL, table)
@@ -325,6 +353,7 @@ func (rh *ReadHandler) aggregateViaTempTable(cl *core.Classification, querySQL, 
 ) {
 	// Get the base data via merged read.
 	baseSQL := "SELECT * FROM " + quoteIdentMSSQL(table)
+	baseSQL = rh.capSQL(baseSQL)
 	baseCl := &core.Classification{
 		OpType:  core.OpRead,
 		SubType: core.SubSelect,

@@ -1391,6 +1391,7 @@ func (p *Proxy) executeAggregateRead(sqlStr string, cl *core.Classification, con
 	baseCl.Limit = 0
 	baseCl.OrderBy = ""
 
+	baseSQL = p.capSQL(baseSQL)
 	_, baseRows, _, err := p.mergedReadRows(baseSQL, &baseCl, connID)
 	if err != nil {
 		return p.safeProdExecQuery(sqlStr, connID)
@@ -1415,6 +1416,7 @@ func (p *Proxy) materializeAndReexecute(sqlStr string, cl *core.Classification, 
 
 	// Build base SELECT * FROM table.
 	baseSQL := fmt.Sprintf(`SELECT * FROM %q`, table)
+	baseSQL = p.capSQL(baseSQL)
 	utilName, err := p.materializeToUtilTable(baseSQL, table, connID, p.maxRowsHydrate)
 	if err != nil {
 		if p.verbose {
@@ -1612,6 +1614,7 @@ func (p *Proxy) mergedReadRows(sqlStr string, cl *core.Classification, connID in
 	}
 
 	// L2 write guard: use safeProdQuery for defense-in-depth.
+	prodSQL = p.capSQL(prodSQL)
 	prodCols, prodRows, prodNulls, prodErr := p.safeProdQuery(prodSQL, connID)
 	if prodErr != nil {
 		if p.schemaRegistry != nil && p.schemaRegistry.HasDiff(table) {

@@ -36,15 +36,16 @@ func (rh *ReadHandler) handleSetOpRead(
 	var allNulls [][]bool
 
 	for i, leaf := range leaves {
+		cappedLeaf := rh.capSQL(leaf)
 		leafCl := &core.Classification{
 			OpType:    core.OpRead,
 			SubType:   core.SubSelect,
-			RawSQL:    leaf,
+			RawSQL:    cappedLeaf,
 			Tables:    extractTablesFromSQL(leaf),
 			HasSetOp:  false,
 		}
 
-		columns, values, nulls, err := rh.mergedReadCore(leafCl, leaf)
+		columns, values, nulls, err := rh.mergedReadCore(leafCl, cappedLeaf)
 		if err != nil {
 			if rh.verbose {
 				log.Printf("[conn %d] set op: leaf %d failed: %v", rh.connID, i, err)

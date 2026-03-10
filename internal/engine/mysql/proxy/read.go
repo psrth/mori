@@ -39,9 +39,10 @@ type ReadHandler struct {
 	tombstones     *delta.TombstoneSet
 	tables         map[string]schema.TableMeta
 	schemaRegistry *coreSchema.Registry
-	connID         int64
-	verbose        bool
-	logger         *logging.Logger
+	connID          int64
+	verbose         bool
+	logger          *logging.Logger
+	maxRowsHydrate  int
 }
 
 // HandleRead dispatches a read operation based on the routing strategy.
@@ -1575,7 +1576,7 @@ func (rh *ReadHandler) joinMaterializeCore(cl *core.Classification, querySQL str
 		selectSQL := "SELECT * FROM `" + table + "`"
 		utilName := utilTableName(selectSQL)
 
-		_, err := rh.materializeToUtilTable(selectSQL, utilName, 0)
+		_, err := rh.materializeToUtilTable(selectSQL, utilName, rh.maxRowsHydrate)
 		if err != nil {
 			rh.logf("JOIN materialization failed for %s: %v", table, err)
 			// Fall back to Shadow-only.

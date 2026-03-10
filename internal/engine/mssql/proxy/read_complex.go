@@ -36,6 +36,7 @@ func (rh *ReadHandler) handleComplexRead(
 	rewriteMap := make(map[string]string) // original table -> temp table
 	for _, table := range dirtyTables {
 		baseSQL := "SELECT * FROM " + quoteIdentMSSQL(table)
+		baseSQL = rh.capSQL(baseSQL)
 		baseCl := &core.Classification{
 			OpType:  core.OpRead,
 			SubType: core.SubSelect,

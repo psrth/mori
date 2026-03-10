@@ -31,6 +31,7 @@ func (rh *ReadHandler) handleWindowFunctionRead(
 	if baseSQL == "" {
 		return rh.fallbackToProd(clientConn, fullPayload, cl.RawSQL)
 	}
+	baseSQL = rh.capSQL(baseSQL)
 
 	// Step 2: Merged read on the base query.
 	baseCl := *cl

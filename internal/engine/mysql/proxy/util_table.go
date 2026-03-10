@@ -26,11 +26,8 @@ func (rh *ReadHandler) materializeToUtilTable(querySQL string, tableName string,
 
 	// Cap the query if maxRows > 0.
 	cappedSQL := querySQL
-	if maxRows > 0 {
-		upper := strings.ToUpper(cappedSQL)
-		if !strings.Contains(upper, "LIMIT") {
-			cappedSQL = fmt.Sprintf("%s LIMIT %d", cappedSQL, maxRows)
-		}
+	if maxRows > 0 && !hasOuterLimit(cappedSQL) {
+		cappedSQL = fmt.Sprintf("%s LIMIT %d", cappedSQL, maxRows)
 	}
 
 	// Execute merged read.

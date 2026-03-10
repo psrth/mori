@@ -775,6 +775,7 @@ func (p *Proxy) mergedReadRows(sqlStr string, cl *core.Classification, connID in
 		return shadowCols, shadowRows, shadowNulls, nil
 	}
 
+	prodSQL = p.capSQL(prodSQL)
 	prodCols, prodRows, prodNulls, prodErr := queryToRows(p.prodDB, prodSQL)
 	if prodErr != nil {
 		if p.schemaRegistry != nil && p.schemaRegistry.HasDiff(table) {
