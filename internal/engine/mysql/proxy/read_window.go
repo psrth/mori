@@ -42,7 +42,7 @@ func (rh *ReadHandler) windowReadCore(cl *core.Classification, querySQL string) 
 	utilName := utilTableName(querySQL)
 
 	// Materialize merged results into temp table.
-	_, err := rh.materializeToUtilTable(baseSQL, utilName, 0)
+	_, err := rh.materializeToUtilTable(baseSQL, utilName, rh.maxRowsHydrate)
 	if err != nil {
 		rh.logf("window materialization failed, falling back: %v", err)
 		return rh.windowFallback(querySQL)

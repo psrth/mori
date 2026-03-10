@@ -734,15 +734,41 @@ func extractInsertValues(ins *sqlparser.Insert) [][]string {
 	return rows
 }
 
-// capSQL appends a LIMIT clause to a SQL query if maxRows > 0 and the query
-// doesn't already have one.
+// capSQL appends a LIMIT clause to a SQL query if maxRows > 0 and the outer
+// query doesn't already have one. Subquery LIMIT clauses are ignored.
 func capSQL(sql string, maxRows int) string {
 	if maxRows <= 0 {
 		return sql
 	}
-	upper := strings.ToUpper(sql)
-	if strings.Contains(upper, "LIMIT") {
+	if hasOuterLimit(sql) {
 		return sql
 	}
 	return fmt.Sprintf("%s LIMIT %d", sql, maxRows)
+}
+
+// hasOuterLimit reports whether sql contains a LIMIT keyword at the outermost
+// level (not inside parenthesized subqueries). It handles any whitespace
+// (spaces, tabs, newlines) around the keyword.
+func hasOuterLimit(sql string) bool {
+	upper := strings.ToUpper(sql)
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+5 <= len(upper) && upper[i:i+5] == "LIMIT" {
+				before := i == 0 || upper[i-1] == ' ' || upper[i-1] == '\t' || upper[i-1] == '\n' || upper[i-1] == '\r' || upper[i-1] == ')'
+				after := i+5 == len(upper) || upper[i+5] == ' ' || upper[i+5] == '\t' || upper[i+5] == '\n' || upper[i+5] == '\r'
+				if before && after {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

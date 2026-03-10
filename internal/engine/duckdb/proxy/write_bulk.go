@@ -48,6 +48,9 @@ func (p *Proxy) handleBulkUpdate(sqlStr string, cl *core.Classification, connID 
 	}
 
 	// 2. Query Prod for matching rows.
+	// Note: do NOT cap this query — write discovery must find ALL matching rows
+	// so the delta map is complete. The hydration loop below caps how many rows
+	// are actually materialized into Shadow.
 	cols, rows, nulls, err := queryToRows(p.prodDB, selectSQL)
 	if err != nil {
 		if p.verbose {
@@ -160,6 +163,9 @@ func (p *Proxy) handleBulkDelete(sqlStr string, cl *core.Classification, connID 
 	}
 
 	// 2. Query Prod for matching PKs.
+	// Note: do NOT cap this query — write discovery must find ALL matching PKs
+	// so the tombstone set is complete. A partial tombstone set would cause
+	// merged reads to re-surface supposedly-deleted rows.
 	cols, rows, _, err := queryToRows(p.prodDB, selectSQL)
 	if err != nil {
 		if p.verbose {

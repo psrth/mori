@@ -70,14 +70,41 @@ func (rh *ReadHandler) logf(format string, args ...interface{}) {
 }
 
 // capSQL appends a LIMIT clause to a SQL query for materialization reads
-// when maxRowsHydrate is configured. If the query already contains a LIMIT
-// clause, the SQL is returned unchanged to avoid double-limiting.
+// when maxRowsHydrate is configured. If the outer query already contains a
+// LIMIT clause, the SQL is returned unchanged to avoid double-limiting.
 func (rh *ReadHandler) capSQL(sql string) string {
 	if rh.maxRowsHydrate <= 0 {
 		return sql
 	}
-	if strings.Contains(strings.ToUpper(sql), " LIMIT ") {
+	if hasOuterLimit(sql) {
 		return sql
 	}
 	return sql + fmt.Sprintf(" LIMIT %d", rh.maxRowsHydrate)
+}
+
+// hasOuterLimit reports whether sql contains a LIMIT keyword at the outermost
+// level (not inside parenthesized subqueries). It handles any whitespace
+// (spaces, tabs, newlines) around the keyword.
+func hasOuterLimit(sql string) bool {
+	upper := strings.ToUpper(sql)
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+5 <= len(upper) && upper[i:i+5] == "LIMIT" {
+				before := i == 0 || upper[i-1] == ' ' || upper[i-1] == '\t' || upper[i-1] == '\n' || upper[i-1] == '\r' || upper[i-1] == ')'
+				after := i+5 == len(upper) || upper[i+5] == ' ' || upper[i+5] == '\t' || upper[i+5] == '\n' || upper[i+5] == '\r'
+				if before && after {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

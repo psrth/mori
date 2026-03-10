@@ -575,7 +575,7 @@ func (rh *ReadHandler) materializeAndAggregateMySQL(
 	}
 
 	utilName := utilTableName(querySQL)
-	_, err := rh.materializeToUtilTable(baseSQL, utilName, 0)
+	_, err := rh.materializeToUtilTable(baseSQL, utilName, rh.maxRowsHydrate)
 	if err != nil {
 		rh.logf("materialization failed, falling back to shadow: %v", err)
 		result, qerr := execMySQLQuery(rh.shadowConn, querySQL)

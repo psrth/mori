@@ -60,6 +60,7 @@ func init() {
 	startCmd.Flags().Bool("verbose", false, "Log all intercepted queries and routing decisions")
 	startCmd.Flags().Bool("mcp", false, "Enable MCP server for AI tool integration")
 	startCmd.Flags().Int("mcp-port", 9000, "Port for the MCP server")
+	startCmd.Flags().Int("max-rows", 0, "Max rows to hydrate from prod per query (0 = unlimited)")
 }
 
 func runStart(cmd *cobra.Command, args []string) error {
@@ -67,6 +68,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	mcpEnabled, _ := cmd.Flags().GetBool("mcp")
 	mcpPort, _ := cmd.Flags().GetInt("mcp-port")
+	maxRows, _ := cmd.Flags().GetInt("max-rows")
 
 	// 1. Find project root.
 	projectRoot, err := config.FindProjectRoot()
@@ -232,6 +234,9 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// Update port in config.
 	cfg.ProxyPort = port
 	cfg.ActiveConnection = connName
+	if cmd.Flags().Changed("max-rows") {
+		cfg.MaxRowsHydrate = maxRows
+	}
 	if err := config.WriteConnConfig(projectRoot, connName, cfg); err != nil {
 		return fmt.Errorf("failed to update config: %w", err)
 	}

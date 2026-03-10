@@ -982,7 +982,8 @@ func (w *WriteHandler) capSQL(sql string) string {
 	if w.maxRowsHydrate <= 0 {
 		return sql
 	}
-	upper := strings.ToUpper(strings.TrimSpace(sql))
+	trimmed := strings.TrimSpace(sql)
+	upper := strings.ToUpper(trimmed)
 	if !strings.HasPrefix(upper, "SELECT") {
 		return sql
 	}
@@ -992,7 +993,7 @@ func (w *WriteHandler) capSQL(sql string) string {
 		return sql
 	}
 	// Insert TOP N after SELECT.
-	return sql[:6] + fmt.Sprintf(" TOP %d", w.maxRowsHydrate) + sql[6:]
+	return trimmed[:6] + fmt.Sprintf(" TOP %d", w.maxRowsHydrate) + trimmed[6:]
 }
 
 // ---------------------------------------------------------------------------
