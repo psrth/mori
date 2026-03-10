@@ -460,6 +460,68 @@ func TestClassify(t *testing.T) {
 			wantTbls: []string{"users"},
 			wantPKs:  []core.TablePK{{Table: "users", PK: "99"}},
 		},
+
+		// ── Multi-statement detection ───────────────────────────────
+		{
+			name:    "multi-stmt select then delete",
+			sql:     "SELECT 1; DELETE FROM users",
+			wantOp:  core.OpWrite,
+			wantSub: core.SubNotSupported,
+		},
+		{
+			name:    "multi-stmt select then insert",
+			sql:     "SELECT 1; INSERT INTO users(id) VALUES(1)",
+			wantOp:  core.OpWrite,
+			wantSub: core.SubNotSupported,
+		},
+		{
+			name:    "multi-stmt select then drop (DDL counts)",
+			sql:     "SELECT 1; DROP TABLE users",
+			wantOp:  core.OpWrite,
+			wantSub: core.SubNotSupported,
+		},
+		{
+			name:    "multi-stmt all reads is fine",
+			sql:     "SELECT 1; SELECT 2",
+			wantOp:  core.OpRead,
+			wantSub: core.SubSelect,
+		},
+		{
+			name:     "multi-stmt write first classified normally",
+			sql:      "DELETE FROM users; SELECT 1",
+			wantOp:   core.OpWrite,
+			wantSub:  core.SubNotSupported,
+		},
+		{
+			name:    "multi-stmt select then COPY",
+			sql:     "SELECT 1; COPY users TO STDOUT",
+			wantOp:  core.OpWrite,
+			wantSub: core.SubNotSupported,
+		},
+		{
+			name:    "multi-stmt select then DO block",
+			sql:     "SELECT 1; DO $$ BEGIN PERFORM 1; END $$",
+			wantOp:  core.OpWrite,
+			wantSub: core.SubNotSupported,
+		},
+		{
+			name:    "multi-stmt select then CALL",
+			sql:     "SELECT 1; CALL my_proc()",
+			wantOp:  core.OpWrite,
+			wantSub: core.SubNotSupported,
+		},
+		{
+			name:    "multi-stmt select then GRANT",
+			sql:     "SELECT 1; GRANT ALL ON users TO attacker",
+			wantOp:  core.OpWrite,
+			wantSub: core.SubNotSupported,
+		},
+		{
+			name:    "multi-stmt select then GRANT ROLE",
+			sql:     "SELECT 1; GRANT admin TO attacker",
+			wantOp:  core.OpWrite,
+			wantSub: core.SubNotSupported,
+		},
 	}
 
 	for _, tt := range tests {

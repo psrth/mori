@@ -171,6 +171,10 @@ func (c *MySQLClassifier) classifyStmt(stmt sqlparser.Statement, cl *core.Classi
 	case *sqlparser.ExplainTab:
 		cl.OpType = core.OpOther
 		cl.SubType = core.SubExplain
+	case *sqlparser.CallProc:
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "CALL statements are not supported through the Mori proxy"
 	case *sqlparser.Use:
 		cl.OpType = core.OpOther
 		cl.SubType = core.SubOther
@@ -712,6 +716,10 @@ func (c *MySQLClassifier) classifyRegex(trimmed string, cl *core.Classification)
 		} else {
 			cl.SubType = core.SubExplain
 		}
+	case hasPrefix(upper, "CALL"):
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "CALL statements are not supported through the Mori proxy"
 	case hasPrefix(upper, "USE"), hasPrefix(upper, "HELP"):
 		cl.OpType = core.OpOther
 		cl.SubType = core.SubOther

@@ -101,8 +101,6 @@ func TestLooksLikeWrite(t *testing.T) {
 		// Safe
 		{"select", "SELECT * FROM users", false},
 		{"set", "SET NOCOUNT ON", false},
-		{"exec", "EXEC sp_help", false},
-		{"execute", "EXECUTE sp_help", false},
 		{"begin", "BEGIN", false},
 		{"commit", "COMMIT", false},
 		{"rollback", "ROLLBACK", false},
@@ -122,11 +120,34 @@ func TestLooksLikeWrite(t *testing.T) {
 		{"drop", "DROP TABLE users", true},
 		{"grant", "GRANT SELECT ON users TO reader", true},
 		{"bulk_insert", "BULK INSERT users FROM 'data.csv'", true},
+		{"exec", "EXEC my_proc", true},
+		{"execute", "EXECUTE sp_help", true},
 
 		// CTE writes
 		{"cte_insert", "WITH data AS (SELECT 1) INSERT INTO users SELECT * FROM data", true},
 		{"cte_select_only", "WITH data AS (SELECT 1) SELECT * FROM data", false},
 		{"cte_merge", "WITH src AS (SELECT 1) MERGE INTO users USING src ON ...", true},
+
+		// Multi-statement detection
+		{"multi_stmt_delete", "SELECT 1; DELETE FROM users", true},
+		{"multi_stmt_insert", "SELECT 1; INSERT INTO t VALUES (1)", true},
+		{"multi_stmt_drop", "SELECT 1; DROP TABLE t", true},
+		{"multi_stmt_safe", "SELECT 1; SELECT 2", false},
+		{"multi_stmt_trailing_semi", "SELECT 1;", false},
+
+		// String literal false positives (semicolons inside quotes are not delimiters)
+		{"string_literal_semicolon", "SELECT 'x;DELETE FROM t'", false},
+		{"string_literal_escaped_quote", "SELECT 'it''s;here'", false},
+
+		// Comment bypass (comments before write keywords must be stripped)
+		{"line_comment_before_write", "SELECT 1; --comment\nDELETE FROM t", true},
+		{"block_comment_before_write", "SELECT 1; /* comment */ DELETE FROM t", true},
+
+		// Block comment with apostrophe must not poison semicolon detection
+		{"block_comment_apostrophe", "SELECT /* it's */ 1; DELETE FROM users", true},
+
+		// CTE name containing keyword substring must not cause false positive
+		{"cte_name_insert_log", "WITH insert_log AS (SELECT 1) SELECT * FROM insert_log", false},
 
 		// Edge cases
 		{"empty", "", false},

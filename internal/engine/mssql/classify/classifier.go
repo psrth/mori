@@ -97,8 +97,11 @@ func (c *MSSQLClassifier) Classify(query string) (*core.Classification, error) {
 		// P1 §2.7: sp_rename for column renaming → classify as DDL.
 		cl.OpType = core.OpDDL
 		cl.SubType = core.SubAlter
+	case hasPrefix(upper, "EXEC"), hasPrefix(upper, "EXECUTE"):
+		cl.OpType = core.OpWrite
+		cl.SubType = core.SubNotSupported
+		cl.NotSupportedMsg = "EXEC/EXECUTE statements are not supported through the Mori proxy"
 	case hasPrefix(upper, "SET"), hasPrefix(upper, "PRINT"),
-		hasPrefix(upper, "EXEC"), hasPrefix(upper, "EXECUTE"),
 		hasPrefix(upper, "DECLARE"), hasPrefix(upper, "USE"),
 		hasPrefix(upper, "DBCC"), hasPrefix(upper, "WAITFOR"),
 		hasPrefix(upper, "RAISERROR"), hasPrefix(upper, "THROW"),

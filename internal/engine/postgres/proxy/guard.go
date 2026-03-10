@@ -135,12 +135,90 @@ func (s *SafeProdConn) SetWriteDeadline(t time.Time) error {
 // looksLikeWrite — heuristic SQL write detection
 // ---------------------------------------------------------------------------
 
+// findSemicolonOutsideQuotes returns the index of the first semicolon
+// that is not inside a single-quoted string literal or a comment, or -1
+// if none found.
+func findSemicolonOutsideQuotes(s string) int {
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote {
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++ // skip escaped ''
+				} else {
+					inQuote = false
+				}
+			}
+			continue
+		}
+		switch c {
+		case '\'':
+			inQuote = true
+		case '-':
+			// Line comment: skip to newline
+			if i+1 < len(s) && s[i+1] == '-' {
+				nl := strings.Index(s[i:], "\n")
+				if nl >= 0 {
+					i += nl // loop will increment past \n
+				} else {
+					return -1 // rest is a comment
+				}
+			}
+		case '/':
+			// Block comment: skip to */
+			if i+1 < len(s) && s[i+1] == '*' {
+				end := strings.Index(s[i+2:], "*/")
+				if end >= 0 {
+					i += 2 + end + 1 // skip past */
+				} else {
+					return -1 // unclosed block comment
+				}
+			}
+		case ';':
+			return i
+		}
+	}
+	return -1
+}
+
+// stripLeadingComments removes leading SQL line comments (-- ...\n)
+// and block comments (/* ... */) from a string.
+func stripLeadingComments(s string) string {
+	for {
+		s = strings.TrimSpace(s)
+		if strings.HasPrefix(s, "--") {
+			if nl := strings.Index(s, "\n"); nl >= 0 {
+				s = s[nl+1:]
+			} else {
+				return ""
+			}
+		} else if strings.HasPrefix(s, "/*") {
+			if end := strings.Index(s, "*/"); end >= 0 {
+				s = s[end+2:]
+			} else {
+				return ""
+			}
+		} else {
+			return s
+		}
+	}
+}
+
 // looksLikeWrite returns true if the given SQL string appears to be a mutating
 // statement (INSERT, UPDATE, DELETE, DDL, etc.). It uses prefix matching and
 // handles CTE writes (WITH ... INSERT/UPDATE/DELETE).
 func looksLikeWrite(sql string) bool {
 	trimmed := strings.TrimSpace(sql)
 	upper := strings.ToUpper(trimmed)
+
+	// Write prefixes — these are always writes.
+	writePrefixes := []string{
+		"INSERT", "UPDATE", "DELETE", "TRUNCATE",
+		"CREATE", "ALTER", "DROP",
+		"GRANT", "REVOKE",
+		"COPY", "DO", "CALL",
+	}
 
 	// Safe prefixes — these are never writes.
 	safePrefixes := []string{
@@ -150,16 +228,17 @@ func looksLikeWrite(sql string) bool {
 	}
 	for _, prefix := range safePrefixes {
 		if strings.HasPrefix(upper, prefix) {
+			// Multi-statement: even if first statement is safe, check
+			// subsequent statements after semicolons.
+			if idx := findSemicolonOutsideQuotes(upper); idx >= 0 {
+				if multiStmtHasWrite(upper[idx+1:], writePrefixes) {
+					return true
+				}
+			}
 			return false
 		}
 	}
 
-	// Write prefixes — these are always writes.
-	writePrefixes := []string{
-		"INSERT", "UPDATE", "DELETE", "TRUNCATE",
-		"CREATE", "ALTER", "DROP",
-		"GRANT", "REVOKE",
-	}
 	for _, prefix := range writePrefixes {
 		if strings.HasPrefix(upper, prefix) {
 			return true
@@ -168,14 +247,67 @@ func looksLikeWrite(sql string) bool {
 
 	// CTE writes: WITH ... INSERT/UPDATE/DELETE.
 	if strings.HasPrefix(upper, "WITH") {
-		if strings.Contains(upper, "INSERT") ||
-			strings.Contains(upper, "UPDATE") ||
-			strings.Contains(upper, "DELETE") {
+		if containsKeyword(upper, "INSERT") ||
+			containsKeyword(upper, "UPDATE") ||
+			containsKeyword(upper, "DELETE") {
 			return true
 		}
 	}
 
 	// Default: not a write.
+	return false
+}
+
+// multiStmtHasWrite checks whether any segment in the semicolon-separated
+// remainder contains a write prefix or a CTE write.
+func multiStmtHasWrite(rest string, writePrefixes []string) bool {
+	for rest != "" {
+		idx := findSemicolonOutsideQuotes(rest)
+		var seg string
+		if idx >= 0 {
+			seg = rest[:idx]
+			rest = rest[idx+1:]
+		} else {
+			seg = rest
+			rest = ""
+		}
+		seg = strings.ToUpper(stripLeadingComments(strings.TrimSpace(seg)))
+		if seg == "" {
+			continue
+		}
+		for _, wp := range writePrefixes {
+			if strings.HasPrefix(seg, wp) {
+				return true
+			}
+		}
+		if strings.HasPrefix(seg, "WITH") {
+			if containsKeyword(seg, "INSERT") ||
+				containsKeyword(seg, "UPDATE") ||
+				containsKeyword(seg, "DELETE") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// containsKeyword checks if s contains keyword as a standalone word
+// (not as a substring of an identifier like "insert_log").
+func containsKeyword(s, keyword string) bool {
+	for idx := 0; idx < len(s); {
+		pos := strings.Index(s[idx:], keyword)
+		if pos < 0 {
+			return false
+		}
+		pos += idx
+		leftOK := pos == 0 || !isIdentChar(s[pos-1])
+		end := pos + len(keyword)
+		rightOK := end >= len(s) || !isIdentChar(s[end])
+		if leftOK && rightOK {
+			return true
+		}
+		idx = pos + len(keyword)
+	}
 	return false
 }
 

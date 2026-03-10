@@ -69,25 +69,30 @@ func TestLooksLikeWrite(t *testing.T) {
 	}{
 		// Safe
 		{"select", "SELECT * FROM users", false},
-		{"pragma", "PRAGMA table_info(users)", false},
 		{"explain", "EXPLAIN SELECT 1", false},
+		{"describe", "DESCRIBE users", false},
+		{"show", "SHOW TABLES", false},
+		{"pragma", "PRAGMA table_info('users')", false},
 		{"begin", "BEGIN", false},
 		{"commit", "COMMIT", false},
-		{"end", "END", false},
 		{"rollback", "ROLLBACK", false},
 		{"savepoint", "SAVEPOINT sp1", false},
 		{"release", "RELEASE SAVEPOINT sp1", false},
-		{"analyze", "ANALYZE", false},
-		{"attach", "ATTACH DATABASE 'other.db' AS other", false},
+		{"set", "SET search_path TO public", false},
+		{"reset", "RESET ALL", false},
+		{"call", "CALL my_function()", true},
 
 		// Write
 		{"insert", "INSERT INTO users (name) VALUES ('alice')", true},
 		{"update", "UPDATE users SET name = 'bob' WHERE id = 1", true},
 		{"delete", "DELETE FROM users WHERE id = 1", true},
-		{"replace", "REPLACE INTO users (id, name) VALUES (1, 'alice')", true},
-		{"create", "CREATE TABLE foo (id INTEGER)", true},
-		{"alter", "ALTER TABLE users ADD COLUMN age INTEGER", true},
+		{"truncate", "TRUNCATE TABLE users", true},
+		{"create", "CREATE TABLE foo (id INT)", true},
+		{"alter", "ALTER TABLE users ADD COLUMN age INT", true},
 		{"drop", "DROP TABLE users", true},
+		{"copy", "COPY users TO 'users.csv'", true},
+		{"export", "EXPORT DATABASE '/tmp/db'", true},
+		{"import", "IMPORT DATABASE '/tmp/db'", true},
 
 		// CTE writes
 		{"cte_insert", "WITH data AS (SELECT 1) INSERT INTO users SELECT * FROM data", true},

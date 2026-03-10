@@ -367,6 +367,38 @@ func TestClassify_CTE(t *testing.T) {
 	})
 }
 
+func TestClassify_CallBlocked(t *testing.T) {
+	c := New(nil)
+	tests := []struct {
+		name    string
+		sql     string
+		wantOp  core.OpType
+		wantSub core.SubType
+	}{
+		{"call no args", "CALL my_proc()", core.OpOther, core.SubNotSupported},
+		{"call with args", "CALL my_proc(1, 2)", core.OpOther, core.SubNotSupported},
+		{"call simple", "CALL do_something()", core.OpOther, core.SubNotSupported},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl, err := c.Classify(tt.sql)
+			if err != nil {
+				t.Fatalf("Classify(%q) error: %v", tt.sql, err)
+			}
+			if cl.OpType != tt.wantOp {
+				t.Errorf("OpType = %v, want %v", cl.OpType, tt.wantOp)
+			}
+			if cl.SubType != tt.wantSub {
+				t.Errorf("SubType = %v, want %v", cl.SubType, tt.wantSub)
+			}
+			if cl.NotSupportedMsg == "" {
+				t.Error("NotSupportedMsg should not be empty for CALL")
+			}
+		})
+	}
+}
+
 func TestClassifyWithParams(t *testing.T) {
 	tables := map[string]schema.TableMeta{
 		"users": {PKColumns: []string{"id"}, PKType: "serial"},

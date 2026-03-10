@@ -44,6 +44,23 @@ func (c *PgClassifier) Classify(query string) (*core.Classification, error) {
 		}, nil
 	}
 
+	// Multi-statement detection: if the batch contains more than one
+	// statement and any of them is a write/DDL, reject the entire batch.
+	// This prevents mutations from sneaking through in compound queries
+	// that the proxy cannot safely split across backends.
+	if len(stmts) > 1 {
+		for _, s := range stmts {
+			if isMutatingStmt(s.GetStmt()) {
+				return &core.Classification{
+					OpType:          core.OpWrite,
+					SubType:         core.SubNotSupported,
+					RawSQL:          query,
+					NotSupportedMsg: "multi-statement query contains a write operation; split into separate statements",
+				}, nil
+			}
+		}
+	}
+
 	node := stmts[0].GetStmt()
 	if node == nil {
 		return &core.Classification{
@@ -78,6 +95,29 @@ func (c *PgClassifier) ClassifyWithParams(query string, params []interface{}) (*
 	}
 
 	return cl, nil
+}
+
+// isMutatingStmt returns true if the AST node represents a write or DDL
+// statement. This is used by multi-statement detection to reject batches
+// that contain any mutation alongside other statements.
+func isMutatingStmt(node *pg_query.Node) bool {
+	if node == nil {
+		return false
+	}
+	return node.GetInsertStmt() != nil ||
+		node.GetUpdateStmt() != nil ||
+		node.GetDeleteStmt() != nil ||
+		node.GetCreateStmt() != nil ||
+		node.GetAlterTableStmt() != nil ||
+		node.GetDropStmt() != nil ||
+		node.GetTruncateStmt() != nil ||
+		node.GetIndexStmt() != nil ||
+		node.GetRenameStmt() != nil ||
+		node.GetCopyStmt() != nil ||
+		node.GetDoStmt() != nil ||
+		node.GetCallStmt() != nil ||
+		node.GetGrantStmt() != nil ||
+		node.GetGrantRoleStmt() != nil
 }
 
 // classifyNode dispatches to the appropriate statement classifier.
