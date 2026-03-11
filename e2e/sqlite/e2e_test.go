@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/psrth/mori/internal/core/config"
 	_ "modernc.org/sqlite"
 )
 

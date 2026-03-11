@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 // rewriteForProd rewrites a SQL query to be compatible with the Prod schema.

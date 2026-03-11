@@ -3,9 +3,9 @@ package providers
 import (
 	"context"
 
-	"github.com/mori-dev/mori/internal/auth"
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/auth"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
 )
 
 func init() { auth.Register(&digitalOceanProvider{}) }

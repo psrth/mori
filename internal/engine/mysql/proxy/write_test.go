@@ -3,7 +3,7 @@ package proxy
 import (
 	"testing"
 
-	"github.com/mori-dev/mori/internal/engine/mysql/schema"
+	"github.com/psrth/mori/internal/engine/mysql/schema"
 )
 
 // ---------------------------------------------------------------------------

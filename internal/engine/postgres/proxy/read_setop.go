@@ -7,7 +7,7 @@ import (
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // handleSetOperation handles UNION/INTERSECT/EXCEPT queries on dirty tables.

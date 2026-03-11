@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/engine/mysql/connstr"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/engine/mysql/connstr"
 )
 
 // DumpResult holds the complete result of a MySQL schema dump and analysis.

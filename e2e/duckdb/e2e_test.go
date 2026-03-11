@@ -18,7 +18,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	_ "github.com/marcboeker/go-duckdb"
-	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/psrth/mori/internal/core/config"
 )
 
 // Global test state set by TestMain, used by all tests.

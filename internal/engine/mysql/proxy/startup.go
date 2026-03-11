@@ -7,7 +7,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core/tlsutil"
+	"github.com/psrth/mori/internal/core/tlsutil"
 )
 
 // clientSSL is the MySQL CLIENT_SSL capability flag.

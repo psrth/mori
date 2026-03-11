@@ -3,7 +3,7 @@ package merge
 import (
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 func TestEmptyNil(t *testing.T) {

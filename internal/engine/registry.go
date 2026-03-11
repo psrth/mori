@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/registry"
 )
 
 var (

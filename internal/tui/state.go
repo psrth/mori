@@ -1,11 +1,11 @@
 package tui
 
 import (
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	pgschema "github.com/mori-dev/mori/internal/engine/postgres/schema"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	pgschema "github.com/psrth/mori/internal/engine/postgres/schema"
+	"github.com/psrth/mori/internal/ui"
 )
 
 // Snapshot holds all mori state read from disk in a single pass.

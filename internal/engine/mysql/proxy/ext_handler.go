@@ -8,10 +8,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
-	"github.com/mori-dev/mori/internal/engine/mysql/schema"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
+	"github.com/psrth/mori/internal/engine/mysql/schema"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // stmtCacheEntry holds the cached info for a prepared statement.

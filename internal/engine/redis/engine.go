@@ -4,14 +4,14 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/tlsutil"
-	"github.com/mori-dev/mori/internal/engine"
-	"github.com/mori-dev/mori/internal/engine/redis/classify"
-	"github.com/mori-dev/mori/internal/engine/redis/connstr"
-	"github.com/mori-dev/mori/internal/engine/redis/proxy"
-	"github.com/mori-dev/mori/internal/engine/redis/schema"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/tlsutil"
+	"github.com/psrth/mori/internal/engine"
+	"github.com/psrth/mori/internal/engine/redis/classify"
+	"github.com/psrth/mori/internal/engine/redis/connstr"
+	"github.com/psrth/mori/internal/engine/redis/proxy"
+	"github.com/psrth/mori/internal/engine/redis/schema"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // redisEngine is the Redis implementation of engine.Engine.

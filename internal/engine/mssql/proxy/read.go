@@ -8,11 +8,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/engine/mssql/schema"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/engine/mssql/schema"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // ReadHandler encapsulates merged read logic for a single MSSQL connection.

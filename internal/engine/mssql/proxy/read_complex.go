@@ -4,7 +4,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // handleComplexRead handles CTEs, derived tables, CROSS/OUTER APPLY, and other

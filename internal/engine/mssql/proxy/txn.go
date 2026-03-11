@@ -6,10 +6,10 @@ import (
 	"net"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // savepointSnapshot captures the delta/tombstone/insert/schema state at the time

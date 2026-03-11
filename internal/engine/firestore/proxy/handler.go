@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"cloud.google.com/go/firestore/apiv1/firestorepb"
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine/firestore/classify"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine/firestore/classify"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

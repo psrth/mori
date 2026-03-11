@@ -6,8 +6,8 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // Model is the top-level bubbletea model.

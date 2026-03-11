@@ -4,12 +4,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
-	"github.com/mori-dev/mori/internal/tunnel"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
+	"github.com/psrth/mori/internal/tunnel"
 
 	// Register all tunnel implementations.
-	_ "github.com/mori-dev/mori/internal/tunnel/tunnels"
+	_ "github.com/psrth/mori/internal/tunnel/tunnels"
 )
 
 // TestAllTunnelsRegistered verifies that all built-in tunnel types are registered.

@@ -3,10 +3,10 @@ package mysql
 import (
 	"context"
 
-	"github.com/mori-dev/mori/internal/core/tlsutil"
-	"github.com/mori-dev/mori/internal/engine"
-	"github.com/mori-dev/mori/internal/engine/mysql/proxy"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core/tlsutil"
+	"github.com/psrth/mori/internal/engine"
+	"github.com/psrth/mori/internal/engine/mysql/proxy"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // mariadbEngine is a thin MariaDB adapter that reuses the MySQL engine

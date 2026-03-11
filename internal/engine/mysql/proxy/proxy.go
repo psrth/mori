@@ -8,12 +8,12 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/core/tlsutil"
-	"github.com/mori-dev/mori/internal/engine/mysql/schema"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/core/tlsutil"
+	"github.com/psrth/mori/internal/engine/mysql/schema"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // Proxy is a protocol-aware MySQL proxy that classifies queries and routes

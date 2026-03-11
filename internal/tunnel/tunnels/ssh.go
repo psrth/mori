@@ -6,9 +6,9 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
-	"github.com/mori-dev/mori/internal/tunnel"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
+	"github.com/psrth/mori/internal/tunnel"
 )
 
 func init() { tunnel.Register(&sshTunnel{}) }

@@ -3,14 +3,14 @@ package postgres
 import (
 	"context"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/tlsutil"
-	"github.com/mori-dev/mori/internal/engine"
-	"github.com/mori-dev/mori/internal/engine/postgres/classify"
-	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
-	"github.com/mori-dev/mori/internal/engine/postgres/proxy"
-	"github.com/mori-dev/mori/internal/engine/postgres/schema"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/tlsutil"
+	"github.com/psrth/mori/internal/engine"
+	"github.com/psrth/mori/internal/engine/postgres/classify"
+	"github.com/psrth/mori/internal/engine/postgres/connstr"
+	"github.com/psrth/mori/internal/engine/postgres/proxy"
+	"github.com/psrth/mori/internal/engine/postgres/schema"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // pgEngine is the PostgreSQL implementation of engine.Engine.

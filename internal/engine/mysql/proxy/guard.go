@@ -7,8 +7,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // ---------------------------------------------------------------------------

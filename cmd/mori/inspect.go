@@ -5,11 +5,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/engine/postgres/schema"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/engine/postgres/schema"
+	"github.com/psrth/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 

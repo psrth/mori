@@ -5,8 +5,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/core"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 // --- Parsing tests (pure, no I/O) ---

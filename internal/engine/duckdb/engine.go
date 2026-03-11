@@ -3,14 +3,14 @@ package duckdb
 import (
 	"context"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine"
-	"github.com/mori-dev/mori/internal/engine/duckdb/classify"
-	"github.com/mori-dev/mori/internal/engine/duckdb/connstr"
-	"github.com/mori-dev/mori/internal/engine/duckdb/proxy"
-	"github.com/mori-dev/mori/internal/engine/duckdb/schema"
-	"github.com/mori-dev/mori/internal/engine/duckdb/shadow"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine"
+	"github.com/psrth/mori/internal/engine/duckdb/classify"
+	"github.com/psrth/mori/internal/engine/duckdb/connstr"
+	"github.com/psrth/mori/internal/engine/duckdb/proxy"
+	"github.com/psrth/mori/internal/engine/duckdb/schema"
+	"github.com/psrth/mori/internal/engine/duckdb/shadow"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // duckdbEngine is the DuckDB implementation of engine.Engine.

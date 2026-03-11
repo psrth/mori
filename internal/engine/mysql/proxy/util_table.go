@@ -6,7 +6,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // utilTableName generates a deterministic temp table name from a SQL query hash.

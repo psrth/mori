@@ -569,7 +569,7 @@ func init() {
 3. **Add blank import** — In `cmd/mori/start.go`:
 
 ```go
-import _ "github.com/mori-dev/mori/internal/engine/<name>"
+import _ "github.com/psrth/mori/internal/engine/<name>"
 ```
 
 4. **Mark as supported** — In `internal/registry/engine.go`, set `Supported: true`.

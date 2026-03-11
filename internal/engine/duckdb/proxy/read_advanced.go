@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // executeWindowRead handles queries with window functions by materializing

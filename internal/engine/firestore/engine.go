@@ -3,14 +3,14 @@ package firestore
 import (
 	"context"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine"
-	"github.com/mori-dev/mori/internal/engine/firestore/classify"
-	"github.com/mori-dev/mori/internal/engine/firestore/connstr"
-	"github.com/mori-dev/mori/internal/engine/firestore/proxy"
-	"github.com/mori-dev/mori/internal/engine/firestore/schema"
-	"github.com/mori-dev/mori/internal/engine/firestore/shadow"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine"
+	"github.com/psrth/mori/internal/engine/firestore/classify"
+	"github.com/psrth/mori/internal/engine/firestore/connstr"
+	"github.com/psrth/mori/internal/engine/firestore/proxy"
+	"github.com/psrth/mori/internal/engine/firestore/schema"
+	"github.com/psrth/mori/internal/engine/firestore/shadow"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // firestoreEngine is the Firestore implementation of engine.Engine.

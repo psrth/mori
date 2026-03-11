@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // RenderQueryStream renders the query stream content (no box — box added by dashboard).

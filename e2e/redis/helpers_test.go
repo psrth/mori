@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mori-dev/mori/internal/engine/redis/proxy"
+	"github.com/psrth/mori/internal/engine/redis/proxy"
 )
 
 // connectProxy returns a TCP connection to the mori RESP proxy.

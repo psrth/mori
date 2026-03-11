@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // LogEntry is a single structured log record written as one JSON line.

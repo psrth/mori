@@ -3,7 +3,7 @@ package proxy
 import (
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 func TestValidateRouteDecision_AllowsReadToProd(t *testing.T) {

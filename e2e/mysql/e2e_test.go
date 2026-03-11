@@ -17,7 +17,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/psrth/mori/internal/core/config"
 )
 
 // Global test state -- set by TestMain, used by all tests.

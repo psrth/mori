@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // Provider defines how a hosting provider collects connection fields during

@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
+	"github.com/psrth/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 

@@ -3,7 +3,7 @@ package merge
 import (
 	"context"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // MergeEngine combines results from Prod and Shadow.

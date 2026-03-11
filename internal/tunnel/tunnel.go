@@ -6,8 +6,8 @@ import (
 	"context"
 	"os/exec"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // Tunnel defines the contract for a tunnel type implementation.

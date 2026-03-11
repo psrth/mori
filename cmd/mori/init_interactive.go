@@ -10,14 +10,14 @@ import (
 
 	"github.com/charmbracelet/huh"
 
-	"github.com/mori-dev/mori/internal/auth"
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
-	"github.com/mori-dev/mori/internal/tunnel"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/auth"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
+	"github.com/psrth/mori/internal/tunnel"
+	"github.com/psrth/mori/internal/ui"
 
 	// Register tunnel implementations via side-effect imports.
-	_ "github.com/mori-dev/mori/internal/tunnel/tunnels"
+	_ "github.com/psrth/mori/internal/tunnel/tunnels"
 )
 
 // nameRe validates connection names: lowercase alphanumeric + hyphens, 1-40 chars.

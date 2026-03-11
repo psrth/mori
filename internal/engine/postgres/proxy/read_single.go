@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // handleMergedRead implements the single-table merged read algorithm.

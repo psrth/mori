@@ -8,11 +8,11 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine/sqlite/connstr"
-	"github.com/mori-dev/mori/internal/ui"
-	"github.com/mori-dev/mori/internal/engine/sqlite/schema"
-	"github.com/mori-dev/mori/internal/engine/sqlite/shadow"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine/sqlite/connstr"
+	"github.com/psrth/mori/internal/ui"
+	"github.com/psrth/mori/internal/engine/sqlite/schema"
+	"github.com/psrth/mori/internal/engine/sqlite/shadow"
 )
 
 // InitOptions holds the options for initializing a SQLite Mori project.

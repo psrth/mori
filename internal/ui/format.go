@@ -7,7 +7,7 @@ import (
 	"strings"
 	"syscall"
 
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 // Pluralize returns singular when n == 1, plural otherwise.

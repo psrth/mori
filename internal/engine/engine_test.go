@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // mockEngine is a minimal Engine implementation for registry tests.

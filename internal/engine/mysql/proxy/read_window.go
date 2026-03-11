@@ -4,7 +4,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // handleWindowRead handles queries with window functions.

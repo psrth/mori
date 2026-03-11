@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // Tailer tracks a file position and reads new JSON log lines.

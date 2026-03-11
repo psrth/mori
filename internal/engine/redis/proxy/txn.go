@@ -7,9 +7,9 @@ import (
 	"net"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
-	"github.com/mori-dev/mori/internal/engine/redis/classify"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
+	"github.com/psrth/mori/internal/engine/redis/classify"
 )
 
 // redisTxnState tracks transaction state for MULTI/EXEC/DISCARD.

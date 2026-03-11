@@ -3,10 +3,10 @@ package main
 import (
 	"os"
 
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/ui"
 	"github.com/spf13/cobra"
 
-	_ "github.com/mori-dev/mori/internal/auth/providers"
+	_ "github.com/psrth/mori/internal/auth/providers"
 )
 
 // Version is set at build time via ldflags.

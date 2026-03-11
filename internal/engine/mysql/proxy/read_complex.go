@@ -8,7 +8,7 @@ import (
 
 	"vitess.io/vitess/go/vt/sqlparser"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // handleComplexRead handles CTE and derived table queries on dirty tables

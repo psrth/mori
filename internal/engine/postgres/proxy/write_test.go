@@ -6,9 +6,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
-	"github.com/mori-dev/mori/internal/engine/postgres/schema"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
+	"github.com/psrth/mori/internal/engine/postgres/schema"
 )
 
 // mockPGBackend simulates a PG backend that reads a query and writes a response.

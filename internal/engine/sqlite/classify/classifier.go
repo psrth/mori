@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine/sqlite/schema"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine/sqlite/schema"
 )
 
 // Compile-time interface check.

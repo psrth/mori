@@ -6,13 +6,13 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/mori-dev/mori/internal/core/config"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/engine/postgres/connstr"
-	"github.com/mori-dev/mori/internal/engine/postgres/schema"
-	"github.com/mori-dev/mori/internal/engine/postgres/shadow"
-	"github.com/mori-dev/mori/internal/registry"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/core/config"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/engine/postgres/connstr"
+	"github.com/psrth/mori/internal/engine/postgres/schema"
+	"github.com/psrth/mori/internal/engine/postgres/shadow"
+	"github.com/psrth/mori/internal/registry"
+	"github.com/psrth/mori/internal/ui"
 )
 
 // CRDBInit performs the Mori initialization sequence for CockroachDB.

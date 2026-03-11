@@ -8,10 +8,10 @@ import (
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/engine/postgres/schema"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/engine/postgres/schema"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // FKEnforcer handles foreign key validation at the proxy layer.

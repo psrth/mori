@@ -7,7 +7,7 @@ import (
 	"log"
 	"strings"
 
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 // DetectForeignKeys discovers FK constraints for all tables in the SQLite database

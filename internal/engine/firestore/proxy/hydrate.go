@@ -7,7 +7,7 @@ import (
 
 	firestore "cloud.google.com/go/firestore/apiv1"
 	"cloud.google.com/go/firestore/apiv1/firestorepb"
-	"github.com/mori-dev/mori/internal/core/delta"
+	"github.com/psrth/mori/internal/core/delta"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

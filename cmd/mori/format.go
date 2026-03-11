@@ -3,8 +3,8 @@ package main
 import (
 	"strings"
 
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/ui"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/ui"
 )
 
 func pluralize(n int, singular, plural string) string {

@@ -9,7 +9,7 @@ import (
 
 	"context"
 
-	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/psrth/mori/internal/core/config"
 )
 
 // Manager handles tunnel subprocess lifecycle.

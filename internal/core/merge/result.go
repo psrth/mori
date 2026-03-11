@@ -1,6 +1,6 @@
 package merge
 
-import "github.com/mori-dev/mori/internal/core"
+import "github.com/psrth/mori/internal/core"
 
 // Empty returns true if the result set has no rows.
 func Empty(rs *core.ResultSet) bool {

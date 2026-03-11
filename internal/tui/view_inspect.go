@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/ui"
 )
 
 // RenderInspectInline renders compact inspect content for the inline panel.

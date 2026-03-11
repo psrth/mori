@@ -8,11 +8,11 @@ import (
 	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine/mssql/connstr"
-	"github.com/mori-dev/mori/internal/ui"
-	"github.com/mori-dev/mori/internal/engine/mssql/schema"
-	"github.com/mori-dev/mori/internal/engine/mssql/shadow"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine/mssql/connstr"
+	"github.com/psrth/mori/internal/ui"
+	"github.com/psrth/mori/internal/engine/mssql/schema"
+	"github.com/psrth/mori/internal/engine/mssql/shadow"
 )
 
 // InitOptions holds the options for initializing an MSSQL Mori project.

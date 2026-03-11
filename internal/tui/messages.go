@@ -1,7 +1,7 @@
 package tui
 
 import (
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // StateRefreshedMsg is sent when the state poller has read all .mori/ files.

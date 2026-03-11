@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine/redis/connstr"
-	"github.com/mori-dev/mori/internal/ui"
-	"github.com/mori-dev/mori/internal/engine/redis/schema"
-	"github.com/mori-dev/mori/internal/engine/redis/shadow"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine/redis/connstr"
+	"github.com/psrth/mori/internal/ui"
+	"github.com/psrth/mori/internal/engine/redis/schema"
+	"github.com/psrth/mori/internal/engine/redis/shadow"
 )
 
 // InitOptions holds the options for initializing a Redis Mori project.

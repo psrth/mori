@@ -7,8 +7,8 @@ import (
 	"net"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
 )
 
 // ExtHandler processes extended query protocol batches for a single DuckDB connection.

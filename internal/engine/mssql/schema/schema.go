@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 // DumpResult holds the complete result of an MSSQL schema dump and analysis.

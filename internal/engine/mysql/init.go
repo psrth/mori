@@ -8,11 +8,11 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine/mysql/connstr"
-	"github.com/mori-dev/mori/internal/ui"
-	"github.com/mori-dev/mori/internal/engine/mysql/schema"
-	"github.com/mori-dev/mori/internal/engine/mysql/shadow"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine/mysql/connstr"
+	"github.com/psrth/mori/internal/ui"
+	"github.com/psrth/mori/internal/engine/mysql/schema"
+	"github.com/psrth/mori/internal/engine/mysql/shadow"
 )
 
 // InitOptions holds the options for initializing a MySQL Mori project.

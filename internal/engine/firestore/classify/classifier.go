@@ -3,8 +3,8 @@ package classify
 import (
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine/firestore/schema"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine/firestore/schema"
 )
 
 // Compile-time interface check.

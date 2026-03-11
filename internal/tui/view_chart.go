@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // Braille dot offsets for a 2×4 grid per character.

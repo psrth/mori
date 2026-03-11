@@ -3,14 +3,14 @@ package sqlite
 import (
 	"context"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine"
-	"github.com/mori-dev/mori/internal/engine/sqlite/classify"
-	"github.com/mori-dev/mori/internal/engine/sqlite/connstr"
-	"github.com/mori-dev/mori/internal/engine/sqlite/proxy"
-	"github.com/mori-dev/mori/internal/engine/sqlite/schema"
-	"github.com/mori-dev/mori/internal/engine/sqlite/shadow"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine"
+	"github.com/psrth/mori/internal/engine/sqlite/classify"
+	"github.com/psrth/mori/internal/engine/sqlite/connstr"
+	"github.com/psrth/mori/internal/engine/sqlite/proxy"
+	"github.com/psrth/mori/internal/engine/sqlite/schema"
+	"github.com/psrth/mori/internal/engine/sqlite/shadow"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // sqliteEngine is the SQLite implementation of engine.Engine.

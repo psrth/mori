@@ -6,8 +6,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
 )
 
 // handleBulkUpdate handles UPDATE statements where no PKs could be extracted

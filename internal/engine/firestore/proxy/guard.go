@@ -5,9 +5,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine/firestore/classify"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine/firestore/classify"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // validateRouteDecision checks that write/DDL operations are never routed to

@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core/tlsutil"
+	"github.com/psrth/mori/internal/core/tlsutil"
 )
 
 // PRELOGIN encryption negotiation values.

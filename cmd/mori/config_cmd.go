@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 

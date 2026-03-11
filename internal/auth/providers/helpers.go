@@ -5,7 +5,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core/config"
+	"github.com/psrth/mori/internal/core/config"
 )
 
 // connWithSSL returns a copy of conn with SSLMode enforced to "verify-full"

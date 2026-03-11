@@ -9,11 +9,11 @@ import (
 	"cloud.google.com/go/firestore"
 	"google.golang.org/api/option"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine/firestore/connstr"
-	"github.com/mori-dev/mori/internal/ui"
-	"github.com/mori-dev/mori/internal/engine/firestore/schema"
-	"github.com/mori-dev/mori/internal/engine/firestore/shadow"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine/firestore/connstr"
+	"github.com/psrth/mori/internal/ui"
+	"github.com/psrth/mori/internal/engine/firestore/schema"
+	"github.com/psrth/mori/internal/engine/firestore/shadow"
 )
 
 // InitOptions holds the options for initializing a Firestore Mori project.

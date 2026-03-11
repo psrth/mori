@@ -3,14 +3,14 @@ package mssql
 import (
 	"context"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/tlsutil"
-	"github.com/mori-dev/mori/internal/engine"
-	"github.com/mori-dev/mori/internal/engine/mssql/classify"
-	"github.com/mori-dev/mori/internal/engine/mssql/connstr"
-	"github.com/mori-dev/mori/internal/engine/mssql/proxy"
-	"github.com/mori-dev/mori/internal/engine/mssql/schema"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/tlsutil"
+	"github.com/psrth/mori/internal/engine"
+	"github.com/psrth/mori/internal/engine/mssql/classify"
+	"github.com/psrth/mori/internal/engine/mssql/connstr"
+	"github.com/psrth/mori/internal/engine/mssql/proxy"
+	"github.com/psrth/mori/internal/engine/mssql/schema"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // mssqlEngine is the MSSQL implementation of engine.Engine.

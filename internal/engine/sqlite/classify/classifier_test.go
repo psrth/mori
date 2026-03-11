@@ -3,8 +3,8 @@ package classify
 import (
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine/sqlite/schema"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine/sqlite/schema"
 )
 
 func TestClassify_Reads(t *testing.T) {

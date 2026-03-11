@@ -3,7 +3,7 @@ package tunnel
 import (
 	"sync"
 
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/registry"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
 
 	"vitess.io/vitess/go/vt/sqlparser"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 // handleSetOperation handles UNION/INTERSECT/EXCEPT queries.

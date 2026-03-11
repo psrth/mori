@@ -1,4 +1,4 @@
-module github.com/mori-dev/mori
+module github.com/psrth/mori
 
 go 1.25.7
 

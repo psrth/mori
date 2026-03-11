@@ -3,8 +3,8 @@ package classify
 import (
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine/duckdb/schema"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine/duckdb/schema"
 )
 
 func TestClassify_Select(t *testing.T) {

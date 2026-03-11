@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mori-dev/mori/internal/auth"
-	_ "github.com/mori-dev/mori/internal/auth/providers" // trigger init() registration
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/auth"
+	_ "github.com/psrth/mori/internal/auth/providers" // trigger init() registration
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
 )
 
 // allProviderIDs lists every ProviderID that must be registered.

@@ -8,8 +8,8 @@ import (
 
 	"vitess.io/vitess/go/vt/sqlparser"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/engine/mysql/schema"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/engine/mysql/schema"
 )
 
 // Compile-time interface check.

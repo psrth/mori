@@ -9,11 +9,11 @@ import (
 
 	"vitess.io/vitess/go/vt/sqlparser"
 
-	"github.com/mori-dev/mori/internal/core"
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
-	"github.com/mori-dev/mori/internal/engine/mysql/schema"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/engine/mysql/schema"
+	"github.com/psrth/mori/internal/logging"
 )
 
 // WriteHandler encapsulates write path logic for a single MySQL connection.

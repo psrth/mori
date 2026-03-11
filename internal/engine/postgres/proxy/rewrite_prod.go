@@ -5,7 +5,7 @@ import (
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 // rewriteSQLForProd rewrites a SELECT statement to be compatible with the Prod

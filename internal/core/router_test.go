@@ -3,8 +3,8 @@ package core
 import (
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 func TestNewRouterNotNil(t *testing.T) {

@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/core"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 type routeTarget int

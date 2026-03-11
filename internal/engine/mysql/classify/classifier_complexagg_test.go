@@ -3,7 +3,7 @@ package classify
 import (
 	"testing"
 
-	"github.com/mori-dev/mori/internal/engine/mysql/schema"
+	"github.com/psrth/mori/internal/engine/mysql/schema"
 )
 
 // TestClassify_HasComplexAgg verifies that GROUP_CONCAT, JSON_ARRAYAGG, and

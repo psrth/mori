@@ -3,8 +3,8 @@ package proxy
 import (
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core/delta"
-	"github.com/mori-dev/mori/internal/logging"
+	"github.com/psrth/mori/internal/core/delta"
+	"github.com/psrth/mori/internal/logging"
 )
 
 func TestTxnHandler_InTxn_Default(t *testing.T) {

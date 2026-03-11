@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/registry"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/registry"
 )
 
 func TestNewManagerNilForNoTunnel(t *testing.T) {

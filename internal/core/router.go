@@ -1,8 +1,8 @@
 package core
 
 import (
-	"github.com/mori-dev/mori/internal/core/delta"
-	coreSchema "github.com/mori-dev/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/core/delta"
+	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
 
 // Router decides execution strategy based on classification and delta state.

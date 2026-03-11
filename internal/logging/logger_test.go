@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mori-dev/mori/internal/core"
+	"github.com/psrth/mori/internal/core"
 )
 
 func TestNew_CreatesDirectoryAndFile(t *testing.T) {

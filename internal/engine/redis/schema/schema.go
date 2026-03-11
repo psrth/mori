@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mori-dev/mori/internal/engine/redis/connstr"
+	"github.com/psrth/mori/internal/engine/redis/connstr"
 )
 
 // dialRedis connects to a Redis instance, using TLS if info.SSL is true.

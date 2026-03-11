@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/logging"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/logging"
+	"github.com/psrth/mori/internal/ui"
 	"github.com/spf13/cobra"
 )
 

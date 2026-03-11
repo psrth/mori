@@ -8,11 +8,11 @@ import (
 
 	_ "github.com/marcboeker/go-duckdb"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine/duckdb/connstr"
-	"github.com/mori-dev/mori/internal/engine/duckdb/schema"
-	"github.com/mori-dev/mori/internal/engine/duckdb/shadow"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine/duckdb/connstr"
+	"github.com/psrth/mori/internal/engine/duckdb/schema"
+	"github.com/psrth/mori/internal/engine/duckdb/shadow"
+	"github.com/psrth/mori/internal/ui"
 )
 
 // InitOptions holds the options for initializing a DuckDB Mori project.

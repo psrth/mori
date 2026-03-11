@@ -4,14 +4,14 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mori-dev/mori/internal/core/config"
-	"github.com/mori-dev/mori/internal/engine"
-	"github.com/mori-dev/mori/internal/registry"
-	"github.com/mori-dev/mori/internal/ui"
+	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine"
+	"github.com/psrth/mori/internal/registry"
+	"github.com/psrth/mori/internal/ui"
 	"github.com/spf13/cobra"
 
 	// Register engine implementations via side-effect imports.
-	_ "github.com/mori-dev/mori/internal/engine/postgres"
+	_ "github.com/psrth/mori/internal/engine/postgres"
 )
 
 var initCmd = &cobra.Command{
