@@ -1,0 +1,53 @@
+---
+title: "MySQL"
+description: "MySQL engine — MySQL wire protocol, Vitess AST classification, full proxy pipeline."
+sidebarTitle: "MySQL"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `mysql` |
+| Wire Protocol | MySQL wire protocol (COM_* commands) |
+| Classifier | AST-based (`vitess/sqlparser`) with regex fallback |
+| Shadow | Docker `mysql:<version>` (version-matched) |
+| Extended Protocol | COM_STMT_PREPARE/EXECUTE/CLOSE |
+
+MySQL uses the Vitess SQL parser for AST-based classification with a regex fallback for edge cases. All 12 routing strategies are implemented. The full merged read pipeline, write hydration, DDL tracking with FK stripping, transaction management with savepoints, and three-layer write guard are fully functional.
+
+**Connection Parameters:**
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `host` | Database host | — |
+| `port` | Database port | `3306` |
+| `user` | Username | — |
+| `password` | Password | — |
+| `database` | Database name | — |
+| `ssl_mode` | SSL mode | `verify-full` |
+
+```bash
+mori init --from "mysql://user:pass@host:3306/mydb"
+```
+
+## Differences from PostgreSQL
+
+- **No RETURNING clause** — MySQL does not support `RETURNING` on INSERT/UPDATE/DELETE. PK extraction uses a 3-tier strategy: (1) `LAST_INSERT_ID` from OK packet for auto-increment tables, (2) Vitess AST parsing of INSERT VALUES clause for literal PKs, (3) fallback to aggregate insert count tracking.
+- **`INSERT ... ON DUPLICATE KEY UPDATE`** — MySQL's upsert syntax (equivalent to PostgreSQL's `ON CONFLICT`). Classified as `HasOnConflict` and routed through the hydration path.
+- **`REPLACE INTO`** — MySQL-specific delete-then-insert semantics. Handled with upsert-like hydration: extracts PKs, hydrates matching prod rows, executes REPLACE, tombstones replaced prod-only rows.
+- **`CHANGE COLUMN`** — MySQL's combined rename + type change DDL. Tracked correctly in the schema registry.
+- **Auto-increment offsets** — Uses `ALTER TABLE ... AUTO_INCREMENT = N` instead of PostgreSQL's `setval()` for sequence offsets.
+- **No `ctid` equivalent** — PK-less tables use full-row deduplication. A warning is emitted during init for tables without primary keys.
+- **No cursor support** — MySQL cursors only work inside stored procedures, not as standalone SQL statements.
+- **No LISTEN/UNLISTEN** — MySQL has no equivalent to PostgreSQL's pub/sub system.
+- **Transaction isolation** — Sends `START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY` to prod for snapshot consistency.
+
+## Known Limitations
+
+- `only_full_group_by` mode conflicts with aggregate re-aggregation. Workaround: `SET sql_mode = ''`.
+- Multi-column ORDER BY not re-applied after merge (single-column sort only).
+
+<Info>
+**Unsupported operations:** CALL, EXPLAIN ANALYZE.
+</Info>

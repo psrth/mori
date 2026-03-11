@@ -1,0 +1,58 @@
+---
+title: "Firestore"
+description: "Firestore engine — gRPC protocol, document-level delta tracking, emulator shadow."
+sidebarTitle: "Firestore"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `firestore` |
+| Wire Protocol | gRPC |
+| Classifier | gRPC method-name based (18 methods classified) |
+| Shadow | Firestore emulator (`gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators`) |
+| Shadow Seeding | Documents copied from prod (including subcollections up to depth 3) |
+
+Firestore uses gRPC with a method-name classifier. Delta tracking works at the document path level — collections serve as "tables" and full document paths serve as "primary keys". The shadow is a Firestore emulator seeded with production data.
+
+Applications connect using the standard Firestore SDK by setting `FIRESTORE_EMULATOR_HOST=127.0.0.1:<mori-port>`.
+
+**Connection Parameters:**
+
+| Field | Description | Required |
+|-------|-------------|----------|
+| `project_id` | GCP project ID | Yes |
+| `credentials_file` | Path to service account JSON | No (uses ADC if omitted) |
+| `database_id` | Database ID for named databases | No (defaults to `(default)`) |
+
+```bash
+mori init --from "firestore://my-project?credentials=./sa.json"
+mori init --from "firestore://my-project?database=my-db&credentials=./sa.json"
+```
+
+## Differences from PostgreSQL
+
+Firestore is a document database — fundamentally different from SQL. The copy-on-write model is adapted:
+
+- **Document-level delta tracking** — Uses `(collection, fullRelativePath)` pairs. Full document paths prevent subcollection key collisions in collection group queries.
+- **Shadow seeded with data** — Unlike SQL engines (schema-only shadow), the Firestore shadow is seeded with production documents including subcollections up to depth 3.
+- **Merged reads by document path** — GetDocument checks tombstone/delta per-document. RunQuery queries both backends, merges with shadow-wins semantics, re-evaluates WHERE filters, re-sorts, and applies LIMIT. ListDocuments over-fetches from prod and merges. BatchGetDocuments routes per-document.
+- **Aggregation** — RunAggregationQuery decomposes to a base RunQuery through the merged pipeline, then re-computes COUNT/SUM/AVG in memory.
+- **Transaction snapshot isolation** — BeginTransaction captures a `ReadTime` timestamp. All subsequent prod-side reads within the transaction use this timestamp for consistent point-in-time snapshots.
+- **Hydration via GetDocument/UpdateDocument** — Fetches the full document from prod and writes to shadow. Falls back to Commit for documents that don't yet exist in shadow.
+- **Document Transforms** — `serverTimestamp`, `increment`, `arrayUnion`, `arrayRemove` transforms are tracked as deltas.
+- **Precondition evaluation** — Checks `exists` and `update_time` preconditions against the correct backend (tombstone, delta, or prod).
+- **Listen (real-time)** — Forwarded to prod only. Real-time listeners do not see shadow mutations.
+- **No schema/DDL** — Firestore is schemaless. No DDL tracking, no FK enforcement, no sequence offsets.
+- **Collection group queries** — Fully supported with full document path keys preventing cross-subcollection key collisions.
+
+## Known Limitations
+
+- `PartitionQuery` returns prod-only cursor boundaries (not a correctness issue — cursors are metadata, not documents).
+- `Listen` (real-time listeners) only reflects prod state, not shadow mutations.
+- Firestore SDK-specific features (offline persistence, local cache) are not intercepted by the proxy.
+
+<Info>
+If `GOOGLE_APPLICATION_CREDENTIALS` is set, you can omit the credentials file in the connection string.
+</Info>

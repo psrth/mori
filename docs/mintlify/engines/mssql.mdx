@@ -1,0 +1,64 @@
+---
+title: "MS SQL Server"
+description: "MSSQL engine — TDS protocol, regex classification, T-SQL support."
+sidebarTitle: "MSSQL"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `mssql` |
+| Wire Protocol | TDS (Tabular Data Stream) |
+| Classifier | Regex-based (no Go-native T-SQL parser exists) |
+| Shadow | Docker `mcr.microsoft.com/mssql/server:2022-latest` |
+| Container Timeout | 300 seconds (ARM emulation is slow) |
+
+MSSQL speaks the TDS protocol. The proxy handles PRELOGIN/LOGIN7 handshake, SQL_BATCH messages, RPC requests (sp_executesql, sp_prepare, sp_execute, sp_unprepare, sp_cursoropen/fetch/close), TransMgrRequest messages for transactions, and attention signals. All strings use UTF-16LE encoding.
+
+**Connection Parameters:**
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `host` | Database host | — |
+| `port` | Database port | `1433` |
+| `user` | Username | — |
+| `password` | Password | — |
+| `database` | Database name | — |
+| `encrypt` | Encryption setting | — |
+| `trust_server_cert` | Trust server certificate | — |
+
+```bash
+mori init --from "sqlserver://sa:password@host:1433?database=mydb&encrypt=false&trustservercertificate=true"
+```
+
+## Differences from PostgreSQL
+
+- **Regex-based classification** — No Go-native T-SQL parser exists. The classifier handles all common T-SQL patterns including bracket-quoted identifiers, `TOP N`, `OFFSET/FETCH`, `MERGE INTO`, `sp_executesql`, and DBCC commands.
+- **MERGE INTO** — MSSQL's upsert syntax (equivalent to `INSERT ... ON CONFLICT`). Classified as `HasOnConflict` and routed through the hydration path.
+- **IDENTITY columns** — Uses `IDENTITY` instead of sequences. Offsets applied via `DBCC CHECKIDENT`. Hydration wraps inserts with `SET IDENTITY_INSERT ON/OFF`.
+- **`sp_executesql` / `sp_prepare`** — TDS RPC model for parameterized queries. `sp_prepare` is forwarded to prod (to obtain a handle), `sp_execute` is classified and routed per-statement with full parameter extraction.
+- **Cursor materialization** — Dirty tables are materialized into shadow temp tables before cursor open. The cursor SQL is rewritten (UTF-16LE) to reference temp tables.
+- **JOIN via materialization** — JOINs on dirty tables use full materialization rather than per-row patching. Functionally correct but materializes entire dirty tables.
+- **Aggregate re-aggregation** — COUNT-only in-memory re-aggregation. SUM/AVG/MIN/MAX use temp table materialization path.
+- **Cross-table UPDATE...FROM** — Detects FROM clause in UPDATE statements and hydrates all referenced tables.
+- **No RELEASE SAVEPOINT** — T-SQL has no `RELEASE SAVEPOINT`. Savepoints are created with `SAVE TRAN` and rolled back with `ROLLBACK TRAN <name>`.
+- **No `ctid` equivalent** — PK-less tables use full-row hash-based deduplication.
+- **Bracket quoting** — Uses `[identifier]` instead of `"identifier"`.
+- **TDS-wrapped TLS not implemented** — Set `encrypt=false` in the connection string. For encrypted connections, use a TLS-terminating tunnel/sidecar.
+- **MARS disabled** — Multiple Active Result Sets are stripped from PRELOGIN.
+
+<Tip>
+For .NET applications: use `CommandType.Text` with inline parameters instead of `CommandType.StoredProcedure` for queries routed through Mori.
+</Tip>
+
+## Known Limitations
+
+- TDS-wrapped TLS not implemented — `encrypt=false` required.
+- MARS disabled — applications must not rely on Multiple Active Result Sets.
+- Aggregate re-aggregation limited to COUNT (SUM/AVG/MIN/MAX use materialization).
+- JOIN patching uses materialization (no per-row patching).
+
+<Info>
+**Unsupported operations:** BULK INSERT, EXEC/EXECUTE (stored procedures).
+</Info>

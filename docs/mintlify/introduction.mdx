@@ -6,7 +6,7 @@ sidebarTitle: "Introduction"
 
 Mori is a transparent proxy that sits between your application and a production database. Your application connects to Mori using a standard database driver -- same wire protocol, no code changes beyond swapping a connection string.
 
-**Reads** are served from the real production database. **Writes** are captured in a local database instance (the **Shadow**) that starts as a schema-only clone of production.
+**Reads** are served from the real production database. **Writes** are captured in a local database instance (the **Shadow**) that starts as a clone of production (schema-only for SQL engines, full file copy for embedded engines, seeded with data for Firestore).
 
 The result: developers and AI agents test against real production data, mutate freely, and never risk the production database. Break something, reset, start over.
 
@@ -51,7 +51,7 @@ These hold at all times, without exception.
 </Note>
 
 <Note>
-**Shadow is the mutation layer.** All writes go to the Shadow database -- a local instance (same engine as prod) holding all local mutations. It starts schema-only with zero rows.
+**Shadow is the mutation layer.** All writes go to the Shadow database -- a local instance (same engine as prod) holding all local mutations. SQL engines start schema-only with zero rows; embedded engines (SQLite/DuckDB) start as a full file copy; Firestore starts seeded with production data.
 </Note>
 
 <Note>

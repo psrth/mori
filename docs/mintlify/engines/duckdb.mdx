@@ -1,0 +1,57 @@
+---
+title: "DuckDB"
+description: "DuckDB engine — embedded analytical database exposed over pgwire, full file copy shadow."
+sidebarTitle: "DuckDB"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `duckdb` |
+| Wire Protocol | pgwire (exposed by Mori) |
+| Classifier | Regex-based |
+| Shadow | Local file copy (full data, not schema-only) |
+| Docker Required | No |
+
+DuckDB is an embedded analytical database. Same architecture as SQLite — Mori opens both prod and shadow DuckDB files directly and exposes them through a pgwire listener. Applications connect with any PostgreSQL driver.
+
+<Warning>
+The shadow is a **full copy** of the production database file, including all data. For large analytical databases, be aware of disk space implications.
+</Warning>
+
+**Connection Parameters:**
+
+| Field | Description |
+|-------|------------|
+| `file_path` | Path to the DuckDB file |
+
+Supported connection string formats:
+```bash
+mori init --from "/path/to/analytics.duckdb"
+mori init --from "duckdb:///path/to/analytics.duckdb"
+```
+
+## Differences from PostgreSQL
+
+- **Full file copy shadow** — Complete copy of the production database including all data. The prod file is opened with `access_mode=READ_ONLY`, providing database-level write protection.
+- **Regex-based classification** — Handles DuckDB-specific constructs: `INSERT OR REPLACE`, `INSERT OR IGNORE`, `CREATE OR REPLACE TABLE`, `DESCRIBE`, `PRAGMA`, `INSTALL`, `LOAD`, `QUALIFY`.
+- **`rowid` for PK-less tables** — Uses DuckDB's implicit `rowid` column for deduplication.
+- **JOIN via materialization** — Dirty tables are materialized into temp tables on shadow, the JOIN SQL is rewritten to reference them, and DuckDB handles the JOIN natively.
+- **Aggregate via materialization** — All aggregates (COUNT, SUM, AVG, MIN, MAX, GROUP BY, list(), array_agg, etc.) use materialization — base data is merged into a temp table, then DuckDB handles aggregation natively. This plays to DuckDB's strengths as an analytical engine.
+- **WHERE clause evaluator** — Regex-based with DuckDB fallback: constructs `SELECT 1 WHERE <condition>` on shadow for complex expressions.
+- **DuckDB type mapping** — Maps DuckDB types to PostgreSQL OIDs for pgwire compatibility. Nested types (LIST, STRUCT, MAP, UNION) map to JSON OID. Unsigned integers map to the next larger signed PostgreSQL type.
+- **`INSERT OR REPLACE` for hydration** — DuckDB-specific upsert semantics for hydrating prod rows into shadow.
+- **No Docker required** — Shadow is a local file copy.
+- **No cursor support** — Cursors are not classified or handled.
+- **No LISTEN/UNLISTEN** — Not applicable to DuckDB.
+
+## Known Limitations
+
+- No cursor operations.
+- DuckDB-specific SQL syntax not parseable by `pg_query_go` — but DuckDB uses its own regex classifier, so this is handled.
+- `LIST()` / `ARRAY_AGG()` results serialize as JSON through pgwire (nested types).
+
+<Info>
+**Unsupported operations:** COPY/EXPORT/IMPORT, EXPLAIN ANALYZE.
+</Info>

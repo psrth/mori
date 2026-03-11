@@ -1,0 +1,58 @@
+---
+title: "Redis"
+description: "Redis engine — RESP protocol, command-based classification, key-level delta tracking."
+sidebarTitle: "Redis"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `redis` |
+| Wire Protocol | RESP (Redis Serialization Protocol) |
+| Classifier | Command-based (static lookup table, ~155 commands) |
+| Shadow | Docker `redis:<version>` (version-matched) |
+| Auth | Password + Redis 6+ ACL (username + password) |
+
+Redis uses the RESP protocol with a command-based classifier. Delta tracking works at the key level — key prefixes (the portion before the first `:`) serve as "tables" and full key names serve as "primary keys". All Redis data types are supported: strings, hashes, lists, sets, sorted sets, streams, HyperLogLog, bitmaps, and geo.
+
+**Connection Parameters:**
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `host` | Redis host | — |
+| `port` | Redis port | `6379` |
+| `username` | Username (Redis 6+ ACL) | — |
+| `password` | Password | — |
+| `db_number` | Database number | `0` |
+| `ssl` | Enable SSL/TLS | `false` |
+
+```bash
+mori init --from "redis://:password@host:6379/0"
+mori init --from "redis://myuser:mypass@host:6379/0"  # ACL auth
+```
+
+## Differences from PostgreSQL
+
+Redis is fundamentally different from SQL databases. The copy-on-write model is adapted as follows:
+
+- **Key-level delta tracking** — Instead of `(table, pk)` pairs, Redis tracks `(prefix, key)` pairs. Reads check per-key: delta keys route to shadow, tombstoned keys return nil/empty, clean keys route to prod.
+- **Hydration via DUMP/RESTORE** — Instead of SELECT/INSERT, Redis hydrates by serializing the key from prod (`DUMP`) and deserializing to shadow (`RESTORE`), preserving data type, TTL, and internal encoding.
+- **MULTI/EXEC transactions** — Redis transactions queue commands and execute atomically. Mori buffers queued commands, hydrates write keys at EXEC time, forwards to shadow within MULTI, and tracks deltas. WATCH invalidation triggers rollback of staged deltas.
+- **SCAN merging** — Two-phase cursor merging: Phase 0 scans prod (filtering tombstoned and delta keys), Phase 1 scans shadow for delta/new keys. Cursor uses bit 63 as a phase flag.
+- **Multi-key reads** — `MGET` routes per-key (batched to shadow/prod). `EXISTS` counts per-key across backends. `SDIFF/SINTER/SUNION` hydrate all source keys to shadow and execute there.
+- **Pub/Sub fan-in** — SUBSCRIBE/PSUBSCRIBE is forwarded to both prod and shadow. Messages from either backend are multiplexed to the client. PUBLISH is blocked (matching PostgreSQL's treatment of NOTIFY).
+- **Lua scripting** — EVAL/EVALSHA hydrate declared keys, execute on shadow, and track all declared keys. EVALRO/EVALSHA_RO also route through merged read with hydration for correctness.
+- **FLUSHDB/FLUSHALL** — Marks the database as fully shadowed. All subsequent reads go to shadow only.
+- **RESP3 normalization** — If upstream Redis responds with RESP3 types, the proxy normalizes them to RESP2. HELLO command is intercepted to force RESP2.
+- **Tombstone responses** — Returns type-appropriate nil/empty for tombstoned keys (null bulk string for GET, empty array for HGETALL, integer 0 for LLEN, -2 for TTL, "none" for TYPE).
+
+## Known Limitations
+
+- Blocking commands (BLPOP, BRPOP, etc.) only see shadow state — pushes from non-Mori clients to prod are not visible.
+- PUBLISH is blocked (returns error — would affect production subscribers).
+- No savepoint support (Redis MULTI/EXEC is atomic, no partial rollback).
+
+<Info>
+**Blocked operations:** PUBLISH (returns error — would affect production subscribers).
+</Info>

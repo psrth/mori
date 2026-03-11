@@ -1,0 +1,41 @@
+---
+title: "CockroachDB"
+description: "CockroachDB engine — pgwire v3, thin adapter over PostgreSQL with CRDB-specific init."
+sidebarTitle: "CockroachDB"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `cockroachdb` |
+| Wire Protocol | pgwire v3 (shared with PostgreSQL) |
+| Classifier | AST-based (`pg_query_go` — shared with PostgreSQL) |
+| Shadow | Docker PostgreSQL container (schema-compatible) |
+| Default Port | `26257` |
+
+CockroachDB is a thin adapter wrapping the PostgreSQL engine. All proxy logic — classification, routing, merging, write handling, transactions, FK enforcement, extended protocol — is shared. The adapter overrides four methods: `ID()`, `ParseConnStr()` (default port 26257), `Init()` (CRDB-specific schema export), and `NewProxy()` (SERIALIZABLE isolation + `rowid` dedup).
+
+**Connection Parameters:** Same as PostgreSQL (default port: `26257`).
+
+```bash
+mori init --from "postgres://user:pass@crdb-host:26257/mydb?sslmode=require"
+```
+
+## Differences from PostgreSQL
+
+- **Shadow uses PostgreSQL, not CockroachDB** — The shadow database is a PostgreSQL container, not CockroachDB. CockroachDB-specific DDL syntax (FAMILY, INTERLEAVE, CONFIGURE ZONE, etc.) is cleaned and converted to PostgreSQL-compatible DDL during init.
+- **Schema export via `SHOW CREATE ALL TABLES`** — Uses CockroachDB's native schema export instead of `pg_dump` (which is incompatible with CockroachDB).
+- **SERIALIZABLE isolation** — CockroachDB only supports SERIALIZABLE. The proxy sends `BEGIN ISOLATION LEVEL SERIALIZABLE` explicitly instead of REPEATABLE READ.
+- **`rowid` for PK-less tables** — CockroachDB does not have PostgreSQL's `ctid` system column. Uses CockroachDB's implicit `rowid` column for deduplication instead.
+- **`unique_rowid()` for SERIAL columns** — CockroachDB's SERIAL uses `unique_rowid()` (timestamp + node ID) instead of PostgreSQL sequences. The init pipeline recognizes this and classifies PK types accordingly.
+- **No extensions** — CockroachDB has no extension system. Extension detection is skipped during init.
+
+## Known Limitations
+
+- CockroachDB-specific SQL syntax (`SHOW RANGES`, `ALTER TABLE ... CONFIGURE ZONE`, etc.) is not parseable by `pg_query_go` and will fail if sent through the proxy.
+- Under contention, CockroachDB may return serialization retry errors (SQLSTATE 40001) that would not occur with PostgreSQL.
+
+<Info>
+**Unsupported operations:** Same as PostgreSQL — NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE.
+</Info>

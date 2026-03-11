@@ -11,15 +11,15 @@ Providers handle authentication and connection configuration for managed databas
 | Provider | Compatible Engines | SSL Default | Auth Method |
 |----------|-------------------|-------------|-------------|
 | Direct / Self-Hosted | All 9 engines | Engine default | Password |
-| GCP Cloud SQL | PostgreSQL, MySQL, MSSQL | `require` | Password or `gcloud` IAM token |
-| AWS RDS / Aurora | PostgreSQL, MySQL, MariaDB, MSSQL | `require` | Password or AWS IAM token |
-| Neon | PostgreSQL | `require` | Password |
-| Supabase | PostgreSQL | `require` | Password |
-| Azure Database | PostgreSQL, MySQL, MariaDB, MSSQL | `require` | Password or Azure CLI token |
-| PlanetScale | MySQL | `require` (TLS always) | Password |
-| Vercel Postgres | PostgreSQL | `require` | Password |
-| DigitalOcean | PostgreSQL, MySQL, Redis | `require` | Password |
-| Railway | PostgreSQL, MySQL, Redis | `require` | Password |
+| GCP Cloud SQL | PostgreSQL, MySQL, MSSQL | `verify-full` | Password or `gcloud` IAM token |
+| AWS RDS / Aurora | PostgreSQL, MySQL, MariaDB, MSSQL | `verify-full` | Password or AWS IAM token |
+| Neon | PostgreSQL | `verify-full` | Password |
+| Supabase | PostgreSQL | `verify-full` | Password |
+| Azure Database | PostgreSQL, MySQL, MariaDB, MSSQL | `verify-full` | Password or Azure CLI token |
+| PlanetScale | PostgreSQL, MySQL | `verify-full` (TLS always) | Password |
+| Vercel Postgres | PostgreSQL | `verify-full` | Password |
+| DigitalOcean | PostgreSQL, MySQL, Redis | `verify-full` | Password |
+| Railway | PostgreSQL, MySQL, Redis | `verify-full` | Password |
 | Upstash | Redis | TLS (`rediss://`) | Password |
 | Cloudflare D1 / KV | SQLite, Redis | N/A (HTTPS API) | API token |
 | Firebase | Firestore | N/A (gRPC with TLS) | Service account or ADC |
@@ -42,7 +42,7 @@ Providers handle authentication and connection configuration for managed databas
   <Accordion title="GCP Cloud SQL">
     **Provider ID:** `gcp-cloud-sql`
 
-    **With password:** Provide host, user, and password as normal. SSL enforced to `verify-full`.
+    **With password:** Provide host, user, and password as normal. SSL defaults to `verify-full`.
 
     **With IAM auth:** Omit the password. Mori obtains a token via `gcloud sql generate-login-token`. Requires Google Cloud SDK installed and authenticated (`gcloud auth login`).
 
@@ -108,7 +108,7 @@ Providers handle authentication and connection configuration for managed databas
   <Accordion title="PlanetScale">
     **Provider ID:** `planetscale`
 
-    Serverless MySQL. TLS always enabled — the provider hardcodes `tls=true` in the DSN.
+    Serverless MySQL and PostgreSQL. TLS always enabled — the provider hardcodes TLS in the DSN.
 
     ```bash
     mori init --from "mysql://user:pass@aws.connect.psdb.cloud:3306/mydb"

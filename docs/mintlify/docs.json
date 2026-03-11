@@ -10,7 +10,7 @@
   },
   "background": {
     "color": {
-      "dark": "#13120A"
+      "dark": "#0D0C07"
     }
   },
   "favicon": "/favicon.svg",
@@ -47,9 +47,23 @@
             ]
           },
           {
-            "group": "Configuration",
+            "group": "Database Engines",
             "pages": [
               "configuration/engines",
+              "engines/postgres",
+              "engines/cockroachdb",
+              "engines/mysql",
+              "engines/mariadb",
+              "engines/mssql",
+              "engines/sqlite",
+              "engines/duckdb",
+              "engines/redis",
+              "engines/firestore"
+            ]
+          },
+          {
+            "group": "Providers",
+            "pages": [
               "configuration/providers"
             ]
           },
@@ -67,8 +81,7 @@
             "pages": [
               "resources/motivation",
               "resources/name",
-              "resources/roadmap",
-              "resources/test-suite"
+              "resources/roadmap"
             ]
           },
           {

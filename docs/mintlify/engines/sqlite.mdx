@@ -1,0 +1,59 @@
+---
+title: "SQLite"
+description: "SQLite engine — embedded database exposed over pgwire, full file copy shadow."
+sidebarTitle: "SQLite"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `sqlite` |
+| Wire Protocol | pgwire (exposed by Mori) |
+| Classifier | Regex-based |
+| Shadow | Local file copy (full data, not schema-only) |
+| Docker Required | No |
+
+SQLite is an embedded database. Mori opens both the prod and shadow SQLite files directly and exposes them through a pgwire listener. Applications connect with any PostgreSQL driver — same wire protocol, no code changes.
+
+<Warning>
+The shadow is a **full copy** of the production database file, including all data. Shadow size equals prod size.
+</Warning>
+
+**Connection Parameters:**
+
+| Field | Description |
+|-------|------------|
+| `file_path` | Path to the SQLite database file |
+
+Supported connection string formats:
+```bash
+mori init --from "/path/to/prod.db"
+mori init --from "file:/path/to/db?mode=ro"
+mori init --from "sqlite:///path/to/db"
+```
+
+## Differences from PostgreSQL
+
+- **Full file copy shadow** — Unlike PostgreSQL (schema-only Docker container), the SQLite shadow is a complete copy of the production database. This means hydration is less critical for rows that existed at init time.
+- **Regex-based classification** — No Go-native SQLite parser exists. Handles SQLite-specific constructs: `REPLACE INTO`, `INSERT OR REPLACE/IGNORE/ABORT`, `PRAGMA`, `VACUUM`, `REINDEX`, `ATTACH/DETACH`.
+- **`rowid` for PK-less tables** — Uses SQLite's implicit `rowid` column for deduplication (more stable than PostgreSQL's `ctid`).
+- **pgwire clients only** — Applications must use a PostgreSQL driver to connect. The actual database is SQLite, but the wire protocol is pgwire.
+- **No Docker required** — Shadow is a local file, no container management needed.
+- **`PRAGMA query_only=ON`** — Additional database-level write protection on the prod connection.
+- **`PRAGMA foreign_keys=OFF`** on shadow — Instead of stripping FK constraints from DDL, SQLite disables FK enforcement on the shadow connection. FK metadata is detected via `PRAGMA foreign_key_list` after DDL execution.
+- **DELETE without WHERE** — Classified as TRUNCATE (SQLite has no native TRUNCATE command).
+- **JOIN via materialization** — Uses materialization-based approach rather than per-row patching.
+- **Aggregate handling** — Efficient path for bare COUNT; all other aggregates use materialization.
+- **No cursor support** — SQLite does not support SQL cursors.
+- **No LISTEN/UNLISTEN** — Not applicable to SQLite.
+
+## Known Limitations
+
+- No cursor operations (DECLARE/FETCH/CLOSE).
+- No ALTER TYPE tracking (SQLite doesn't support `ALTER TABLE ... ALTER COLUMN`).
+- Multi-column ORDER BY not re-applied after merge.
+
+<Info>
+**Unsupported operations:** EXPLAIN ANALYZE.
+</Info>

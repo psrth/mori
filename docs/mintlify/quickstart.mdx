@@ -6,13 +6,13 @@ sidebarTitle: "Quick Start"
 
 ## For AI Agents
 
-If you're setting up Mori with an AI coding agent, download the [`agents.md`](https://github.com/psrth/mori/blob/main/agents.md) file and add it to your project root. Point your agent at it -- it contains everything needed to build, initialize, and start Mori.
+If you're setting up Mori with an AI coding agent, download the [`skill.md`](https://moridb.sh/skill.md) file and add it to your project root. Point your agent at it -- it contains everything needed to install, initialize, and start Mori.
 
 ```bash
-curl -o agents.md https://raw.githubusercontent.com/psrth/mori/main/agents.md
+curl -o skill.md https://raw.githubusercontent.com/psrth/mori/main/skill.md
 ```
 
-Your agent can read `agents.md` and handle the rest autonomously.
+Your agent can read `skill.md` and handle the rest autonomously.
 
 ---
 
@@ -20,23 +20,31 @@ Your agent can read `agents.md` and handle the rest autonomously.
 
 ### Prerequisites
 
-- **Go 1.21+** (for building from source)
 - **Docker** (for shadow containers -- required for all engines except SQLite and DuckDB)
+
+### Install
+
+<CodeGroup>
+```bash curl (recommended)
+curl -fsSL https://raw.githubusercontent.com/psrth/mori/main/install.sh | sh
+```
+```bash go install
+go install github.com/psrth/mori/cmd/mori@latest
+```
+```bash build from source
+git clone https://github.com/psrth/mori.git
+cd mori
+go build -o mori ./cmd/mori
+```
+</CodeGroup>
 
 ### Steps
 
 <Steps>
-  <Step title="Build from source">
-    ```bash
-    git clone https://github.com/psrth/mori.git
-    cd mori
-    go build -o mori ./cmd/mori
-    ```
-  </Step>
   <Step title="Initialize a connection">
     Point Mori at your production database. The interactive setup walks you through engine, provider, and credentials.
     ```bash
-    ./mori init
+    mori init
     ```
 
     <Tip>
@@ -44,48 +52,73 @@ Your agent can read `agents.md` and handle the rest autonomously.
 
     <CodeGroup>
     ```bash PostgreSQL
-    ./mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
+    mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
     ```
     ```bash MySQL
-    ./mori init --from "mysql://user:pass@host:3306/mydb"
+    mori init --from "mysql://user:pass@host:3306/mydb"
     ```
     ```bash Redis
-    ./mori init --from "redis://:password@host:6379/0"
+    mori init --from "redis://:password@host:6379/0"
     ```
     ```bash SQLite
-    ./mori init --from "/path/to/database.db"
+    mori init --from "/path/to/database.db"
+    ```
+    ```bash DuckDB
+    mori init --from "/path/to/analytics.duckdb"
+    ```
+    ```bash Firestore
+    mori init --from "firestore://my-project?credentials=./sa.json"
+    ```
+    ```bash MSSQL
+    mori init --from "sqlserver://sa:password@host:1433?database=mydb"
+    ```
+    ```bash CockroachDB
+    mori init --from "postgres://user:pass@host:26257/mydb?sslmode=require"
     ```
     </CodeGroup>
     </Tip>
 
     On init, Mori:
     1. Connects to your production database
-    2. Dumps the schema (tables, types, sequences)
-    3. Spins up a shadow database (Docker container or local file)
-    4. Replays the schema on shadow
-    5. Offsets sequences to prevent PK collisions
+    2. Discovers schema and structure (SQL engines dump tables/types/sequences; Firestore discovers collections; Redis scans key prefixes)
+    3. Spins up a shadow database (Docker container, local file copy, or emulator)
+    4. Replicates structure to shadow (SQL engines replay schema; Firestore seeds documents; Redis starts empty)
+    5. Offsets auto-increment sequences to prevent PK collisions (SQL engines only)
   </Step>
   <Step title="Start the proxy">
     ```bash
-    ./mori start
+    mori start
     ```
     Mori listens on a local port. Use `--port` to pick a specific one, or let Mori auto-assign.
   </Step>
   <Step title="Point your app at Mori">
     Swap your application's connection string to point at `127.0.0.1` on the proxy port. Same driver, same protocol -- your app won't know the difference.
 
-    ```bash
+    <CodeGroup>
+    ```bash PostgreSQL / MySQL / MSSQL
     # Before (direct to prod)
     DATABASE_URL=postgres://user:pass@prod-host:5432/mydb
 
     # After (through Mori)
     DATABASE_URL=postgres://user:pass@127.0.0.1:5432/mydb
     ```
+    ```bash Redis
+    # Before
+    REDIS_URL=redis://:password@prod-host:6379/0
+
+    # After
+    REDIS_URL=redis://:password@127.0.0.1:6379/0
+    ```
+    ```bash Firestore
+    # Set the emulator host to point at Mori's proxy port
+    FIRESTORE_EMULATOR_HOST=127.0.0.1:<proxy-port>
+    ```
+    </CodeGroup>
   </Step>
   <Step title="Reset when done">
     Wipe all local state and start fresh:
     ```bash
-    ./mori reset
+    mori reset
     ```
   </Step>
 </Steps>
@@ -93,7 +126,7 @@ Your agent can read `agents.md` and handle the rest autonomously.
 ## Lifecycle
 
 ```
-mori init         Connect to prod, dump schema, spin up shadow, offset sequences
+mori init         Connect to prod, discover structure, spin up shadow
      |
 mori start        Start proxy, load state, accept connections
      |
@@ -109,7 +142,7 @@ mori reset        Wipe shadow data + metadata, clean slate
 Start Mori with the MCP server for AI agent integration:
 
 ```bash
-./mori start --mcp --mcp-port 9000
+mori start --mcp --mcp-port 9000
 ```
 
 AI agents connect to `http://127.0.0.1:9000/mcp` and get engine-specific tools (SQL queries, Redis commands, or Firestore operations) -- all safely routed through the proxy.

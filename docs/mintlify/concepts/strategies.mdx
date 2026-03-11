@@ -16,7 +16,18 @@ The classifier parses each incoming statement to extract:
 - **Primary Keys** — extractable PKs from WHERE clauses (e.g., `WHERE id = 42`)
 - **Feature flags** — `IsJoin`, `HasAggregate`, `HasSetOp`, `IsComplexRead`, `HasReturning`, `HasOnConflict`, `HasWindowFunc`, `HasDistinct`, `HasCursor`, `IsMetadataQuery`
 
-### Statement Types
+### Classification by Engine
+
+| Engine | Classification Method | Notes |
+|--------|----------------------|-------|
+| PostgreSQL, CockroachDB | AST-based (`pg_query_go`) | Full SQL parse tree |
+| MySQL, MariaDB | AST-based (`vitess/sqlparser`) | Vitess SQL parser |
+| MSSQL | Regex-based | No Go-native TDS parser |
+| SQLite, DuckDB | Regex-based | pgwire-exposed embedded engines |
+| Redis | Command-based (static lookup, ~155 commands) | No AST — fixed command grammar |
+| Firestore | gRPC method-name based (18 methods) | No SQL — method name classification |
+
+### Statement Types (SQL Engines)
 
 | Category | Statements | SubType |
 |----------|-----------|---------|
@@ -30,6 +41,16 @@ The classifier parses each incoming statement to extract:
 | **Prepared** | PREPARE, EXECUTE, DEALLOCATE | SubPrepare, SubExecute, SubDeallocate |
 | **Listen** | LISTEN, UNLISTEN | SubListen |
 | **Unsupported** | NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE | SubNotSupported |
+
+### Unsupported Operations by Engine
+
+| Engine | Unsupported Operations |
+|--------|----------------------|
+| PostgreSQL | NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE |
+| MySQL | CALL, EXPLAIN ANALYZE |
+| MSSQL | BULK INSERT, EXEC/EXECUTE |
+| DuckDB | COPY/EXPORT/IMPORT, EXPLAIN ANALYZE |
+| Redis | PUBLISH (would affect production subscribers) |
 
 ## Routing Decision Matrix
 
@@ -52,7 +73,7 @@ The router takes the classification output plus the current delta/tombstone/sche
 | **Truncate** | Execute on shadow, mark table fully shadowed. |
 | **Listen Only** | Forward LISTEN to prod only. |
 
-### Decision Table
+### Decision Table (SQL Engines)
 
 | OpType | Condition | Strategy |
 |--------|-----------|----------|
@@ -79,6 +100,45 @@ The router takes the classification output plus the current delta/tombstone/sche
 | PREPARE | Always | **Shadow Write** |
 | DEALLOCATE | Always | **Forward Both** |
 | NOTIFY | Always | **Not Supported** |
+
+### Decision Table (Redis)
+
+Redis uses the same strategy model, but classification is command-based rather than SQL-based.
+
+| Command Type | Condition | Strategy |
+|-------------|-----------|----------|
+| Read (GET, HGETALL, LRANGE, etc.) | Key not in delta/tombstone | **Prod Direct** |
+| Read (GET, HGETALL, LRANGE, etc.) | Key in delta map | **Merged Read** (route to shadow) |
+| Read (GET, HGETALL, LRANGE, etc.) | Key tombstoned | **Merged Read** (return type-appropriate nil) |
+| MGET | Mixed keys | **Merged Read** (per-key routing) |
+| SCAN | Any deltas exist | **Merged Read** (two-phase cursor merge) |
+| SET, MSET, SETNX | Always | **Shadow Write** |
+| INCR, HSET, LPUSH, SADD, ZADD, etc. | Always | **Hydrate and Write** |
+| DEL, UNLINK, SREM, ZREM, etc. | Always | **Shadow Delete** |
+| FLUSHDB, FLUSHALL | Always | **Truncate** (marks DB fully shadowed) |
+| MULTI/EXEC/DISCARD | Always | **Transaction** |
+| SUBSCRIBE/PSUBSCRIBE | Always | **Forward Both** (fan-in from both) |
+| PUBLISH | Always | **Not Supported** |
+
+### Decision Table (Firestore)
+
+Firestore classification is gRPC method-based.
+
+| gRPC Method | Condition | Strategy |
+|-------------|-----------|----------|
+| GetDocument | No deltas for collection | **Prod Direct** |
+| GetDocument | Document in delta map | **Merged Read** (route to shadow) |
+| GetDocument | Document tombstoned | **Merged Read** (return NOT_FOUND) |
+| BatchGetDocuments | Mixed documents | **Merged Read** (per-document routing) |
+| ListDocuments, RunQuery | Any collection deltas | **Merged Read** (over-fetch + merge) |
+| RunAggregationQuery | Any collection deltas | **Merged Read** (decompose + re-aggregate) |
+| CreateDocument | Always | **Shadow Write** |
+| UpdateDocument | Always | **Hydrate and Write** |
+| DeleteDocument | Always | **Shadow Delete** |
+| Commit, BatchWrite | Always | **Hydrate and Write** (per-write) |
+| BeginTransaction | Always | **Transaction** |
+| Rollback | Always | **Transaction** |
+| Listen | Always | **Listen Only** |
 
 ---
 
@@ -116,6 +176,14 @@ When a SELECT touches a table with delta or tombstone entries:
 **PK injection:** The proxy injects PK columns into the SELECT if they aren't already present (needed for deduplication). They're stripped from the final output.
 
 **LIMIT over-fetching:** Prod queries add `delta_count + tombstone_count` to the LIMIT to compensate for rows that will be filtered out.
+
+<Info>
+**Redis merged reads** use a simpler per-key routing model instead of the SQL merge pipeline. Each key is checked against the delta map and tombstone set individually. MGET batches per-key routing. SCAN uses a two-phase cursor: Phase 0 scans prod (filtering delta/tombstoned keys), Phase 1 scans shadow for new/modified keys.
+</Info>
+
+<Info>
+**Firestore merged reads** use document-path-based deduplication. GetDocument routes per-document (tombstone → NOT_FOUND, delta → shadow, else → prod). ListDocuments and RunQuery over-fetch from prod, query shadow, merge by document path, re-evaluate WHERE filters, and re-sort.
+</Info>
 
 ### Join Patch
 
@@ -156,6 +224,10 @@ Aggregate queries (COUNT, SUM, AVG, MIN, MAX with GROUP BY) can't be merged by s
 5. Apply HAVING filters on re-aggregated results
 
 **Complex aggregates** (array_agg, json_agg, string_agg, etc.) materialize into a temp table and re-execute the original query against it on shadow, leveraging the database's native aggregate implementation.
+
+<Info>
+**Firestore aggregations** (COUNT, SUM, AVG only) decompose to a base RunQuery through the merged pipeline, then re-compute aggregations in memory. No temp tables — Firestore has no SQL execution engine.
+</Info>
 
 ### Complex Reads
 
@@ -219,6 +291,10 @@ Shadow's offset sequences assign PKs in the local range (e.g., 10,000,001+), gua
 4. Execute upsert on shadow
 5. Track all affected rows (hydrated + newly inserted) in Delta Map
 
+**MySQL-specific:** MySQL lacks `RETURNING`. INSERT PK extraction uses a 3-tier approach: (1) extract from VALUES clause, (2) use `LAST_INSERT_ID()`, (3) fall back to `information_schema` PK lookup.
+
+**MySQL-specific:** `INSERT ... ON DUPLICATE KEY UPDATE` and `REPLACE INTO` route through the hydrate-and-write path.
+
 ### UPDATE
 
 **Point Update** (PK extractable from WHERE, e.g., `WHERE id = 42`):
@@ -237,6 +313,14 @@ Shadow's offset sequences assign PKs in the local range (e.g., 10,000,001+), gua
 **Cross-table Updates** (UPDATE ... FROM):
 - Extract subquery predicates from FROM clause
 - Hydrate referenced tables before applying the update
+
+<Info>
+**Redis writes:** SET/MSET route to shadow directly (Shadow Write). Commands that modify existing keys (INCR, HSET, LPUSH, SADD, ZADD, etc.) use DUMP/RESTORE to hydrate the key from prod to shadow before executing (Hydrate and Write).
+</Info>
+
+<Info>
+**Firestore writes:** CreateDocument routes to shadow directly. UpdateDocument hydrates the document from prod first. Commit and BatchWrite hydrate per-write. Document transforms (serverTimestamp, increment, arrayUnion, arrayRemove) are tracked as deltas.
+</Info>
 
 ### DELETE
 
@@ -262,6 +346,10 @@ Shadow's offset sequences assign PKs in the local range (e.g., 10,000,001+), gua
 3. Clear all tombstones for the table
 4. CASCADE: recursively mark FK-related tables as fully shadowed
 
+<Info>
+**Redis:** FLUSHDB/FLUSHALL mark the entire database as fully shadowed. All subsequent reads go to shadow only.
+</Info>
+
 ---
 
 ## DDL Handling
@@ -282,6 +370,11 @@ DDL operations execute on shadow only. Production schema is never modified.
 | `CREATE TABLE` | Marks table as shadow-only | Table is shadow-only, no prod reads |
 | `DROP TABLE` | Marks table as dropped | Queries return "table not found" |
 | `CREATE INDEX` | Shadow only, silent | No impact on reads |
+| `RENAME TABLE` | Records `old → new` mapping | Reads redirect to new name |
+
+<Info>
+**Redis and Firestore** have no DDL. Redis is schemaless (key-value); Firestore is schemaless (document). The Schema Registry is unused for these engines except for the `IsFullyShadowed` flag (set by FLUSHDB in Redis).
+</Info>
 
 ---
 
@@ -297,6 +390,17 @@ DDL operations execute on shadow only. Production schema is never modified.
 
 Prod uses REPEATABLE READ isolation to ensure consistent reads across the transaction — the merged read always sees a stable prod snapshot.
 
+### Engine-Specific Transaction Behavior
+
+| Engine | Transaction Model | Notes |
+|--------|------------------|-------|
+| PostgreSQL, CockroachDB | Full BEGIN/COMMIT/ROLLBACK + savepoints | Prod uses REPEATABLE READ |
+| MySQL, MariaDB | Full BEGIN/COMMIT/ROLLBACK + savepoints | Prod uses REPEATABLE READ |
+| MSSQL | Full BEGIN/COMMIT/ROLLBACK | Savepoints supported |
+| SQLite, DuckDB | Full BEGIN/COMMIT/ROLLBACK | Single-writer; no concurrent txns |
+| Redis | MULTI/EXEC/DISCARD | No savepoints; WATCH-based optimistic locking |
+| Firestore | BeginTransaction/Commit/Rollback | Prod-side snapshot isolation via ReadTime |
+
 ### Staged Deltas
 
 Within a transaction, all delta/tombstone additions are **staged** — held in a per-transaction buffer. This prevents phantom deltas from failed transactions: if a transaction rolls back, the Delta Map and Tombstone Set remain unchanged.
@@ -305,7 +409,7 @@ Autocommit mode (implicit single-statement transactions) applies deltas immediat
 
 ### Savepoints
 
-Savepoints are fully supported with stack-based snapshot management:
+Savepoints are fully supported (SQL engines) with stack-based snapshot management:
 
 - **SAVEPOINT name**: Capture current delta/tombstone/schema/insert-count state, push onto stack
 - **RELEASE SAVEPOINT name**: Pop snapshot from stack (changes persist)
@@ -335,16 +439,24 @@ Supports multi-column (composite) foreign keys.
 - **CASCADE**: Tombstone child rows when parent deleted, recursively cascade
 - **SET NULL / SET DEFAULT**: Falls through to shadow enforcement
 
+<Info>
+**Redis and Firestore** have no foreign key concept. FK enforcement is SQL-engine-specific.
+</Info>
+
 ---
 
 ## Known Limitations
 
-| Limitation | Impact | Mitigation |
-|-----------|--------|-----------|
-| Multi-column ORDER BY | Only single-column sort re-applied after merge | Multi-column ORDER BY returns in backend order |
-| Mutating CTEs only see shadow data | CTE reads from clean tables return empty | v1.1: split into write + read |
-| Stored procedures with side effects | `SELECT my_function()` routes as READ to prod | v2: function introspection or config allowlist |
-| Tables without PKs | Read-only, writes produce warning | Rare in practice |
-| Bulk ops on large tables | Hydrating thousands of rows is slow | Acceptable for dev tool |
-| JOIN PK patching | Requires PK in SELECT list | Patching skipped when PK not selected |
-| Parameterized LIMIT | `LIMIT $1` not rewritten for over-fetching | Uncommon in practice |
+| Limitation | Engines | Impact | Mitigation |
+|-----------|---------|--------|-----------|
+| Multi-column ORDER BY | All SQL | Only single-column sort re-applied after merge | Multi-column ORDER BY returns in backend order |
+| Mutating CTEs only see shadow data | All SQL | CTE reads from clean tables return empty | v1.1: split into write + read |
+| Stored procedures with side effects | All SQL | `SELECT my_function()` routes as READ to prod | v2: function introspection or config allowlist |
+| Tables without PKs | All SQL | Read-only, writes produce warning | Rare in practice |
+| Bulk ops on large tables | All SQL | Hydrating thousands of rows is slow | Acceptable for dev tool |
+| JOIN PK patching | All SQL | Requires PK in SELECT list | Patching skipped when PK not selected |
+| Parameterized LIMIT | All SQL | `LIMIT $1` not rewritten for over-fetching | Uncommon in practice |
+| `sp_executesql` parameter resolution | MSSQL | Parameterized SELECT not resolved for merged reads | Use inline SQL where possible |
+| Blocking commands (BLPOP, etc.) | Redis | Won't see pushes from non-Mori clients to prod | Inherent to copy-on-write model |
+| Real-time listeners (Listen) | Firestore | Only see prod data, not shadow mutations | By design — listeners reflect prod state |
+| Don't rename PK columns | All SQL | Delta tracking depends on stable PK column names | Avoid renaming PK columns |

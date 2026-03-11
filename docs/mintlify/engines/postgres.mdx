@@ -1,0 +1,50 @@
+---
+title: "PostgreSQL"
+description: "PostgreSQL engine — pgwire v3, AST-based classification, full feature reference."
+sidebarTitle: "PostgreSQL"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `postgres` |
+| Wire Protocol | pgwire v3 |
+| Classifier | AST-based (`pg_query_go` — PostgreSQL's actual parser internals) |
+| Shadow | Docker `postgres:<version>` (version-matched) |
+| Extended Protocol | Full Parse/Bind/Describe/Execute/Close/Sync support |
+
+PostgreSQL is the reference implementation. All 12 routing strategies, the complete merged read pipeline, full write hydration, DDL tracking with schema registry, transaction management with savepoints, proxy-layer FK enforcement, and the three-layer write guard are fully implemented.
+
+**Connection Parameters:**
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `host` | Database host | — |
+| `port` | Database port | `5432` |
+| `user` | Username | — |
+| `password` | Password | — |
+| `database` | Database name | — |
+| `ssl_mode` | `disable`, `require`, `verify-ca`, `verify-full` | `verify-full` |
+
+```bash
+mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
+```
+
+## Engine-Specific Features
+
+- **AST-based classification** via `pg_query_go` — PostgreSQL's actual parser compiled to Go. Every SQL statement is parsed into a full AST for precise classification with feature flags (IsJoin, HasAggregate, HasSetOp, IsComplexRead, HasReturning, HasOnConflict, HasWindowFunc, HasDistinct, HasCursor, etc.).
+- **Extended query protocol** — Full Parse/Bind/Describe/Execute/Close/Sync support with parameter type resolution, binary format decoding, and statement caching.
+- **RETURNING clause** — Used on INSERT/UPDATE/DELETE to extract exact PKs for precise per-row delta tracking.
+- **`ctid` for PK-less tables** — Uses PostgreSQL's system column as row identity for deduplication when no user-defined PK exists.
+- **Extension replication** — Auto-detects extensions from prod (`pg_extension`) and replicates them to the shadow container. Auto-installs missing extensions via `apt-get` when `CREATE EXTENSION` fails.
+- **Read-replica conflict handling** — Automatic retry with exponential backoff on SQLSTATE 40001 (recovery conflict) during initialization.
+- **Custom shadow images** — Use `--image` flag to specify a custom Docker image for the shadow container (e.g., for proprietary extensions).
+
+## Known Limitations
+
+None. All E2E tests pass without skips. PostgreSQL is the gold standard implementation.
+
+<Info>
+**Unsupported operations (by design):** NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE. These return a descriptive error to the client.
+</Info>

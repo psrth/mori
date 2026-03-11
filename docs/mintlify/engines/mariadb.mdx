@@ -1,0 +1,44 @@
+---
+title: "MariaDB"
+description: "MariaDB engine — thin adapter over MySQL with RETURNING support and MariaDB-specific tooling."
+sidebarTitle: "MariaDB"
+---
+
+## Overview
+
+| Property | Value |
+|----------|-------|
+| Engine ID | `mariadb` |
+| Wire Protocol | MySQL wire protocol (shared with MySQL) |
+| Classifier | AST-based (`vitess/sqlparser`) with MariaDB regex extensions |
+| Shadow | Docker `mariadb:<version>` |
+
+MariaDB is a thin adapter over the MySQL engine. It overrides three methods: `ID()`, `Init()` (passes `mariadb` engine name), and `NewProxy()` (enables `RETURNING` support for MariaDB 10.5+).
+
+**Connection Parameters:** Same as MySQL.
+
+```bash
+mori init --from "mysql://user:pass@host:3306/mydb"
+```
+
+## Differences from MySQL
+
+- **INSERT ... RETURNING** — MariaDB 10.5+ supports `RETURNING` on INSERT/DELETE. The proxy appends `RETURNING pk_col1, pk_col2` to INSERTs sent to shadow, parses the result set for exact PKs, providing PostgreSQL-level delta tracking fidelity.
+- **`mariadb-dump`** — Uses `mariadb-dump` instead of `mysqldump` for schema dumps (MySQL's `mysqldump` queries `COLUMN_STATISTICS` which MariaDB doesn't support).
+- **`mariadb-admin`** — Uses `mariadb-admin` for container readiness checks (falls back to `mysqladmin`).
+- **Container prefix** — Shadow containers use `mori-mariadb-shadow-` prefix instead of `mori-mysql-shadow-`.
+- **No `only_full_group_by` issue** — MariaDB does not enable this SQL mode by default, avoiding the aggregate re-aggregation conflict that affects MySQL.
+- **MariaDB-specific classification** — Regex patterns added for `INSERT/DELETE/REPLACE ... RETURNING`, `EXECUTE IMMEDIATE`, and `CREATE/DROP SEQUENCE`.
+
+## Differences from PostgreSQL
+
+Inherits all MySQL differences from PostgreSQL (no `ctid`, no cursors, no LISTEN/UNLISTEN, auto-increment offsets, etc.). See the [MySQL engine page](/docs/engines/mysql) for the full list.
+
+## Known Limitations
+
+- Inherits all MySQL limitations (multi-column ORDER BY, PK-less table dedup).
+- Vitess parser is hardcoded to MySQL 8.0.30 — MariaDB-specific syntax falls through to regex fallback.
+
+<Info>
+**Unsupported operations:** Same as MySQL — CALL, EXPLAIN ANALYZE.
+</Info>
