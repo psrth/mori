@@ -203,10 +203,15 @@ func (w *WriteHandler) handleBulkDelete(
 ) error {
 	table := cl.Tables[0]
 	meta := w.tables[table]
-	pkCol := meta.PKColumns[0]
 
-	// 1. Build SELECT pk FROM table WHERE <same conditions> from the DELETE's WHERE.
-	selectSQL, err := buildBulkDeletePKQuery(cl.RawSQL, pkCol)
+	// 1. Build SELECT pk_col1, pk_col2, ... FROM table WHERE <same conditions> from the DELETE's WHERE.
+	pkSelectCols := make([]string, len(meta.PKColumns))
+	for i, pkc := range meta.PKColumns {
+		pkSelectCols[i] = quoteIdent(pkc)
+	}
+	pkSelectList := strings.Join(pkSelectCols, ", ")
+
+	selectSQL, err := buildBulkDeletePKQuery(cl.RawSQL, pkSelectList)
 	if err != nil {
 		if w.verbose {
 			log.Printf("[conn %d] bulk DELETE: failed to build PK discovery query: %v", w.connID, err)
@@ -249,17 +254,19 @@ func (w *WriteHandler) handleBulkDelete(
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
 
-	// 3. Find PK column index in results.
-	pkIdx := -1
-	for i, col := range result.Columns {
-		if col.Name == pkCol {
-			pkIdx = i
-			break
+	// 3. Find PK column indices in results.
+	pkIndices := make(map[string]int, len(meta.PKColumns))
+	for _, pkc := range meta.PKColumns {
+		for i, col := range result.Columns {
+			if col.Name == pkc {
+				pkIndices[pkc] = i
+				break
+			}
 		}
 	}
-	if pkIdx == -1 {
+	if len(pkIndices) != len(meta.PKColumns) {
 		if w.verbose {
-			log.Printf("[conn %d] bulk DELETE: PK column %q not found in Prod results", w.connID, pkCol)
+			log.Printf("[conn %d] bulk DELETE: not all PK columns found in Prod results", w.connID)
 		}
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
@@ -267,10 +274,20 @@ func (w *WriteHandler) handleBulkDelete(
 	// Collect discovered PKs.
 	var discoveredPKs []string
 	for i, row := range result.RowValues {
-		if result.RowNulls[i][pkIdx] {
-			continue // NULL PK, skip.
+		hasNullPK := false
+		pkVals := make([]string, len(meta.PKColumns))
+		for j, pkc := range meta.PKColumns {
+			idx := pkIndices[pkc]
+			if result.RowNulls[i][idx] {
+				hasNullPK = true
+				break
+			}
+			pkVals[j] = row[idx]
 		}
-		discoveredPKs = append(discoveredPKs, row[pkIdx])
+		if hasNullPK {
+			continue
+		}
+		discoveredPKs = append(discoveredPKs, core.SerializeCompositePK(meta.PKColumns, pkVals))
 	}
 
 	if w.verbose {
@@ -348,14 +365,16 @@ func (w *WriteHandler) handleBulkDelete(
 }
 
 // buildBulkDeletePKQuery parses a DELETE statement and builds a SELECT query
-// that retrieves the PK column using the same WHERE clause. This allows
+// that retrieves the PK columns using the same WHERE clause. This allows
 // discovering which Prod rows would be affected by the DELETE.
+//
+// The pkCols parameter contains the PK column names to select.
 //
 // Example:
 //
 //	DELETE FROM users WHERE active = false
 //	→ SELECT id FROM users WHERE active = false
-func buildBulkDeletePKQuery(rawSQL string, pkCol string) (string, error) {
+func buildBulkDeletePKQuery(rawSQL string, pkCols string) (string, error) {
 	parseResult, err := pg_query.Parse(rawSQL)
 	if err != nil {
 		return "", fmt.Errorf("parse: %w", err)
@@ -376,22 +395,16 @@ func buildBulkDeletePKQuery(rawSQL string, pkCol string) (string, error) {
 		return "", fmt.Errorf("DELETE has no target relation")
 	}
 
-	// Build SELECT <pkCol> target list.
-	pkTarget := &pg_query.Node{
-		Node: &pg_query.Node_ResTarget{
-			ResTarget: &pg_query.ResTarget{
-				Val: &pg_query.Node{
-					Node: &pg_query.Node_ColumnRef{
-						ColumnRef: &pg_query.ColumnRef{
-							Fields: []*pg_query.Node{
-								{Node: &pg_query.Node_String_{String_: &pg_query.String{Sval: pkCol}}},
-							},
-						},
-					},
-				},
-			},
-		},
+	// Build target list from the comma-separated column expression.
+	// We parse a dummy SELECT to let pg_query handle the column list.
+	tableName := rangeVarName(rel)
+	dummySQL := fmt.Sprintf("SELECT %s FROM %s", pkCols, quoteIdent(tableName))
+	dummyResult, dErr := pg_query.Parse(dummySQL)
+	if dErr != nil {
+		return "", fmt.Errorf("parse pk columns: %w", dErr)
 	}
+	dummySel := dummyResult.GetStmts()[0].GetStmt().GetSelectStmt()
+	targetList := dummySel.GetTargetList()
 
 	// Build FROM clause from the DELETE's relation.
 	fromClause := []*pg_query.Node{
@@ -403,7 +416,7 @@ func buildBulkDeletePKQuery(rawSQL string, pkCol string) (string, error) {
 
 	// Build SELECT statement reusing the WHERE clause.
 	selectStmt := &pg_query.SelectStmt{
-		TargetList:  []*pg_query.Node{pkTarget},
+		TargetList:  targetList,
 		FromClause:  fromClause,
 		WhereClause: del.GetWhereClause(),
 	}

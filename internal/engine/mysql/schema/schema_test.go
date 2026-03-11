@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -131,6 +132,38 @@ func TestComputeOffset(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("computeOffset(%d) = %d, want %d", tt.prodMax, got, tt.want)
 		}
+	}
+}
+
+func TestIsLockConflict(t *testing.T) {
+	tests := []struct {
+		name string
+		err  string
+		want bool
+	}{
+		{"lock wait timeout 1205", "Error 1205: Lock wait timeout exceeded", true},
+		{"deadlock 1213", "Error 1213: Deadlock found", true},
+		{"lost connection 2013", "Error 2013: Lost connection to MySQL server during query", true},
+		{"too many connections 1040", "Error 1040: Too many connections", true},
+		{"lock text", "Lock wait timeout exceeded", true},
+		{"deadlock text", "Deadlock found when trying to get lock", true},
+		{"normal error", "Unknown column 'foo'", false},
+		{"syntax error", "You have an error in your SQL syntax", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := fmt.Errorf("%s", tt.err)
+			if got := isLockConflict(err); got != tt.want {
+				t.Errorf("isLockConflict(%q) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsLockConflict_Nil(t *testing.T) {
+	if isLockConflict(nil) {
+		t.Error("isLockConflict(nil) = true, want false")
 	}
 }
 

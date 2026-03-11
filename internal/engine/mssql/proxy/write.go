@@ -186,14 +186,32 @@ func (w *WriteHandler) handleInsertWithOutput(clientConn net.Conn, rawMsg []byte
 
 	// Extract PKs from the OUTPUT result if possible.
 	if hasMeta && len(meta.PKColumns) > 0 && result.Error == "" {
-		pkCol := meta.PKColumns[0]
-		pkIdx := findColumnIndex(result.Columns, pkCol)
-		if pkIdx >= 0 {
+		// Find indices for ALL PK columns in the OUTPUT result.
+		pkIndices := make([]int, len(meta.PKColumns))
+		allFound := true
+		for p, pkCol := range meta.PKColumns {
+			pkIndices[p] = findColumnIndex(result.Columns, pkCol)
+			if pkIndices[p] < 0 {
+				allFound = false
+				break
+			}
+		}
+		if allFound {
 			for i, row := range result.RowValues {
-				if pkIdx >= len(row) || result.RowNulls[i][pkIdx] {
+				// Check that all PK columns are present and non-null.
+				skip := false
+				pkValues := make([]string, len(meta.PKColumns))
+				for p, idx := range pkIndices {
+					if idx >= len(row) || result.RowNulls[i][idx] {
+						skip = true
+						break
+					}
+					pkValues[p] = row[idx]
+				}
+				if skip {
 					continue
 				}
-				pk := row[pkIdx]
+				pk := core.SerializeCompositePK(meta.PKColumns, pkValues)
 				if w.inTxn() {
 					w.deltaMap.Stage(table, pk)
 				} else {
@@ -245,12 +263,12 @@ func execTDSQueryRaw(conn net.Conn, rawMsg []byte) (*TDSQueryResult, error) {
 	return result, nil
 }
 
-// extractInsertPK attempts to extract the PK value from an INSERT VALUES clause.
+// extractInsertPK attempts to extract the PK value(s) from an INSERT VALUES clause.
+// For composite PKs, extracts all PK columns and serializes them.
 func (w *WriteHandler) extractInsertPK(rawSQL, table string, meta schema.TableMeta) string {
 	if len(meta.PKColumns) == 0 {
 		return ""
 	}
-	pkCol := strings.ToLower(meta.PKColumns[0])
 
 	upper := strings.ToUpper(rawSQL)
 	// Find column list between first ( and )
@@ -268,18 +286,21 @@ func (w *WriteHandler) extractInsertPK(rawSQL, table string, meta schema.TableMe
 	colList := rawSQL[colStart+1 : colEnd]
 	cols := strings.Split(colList, ",")
 
-	// Find PK column index.
-	pkIdx := -1
-	for i, col := range cols {
-		name := strings.TrimSpace(col)
-		name = strings.Trim(name, "[]`\"")
-		if strings.EqualFold(name, pkCol) {
-			pkIdx = i
-			break
+	// Find index for each PK column.
+	pkIndices := make([]int, len(meta.PKColumns))
+	for p, pkCol := range meta.PKColumns {
+		pkIndices[p] = -1
+		for i, col := range cols {
+			name := strings.TrimSpace(col)
+			name = strings.Trim(name, "[]`\"")
+			if strings.EqualFold(name, pkCol) {
+				pkIndices[p] = i
+				break
+			}
 		}
-	}
-	if pkIdx < 0 {
-		return ""
+		if pkIndices[p] < 0 {
+			return "" // PK column not found in INSERT column list.
+		}
 	}
 
 	// Find VALUES ( ... )
@@ -296,20 +317,26 @@ func (w *WriteHandler) extractInsertPK(rawSQL, table string, meta schema.TableMe
 
 	valList := rawSQL[valStart+1 : valEnd]
 	vals := splitValuesRespectingQuotes(valList)
-	if pkIdx >= len(vals) {
-		return ""
+
+	// Extract all PK values.
+	pkValues := make([]string, len(meta.PKColumns))
+	for p, idx := range pkIndices {
+		if idx >= len(vals) {
+			return ""
+		}
+		val := strings.TrimSpace(vals[idx])
+		// Strip quotes.
+		if len(val) >= 2 && val[0] == '\'' && val[len(val)-1] == '\'' {
+			val = val[1 : len(val)-1]
+		}
+		// Skip parameter references.
+		if strings.HasPrefix(val, "@") {
+			return ""
+		}
+		pkValues[p] = val
 	}
 
-	val := strings.TrimSpace(vals[pkIdx])
-	// Strip quotes.
-	if len(val) >= 2 && val[0] == '\'' && val[len(val)-1] == '\'' {
-		val = val[1 : len(val)-1]
-	}
-	// Skip parameter references.
-	if strings.HasPrefix(val, "@") {
-		return ""
-	}
-	return val
+	return core.SerializeCompositePK(meta.PKColumns, pkValues)
 }
 
 // splitValuesRespectingQuotes splits a comma-separated VALUES list, respecting
@@ -465,8 +492,6 @@ func (w *WriteHandler) handleBulkUpdate(
 	table string,
 	meta schema.TableMeta,
 ) error {
-	pkCol := meta.PKColumns[0]
-
 	// Build SELECT * FROM table WHERE <same conditions> via regex extraction.
 	selectSQL := buildBulkHydrationQueryMSSQL(cl.RawSQL, table)
 	if selectSQL == "" {
@@ -492,11 +517,19 @@ func (w *WriteHandler) handleBulkUpdate(
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
 
-	// Find PK column index.
-	pkIdx := findColumnIndex(result.Columns, pkCol)
-	if pkIdx < 0 {
+	// Find indices for ALL PK columns.
+	pkIndices := make([]int, len(meta.PKColumns))
+	allFound := true
+	for p, pkCol := range meta.PKColumns {
+		pkIndices[p] = findColumnIndex(result.Columns, pkCol)
+		if pkIndices[p] < 0 {
+			allFound = false
+			break
+		}
+	}
+	if !allFound {
 		if w.verbose {
-			log.Printf("[conn %d] bulk UPDATE: PK column %q not in Prod results", w.connID, pkCol)
+			log.Printf("[conn %d] bulk UPDATE: PK columns not in Prod results", w.connID)
 		}
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
@@ -506,10 +539,20 @@ func (w *WriteHandler) handleBulkUpdate(
 	var affectedPKs []string
 	hydratedCount := 0
 	for i, row := range result.RowValues {
-		if result.RowNulls[i][pkIdx] {
+		// Extract all PK values for this row.
+		skip := false
+		pkValues := make([]string, len(meta.PKColumns))
+		for p, idx := range pkIndices {
+			if result.RowNulls[i][idx] {
+				skip = true
+				break
+			}
+			pkValues[p] = row[idx]
+		}
+		if skip {
 			continue
 		}
-		pk := row[pkIdx]
+		pk := core.SerializeCompositePK(meta.PKColumns, pkValues)
 		if w.deltaMap.IsDelta(table, pk) {
 			affectedPKs = append(affectedPKs, pk)
 			continue
@@ -649,14 +692,31 @@ func (w *WriteHandler) handleDeleteWithOutput(clientConn net.Conn, rawMsg []byte
 
 	// Extract PKs from the OUTPUT result for tombstoning.
 	if hasMeta && len(meta.PKColumns) > 0 && result.Error == "" {
-		pkCol := meta.PKColumns[0]
-		pkIdx := findColumnIndex(result.Columns, pkCol)
-		if pkIdx >= 0 {
+		// Find indices for ALL PK columns.
+		pkIndices := make([]int, len(meta.PKColumns))
+		allFound := true
+		for p, pkCol := range meta.PKColumns {
+			pkIndices[p] = findColumnIndex(result.Columns, pkCol)
+			if pkIndices[p] < 0 {
+				allFound = false
+				break
+			}
+		}
+		if allFound {
 			for i, row := range result.RowValues {
-				if pkIdx >= len(row) || result.RowNulls[i][pkIdx] {
+				skip := false
+				pkValues := make([]string, len(meta.PKColumns))
+				for p, idx := range pkIndices {
+					if idx >= len(row) || result.RowNulls[i][idx] {
+						skip = true
+						break
+					}
+					pkValues[p] = row[idx]
+				}
+				if skip {
 					continue
 				}
-				pk := row[pkIdx]
+				pk := core.SerializeCompositePK(meta.PKColumns, pkValues)
 				if w.inTxn() {
 					w.tombstones.Stage(table, pk)
 				} else {
@@ -676,12 +736,29 @@ func (w *WriteHandler) handleDeleteWithOutput(clientConn net.Conn, rawMsg []byte
 	if w.fkEnforcer != nil {
 		var outputPKs []string
 		if hasMeta && len(meta.PKColumns) > 0 && result.Error == "" {
-			pkCol := meta.PKColumns[0]
-			pkIdx := findColumnIndex(result.Columns, pkCol)
-			if pkIdx >= 0 {
+			pkIndices := make([]int, len(meta.PKColumns))
+			allFound := true
+			for p, pkCol := range meta.PKColumns {
+				pkIndices[p] = findColumnIndex(result.Columns, pkCol)
+				if pkIndices[p] < 0 {
+					allFound = false
+					break
+				}
+			}
+			if allFound {
 				for i, row := range result.RowValues {
-					if pkIdx < len(row) && !result.RowNulls[i][pkIdx] {
-						outputPKs = append(outputPKs, row[pkIdx])
+					skip := false
+					pkValues := make([]string, len(meta.PKColumns))
+					for p, idx := range pkIndices {
+						if idx < len(row) && !result.RowNulls[i][idx] {
+							pkValues[p] = row[idx]
+						} else {
+							skip = true
+							break
+						}
+					}
+					if !skip {
+						outputPKs = append(outputPKs, core.SerializeCompositePK(meta.PKColumns, pkValues))
 					}
 				}
 			}
@@ -718,10 +795,14 @@ func (w *WriteHandler) handleBulkDelete(
 	table string,
 	meta schema.TableMeta,
 ) error {
-	pkCol := meta.PKColumns[0]
+	// Build SELECT for ALL PK columns from the DELETE's WHERE clause.
+	var pkColExprs []string
+	for _, pkCol := range meta.PKColumns {
+		pkColExprs = append(pkColExprs, quoteIdentMSSQL(pkCol))
+	}
+	selectCols := strings.Join(pkColExprs, ", ")
 
-	// Build SELECT pk FROM table WHERE <conditions> from the DELETE.
-	selectSQL := buildBulkDeletePKQueryMSSQL(cl.RawSQL, pkCol, table)
+	selectSQL := buildBulkDeletePKQueryCompositeMSSQL(cl.RawSQL, selectCols, table)
 	if selectSQL == "" {
 		if w.verbose {
 			log.Printf("[conn %d] bulk DELETE: failed to build PK discovery query", w.connID)
@@ -744,17 +825,35 @@ func (w *WriteHandler) handleBulkDelete(
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
 
-	pkIdx := findColumnIndex(result.Columns, pkCol)
-	if pkIdx < 0 {
+	// Find indices for ALL PK columns.
+	pkIndices := make([]int, len(meta.PKColumns))
+	allFound := true
+	for p, pkCol := range meta.PKColumns {
+		pkIndices[p] = findColumnIndex(result.Columns, pkCol)
+		if pkIndices[p] < 0 {
+			allFound = false
+			break
+		}
+	}
+	if !allFound {
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
 
 	var discoveredPKs []string
 	for i, row := range result.RowValues {
-		if result.RowNulls[i][pkIdx] {
+		skip := false
+		pkValues := make([]string, len(meta.PKColumns))
+		for p, idx := range pkIndices {
+			if result.RowNulls[i][idx] {
+				skip = true
+				break
+			}
+			pkValues[p] = row[idx]
+		}
+		if skip {
 			continue
 		}
-		discoveredPKs = append(discoveredPKs, row[pkIdx])
+		discoveredPKs = append(discoveredPKs, core.SerializeCompositePK(meta.PKColumns, pkValues))
 	}
 
 	if w.verbose {
@@ -911,9 +1010,9 @@ func (w *WriteHandler) hydrateRow(table, pk string) error {
 		return fmt.Errorf("no PK metadata for table %q", table)
 	}
 
-	pkCol := meta.PKColumns[0]
-	selectSQL := fmt.Sprintf("SELECT * FROM %s WHERE %s = %s",
-		quoteIdentMSSQL(table), quoteIdentMSSQL(pkCol), quoteLiteralMSSQL(pk))
+	pkValues := core.DeserializeCompositePK(pk, meta.PKColumns)
+	whereClause := core.BuildCompositeWHERE(meta.PKColumns, pkValues, quoteIdentMSSQL, quoteLiteralMSSQL)
+	selectSQL := fmt.Sprintf("SELECT * FROM %s WHERE %s", quoteIdentMSSQL(table), whereClause)
 
 	result, err := execTDSQuery(w.prodConn, selectSQL)
 	if err != nil {
@@ -1113,6 +1212,18 @@ func buildBulkDeletePKQueryMSSQL(rawSQL, pkCol, table string) string {
 	}
 	whereClause := rawSQL[whereIdx:]
 	return fmt.Sprintf("SELECT %s FROM %s%s", quoteIdentMSSQL(pkCol), quoteIdentMSSQL(table), whereClause)
+}
+
+// buildBulkDeletePKQueryCompositeMSSQL converts a DELETE into a SELECT for multiple PK columns.
+// DELETE FROM table WHERE ... → SELECT col1, col2 FROM table WHERE ...
+func buildBulkDeletePKQueryCompositeMSSQL(rawSQL, selectCols, table string) string {
+	upper := strings.ToUpper(rawSQL)
+	whereIdx := strings.Index(upper, " WHERE ")
+	if whereIdx < 0 {
+		return fmt.Sprintf("SELECT %s FROM %s", selectCols, quoteIdentMSSQL(table))
+	}
+	whereClause := rawSQL[whereIdx:]
+	return fmt.Sprintf("SELECT %s FROM %s%s", selectCols, quoteIdentMSSQL(table), whereClause)
 }
 
 // ---------------------------------------------------------------------------

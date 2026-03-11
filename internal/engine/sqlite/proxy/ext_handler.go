@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 
 	"github.com/psrth/mori/internal/core"
@@ -314,9 +315,8 @@ func (eh *ExtHandler) extHandleInsert(clientConn net.Conn, sqlStr string, cl *co
 
 	tracked := false
 	if hasMeta && len(meta.PKColumns) > 0 {
-		pkCol := meta.PKColumns[0]
-
-		if meta.PKType == "serial" || meta.PKType == "bigserial" {
+		// Single-column serial PK: use last_insert_rowid().
+		if len(meta.PKColumns) == 1 && (meta.PKType == "serial" || meta.PKType == "bigserial") {
 			var lastID int64
 			if err := p.shadowDB.QueryRow("SELECT last_insert_rowid()").Scan(&lastID); err == nil && lastID > 0 {
 				pk := fmt.Sprintf("%d", lastID)
@@ -330,16 +330,52 @@ func (eh *ExtHandler) extHandleInsert(clientConn net.Conn, sqlStr string, cl *co
 		}
 
 		if !tracked {
-			pks := extractInsertPKValues(sqlStr, table, pkCol)
-			if len(pks) > 0 {
-				for _, pk := range pks {
-					if inTxn {
-						p.deltaMap.Stage(table, pk)
-					} else {
-						p.deltaMap.Add(table, pk)
+			if len(meta.PKColumns) == 1 {
+				// Single PK column — use existing extraction.
+				pks := extractInsertPKValues(sqlStr, table, meta.PKColumns[0])
+				if len(pks) > 0 {
+					for _, pk := range pks {
+						if inTxn {
+							p.deltaMap.Stage(table, pk)
+						} else {
+							p.deltaMap.Add(table, pk)
+						}
+					}
+					tracked = true
+				}
+			} else {
+				// Composite PK — extract values for each PK column and serialize.
+				pkIndices, colNames := extractPKColumnIndices(sqlStr, meta.PKColumns)
+				if len(pkIndices) == len(meta.PKColumns) && len(colNames) > 0 {
+					valueRows := extractInsertValueRows(sqlStr)
+					for _, vals := range valueRows {
+						pkVals := make([]string, len(meta.PKColumns))
+						valid := true
+						for i, idx := range pkIndices {
+							if idx < len(vals) {
+								v := strings.TrimSpace(vals[idx])
+								v = strings.Trim(v, "'")
+								if v == "" || v == "NULL" || v == "null" {
+									valid = false
+									break
+								}
+								pkVals[i] = v
+							} else {
+								valid = false
+								break
+							}
+						}
+						if valid {
+							pk := core.SerializeCompositePK(meta.PKColumns, pkVals)
+							if inTxn {
+								p.deltaMap.Stage(table, pk)
+							} else {
+								p.deltaMap.Add(table, pk)
+							}
+							tracked = true
+						}
 					}
 				}
-				tracked = true
 			}
 		}
 	}
@@ -369,28 +405,75 @@ func (eh *ExtHandler) extHandleUpsert(clientConn net.Conn, sqlStr string, cl *co
 		return
 	}
 
-	pkCol := meta.PKColumns[0]
-	conflictValues := extractUpsertConflictValues(sqlStr, table, pkCol)
 	skipCols := toSkipSet(meta.GeneratedCols)
 
 	var affectedPKs []string
-	for _, val := range conflictValues {
-		if p.deltaMap != nil && p.deltaMap.IsDelta(table, val) {
+	if len(meta.PKColumns) == 1 {
+		pkCol := meta.PKColumns[0]
+		conflictValues := extractUpsertConflictValues(sqlStr, table, pkCol)
+		for _, val := range conflictValues {
+			if p.deltaMap != nil && p.deltaMap.IsDelta(table, val) {
+				affectedPKs = append(affectedPKs, val)
+				continue
+			}
+			escapedVal := strings.ReplaceAll(val, "'", "''")
+			selectSQL := fmt.Sprintf(`SELECT * FROM %q WHERE %q = '%s'`, table, pkCol, escapedVal)
+			if p.maxRowsHydrate > 0 {
+				selectSQL += fmt.Sprintf(" LIMIT %d", p.maxRowsHydrate)
+			}
+			cols, rows, _, err := p.safeProdQuery(selectSQL, eh.connID)
+			if err != nil || len(rows) == 0 {
+				continue
+			}
+			insertSQL := buildHydrateInsert(table, cols, rows[0], skipCols)
+			p.shadowDB.Exec(insertSQL)
 			affectedPKs = append(affectedPKs, val)
-			continue
 		}
-		escapedVal := strings.ReplaceAll(val, "'", "''")
-		selectSQL := fmt.Sprintf(`SELECT * FROM %q WHERE %q = '%s'`, table, pkCol, escapedVal)
-		if p.maxRowsHydrate > 0 {
-			selectSQL += fmt.Sprintf(" LIMIT %d", p.maxRowsHydrate)
+	} else {
+		// Composite PK: extract all PK column values from the INSERT.
+		pkIndices, _ := extractPKColumnIndices(sqlStr, meta.PKColumns)
+		if len(pkIndices) == len(meta.PKColumns) {
+			valueRows := extractInsertValueRows(sqlStr)
+			for _, vals := range valueRows {
+				pkVals := make([]string, len(meta.PKColumns))
+				valid := true
+				for i, idx := range pkIndices {
+					if idx < len(vals) {
+						v := strings.TrimSpace(vals[idx])
+						v = strings.Trim(v, "'")
+						if v == "" || v == "NULL" || v == "null" {
+							valid = false
+							break
+						}
+						pkVals[i] = v
+					} else {
+						valid = false
+						break
+					}
+				}
+				if !valid {
+					continue
+				}
+				pk := core.SerializeCompositePK(meta.PKColumns, pkVals)
+				if p.deltaMap != nil && p.deltaMap.IsDelta(table, pk) {
+					affectedPKs = append(affectedPKs, pk)
+					continue
+				}
+				pkMap := core.DeserializeCompositePK(pk, meta.PKColumns)
+				whereClause := core.BuildCompositeWHERE(meta.PKColumns, pkMap, sqliteQuoteIdent, sqliteQuoteLiteral)
+				selectSQL := fmt.Sprintf(`SELECT * FROM %q WHERE %s`, table, whereClause)
+				if p.maxRowsHydrate > 0 {
+					selectSQL += fmt.Sprintf(" LIMIT %d", p.maxRowsHydrate)
+				}
+				cols, rows, _, err := p.safeProdQuery(selectSQL, eh.connID)
+				if err != nil || len(rows) == 0 {
+					continue
+				}
+				insertSQL := buildHydrateInsert(table, cols, rows[0], skipCols)
+				p.shadowDB.Exec(insertSQL)
+				affectedPKs = append(affectedPKs, pk)
+			}
 		}
-		cols, rows, _, err := p.safeProdQuery(selectSQL, eh.connID)
-		if err != nil || len(rows) == 0 {
-			continue
-		}
-		insertSQL := buildHydrateInsert(table, cols, rows[0], skipCols)
-		p.shadowDB.Exec(insertSQL)
-		affectedPKs = append(affectedPKs, val)
 	}
 
 	eh.extExecOnShadow(clientConn, sqlStr)
@@ -438,13 +521,19 @@ func (eh *ExtHandler) extHandleUpdateWithHydration(clientConn net.Conn, sqlStr s
 		table := cl.Tables[0]
 		meta, hasMeta := p.tables[table]
 		if hasMeta && len(meta.PKColumns) > 0 {
-			pkCol := meta.PKColumns[0]
+			// Build SELECT list for all PK columns.
+			pkSelectParts := make([]string, len(meta.PKColumns))
+			for i, col := range meta.PKColumns {
+				pkSelectParts[i] = fmt.Sprintf("%q", col)
+			}
+			pkSelectList := strings.Join(pkSelectParts, ", ")
+
 			whereClause := extractWhereFromSQL(sqlStr)
 			var selectSQL string
 			if whereClause != "" {
-				selectSQL = fmt.Sprintf(`SELECT %q FROM %q WHERE %s`, pkCol, table, whereClause)
+				selectSQL = fmt.Sprintf(`SELECT %s FROM %q WHERE %s`, pkSelectList, table, whereClause)
 			} else {
-				selectSQL = fmt.Sprintf(`SELECT %q FROM %q`, pkCol, table)
+				selectSQL = fmt.Sprintf(`SELECT %s FROM %q`, pkSelectList, table)
 			}
 			if p.schemaRegistry != nil {
 				rewritten, skipProd := rewriteForProd(selectSQL, p.schemaRegistry, cl.Tables)
@@ -462,12 +551,27 @@ func (eh *ExtHandler) extHandleUpdateWithHydration(clientConn net.Conn, sqlStr s
 					if len(row) == 0 || !row[0].Valid {
 						continue
 					}
-					pk := row[0].String
+					// Build composite PK from all returned columns.
+					pkVals := make([]string, len(meta.PKColumns))
+					valid := true
+					for i := range meta.PKColumns {
+						if i < len(row) && row[i].Valid {
+							pkVals[i] = row[i].String
+						} else {
+							valid = false
+							break
+						}
+					}
+					if !valid {
+						continue
+					}
+					pk := core.SerializeCompositePK(meta.PKColumns, pkVals)
 					if p.deltaMap != nil && p.deltaMap.IsDelta(table, pk) {
 						continue
 					}
-					escapedPK := strings.ReplaceAll(pk, "'", "''")
-					hydrateSQL := fmt.Sprintf(`SELECT * FROM %q WHERE %q = '%s'`, table, pkCol, escapedPK)
+					pkMap := core.DeserializeCompositePK(pk, meta.PKColumns)
+					whereFragment := core.BuildCompositeWHERE(meta.PKColumns, pkMap, sqliteQuoteIdent, sqliteQuoteLiteral)
+					hydrateSQL := fmt.Sprintf(`SELECT * FROM %q WHERE %s`, table, whereFragment)
 					cols, rows, _, err := p.safeProdQuery(hydrateSQL, eh.connID)
 					if err != nil || len(rows) == 0 {
 						continue
@@ -527,13 +631,19 @@ func (eh *ExtHandler) extHandleDelete(clientConn net.Conn, sqlStr string, cl *co
 		table := cl.Tables[0]
 		meta, hasMeta := p.tables[table]
 		if hasMeta && len(meta.PKColumns) > 0 {
-			pkCol := meta.PKColumns[0]
+			// Build SELECT list for all PK columns.
+			pkSelectParts := make([]string, len(meta.PKColumns))
+			for i, col := range meta.PKColumns {
+				pkSelectParts[i] = fmt.Sprintf("%q", col)
+			}
+			pkSelectList := strings.Join(pkSelectParts, ", ")
+
 			whereClause := extractWhereFromSQL(sqlStr)
 			var selectSQL string
 			if whereClause != "" {
-				selectSQL = fmt.Sprintf(`SELECT %q FROM %q WHERE %s`, pkCol, table, whereClause)
+				selectSQL = fmt.Sprintf(`SELECT %s FROM %q WHERE %s`, pkSelectList, table, whereClause)
 			} else {
-				selectSQL = fmt.Sprintf(`SELECT %q FROM %q`, pkCol, table)
+				selectSQL = fmt.Sprintf(`SELECT %s FROM %q`, pkSelectList, table)
 			}
 			if p.schemaRegistry != nil {
 				rewritten, skipProd := rewriteForProd(selectSQL, p.schemaRegistry, cl.Tables)
@@ -550,7 +660,21 @@ func (eh *ExtHandler) extHandleDelete(clientConn net.Conn, sqlStr string, cl *co
 					if len(row) == 0 || !row[0].Valid {
 						continue
 					}
-					pk := row[0].String
+					// Build composite PK from all returned columns.
+					pkVals := make([]string, len(meta.PKColumns))
+					valid := true
+					for i := range meta.PKColumns {
+						if i < len(row) && row[i].Valid {
+							pkVals[i] = row[i].String
+						} else {
+							valid = false
+							break
+						}
+					}
+					if !valid {
+						continue
+					}
+					pk := core.SerializeCompositePK(meta.PKColumns, pkVals)
 					if inTxn {
 						p.tombstones.Stage(table, pk)
 					} else {
@@ -985,4 +1109,74 @@ func (eh *ExtHandler) clearBatch() {
 	eh.batchHasDesc = false
 	eh.batchHasExec = false
 	eh.batchMaxRows = 0
+}
+
+// sqliteQuoteIdent quotes an identifier with double quotes for SQLite.
+func sqliteQuoteIdent(s string) string {
+	return fmt.Sprintf("%q", s)
+}
+
+// sqliteQuoteLiteral quotes a string value with single quotes for SQLite,
+// escaping embedded single quotes.
+func sqliteQuoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// extractPKColumnIndices finds the positional indices of all PK columns in an
+// INSERT statement's column list. Returns the indices (in PK column order) and
+// the full column name list. If any PK column is missing, the returned indices
+// slice will be shorter than pkColumns.
+func extractPKColumnIndices(sqlStr string, pkColumns []string) ([]int, []string) {
+	parenStart := strings.Index(sqlStr, "(")
+	if parenStart < 0 {
+		return nil, nil
+	}
+	parenEnd := strings.Index(sqlStr[parenStart:], ")")
+	if parenEnd < 0 {
+		return nil, nil
+	}
+	parenEnd += parenStart
+	colList := sqlStr[parenStart+1 : parenEnd]
+	cols := strings.Split(colList, ",")
+	for i := range cols {
+		cols[i] = strings.TrimSpace(strings.Trim(strings.TrimSpace(cols[i]), `"`))
+	}
+
+	indices := make([]int, 0, len(pkColumns))
+	for _, pkCol := range pkColumns {
+		found := false
+		for i, col := range cols {
+			if strings.EqualFold(col, pkCol) {
+				indices = append(indices, i)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return indices, cols
+		}
+	}
+	return indices, cols
+}
+
+// extractInsertValueRows extracts the value tuples from an INSERT statement's
+// VALUES clause. Each returned slice element is the list of raw value strings
+// for one row (still possibly quoted/whitespaced).
+func extractInsertValueRows(sqlStr string) [][]string {
+	upper := strings.ToUpper(sqlStr)
+	valuesIdx := strings.Index(upper, "VALUES")
+	if valuesIdx < 0 {
+		return nil
+	}
+	valuesPart := sqlStr[valuesIdx+6:]
+
+	re := regexp.MustCompile(`\(([^)]+)\)`)
+	var rows [][]string
+	for _, m := range re.FindAllStringSubmatch(valuesPart, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		rows = append(rows, strings.Split(m[1], ","))
+	}
+	return rows
 }

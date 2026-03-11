@@ -5,9 +5,40 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	coreSchema "github.com/psrth/mori/internal/core/schema"
 )
+
+// isTransientError returns true if the error is a transient MSSQL error that
+// may succeed on retry (deadlocks, timeouts, throttling, etc.).
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "1205") ||
+		strings.Contains(s, "Error -2") || strings.Contains(s, "timeout") ||
+		strings.Contains(s, "40197") ||
+		strings.Contains(s, "40501") ||
+		strings.Contains(s, "49918") || strings.Contains(s, "49919") || strings.Contains(s, "49920") ||
+		strings.Contains(s, "Deadlock") || strings.Contains(s, "currently busy")
+}
+
+// retryOnTransientError retries fn up to maxAttempts times when a transient
+// error is returned. Non-transient errors are returned immediately.
+func retryOnTransientError(maxAttempts int, fn func() error) error {
+	var err error
+	for i := range maxAttempts {
+		if err = fn(); err == nil || !isTransientError(err) {
+			return err
+		}
+		if i < maxAttempts-1 {
+			time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+		}
+	}
+	return err
+}
 
 // DumpResult holds the complete result of an MSSQL schema dump and analysis.
 type DumpResult struct {
@@ -19,10 +50,15 @@ type DumpResult struct {
 // Unlike MySQL/PostgreSQL, MSSQL has no built-in dump tool, so we reconstruct
 // CREATE TABLE statements from INFORMATION_SCHEMA.
 func DumpSchema(ctx context.Context, db *sql.DB, dbName string) (string, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
-		 WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE'
-		 ORDER BY TABLE_NAME`)
+	var rows *sql.Rows
+	err := retryOnTransientError(3, func() error {
+		var qErr error
+		rows, qErr = db.QueryContext(ctx,
+			`SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+			 WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE'
+			 ORDER BY TABLE_NAME`)
+		return qErr
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to query tables: %w", err)
 	}
@@ -190,9 +226,14 @@ func StripForeignKeys(schemaSQL string) string {
 // DetectTableMetadata queries the MSSQL INFORMATION_SCHEMA for all user tables
 // and their PK info.
 func DetectTableMetadata(ctx context.Context, db *sql.DB) (map[string]TableMeta, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
-		 WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE'`)
+	var rows *sql.Rows
+	err := retryOnTransientError(3, func() error {
+		var qErr error
+		rows, qErr = db.QueryContext(ctx,
+			`SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+			 WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE'`)
+		return qErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query tables: %w", err)
 	}
@@ -212,7 +253,12 @@ func DetectTableMetadata(ctx context.Context, db *sql.DB) (map[string]TableMeta,
 
 	tables := make(map[string]TableMeta)
 	for _, tableName := range tableNames {
-		meta, err := detectTablePK(ctx, db, tableName)
+		var meta TableMeta
+		err := retryOnTransientError(3, func() error {
+			var pkErr error
+			meta, pkErr = detectTablePK(ctx, db, tableName)
+			return pkErr
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -395,7 +441,10 @@ func DetectIdentityOffsets(ctx context.Context, db *sql.DB, tables map[string]Ta
 		pkCol := meta.PKColumns[0]
 		var maxVal sql.NullInt64
 		query := fmt.Sprintf("SELECT MAX([%s]) FROM [%s]", pkCol, tableName)
-		if err := db.QueryRowContext(ctx, query).Scan(&maxVal); err != nil {
+		err := retryOnTransientError(3, func() error {
+			return db.QueryRowContext(ctx, query).Scan(&maxVal)
+		})
+		if err != nil {
 			return nil, fmt.Errorf("failed to get max PK for table %q: %w", tableName, err)
 		}
 
@@ -434,12 +483,17 @@ func ApplyIdentityOffsets(ctx context.Context, db *sql.DB, offsets map[string]in
 // them into the existing table metadata. These columns must be excluded from
 // hydration INSERTs because SQL Server rejects explicit values for computed columns.
 func DetectComputedColumns(ctx context.Context, db *sql.DB, tables map[string]TableMeta) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT t.name AS table_name, c.name AS column_name
-		FROM sys.computed_columns c
-		JOIN sys.tables t ON c.object_id = t.object_id
-		WHERE SCHEMA_NAME(t.schema_id) = 'dbo'
-		ORDER BY t.name, c.column_id`)
+	var rows *sql.Rows
+	err := retryOnTransientError(3, func() error {
+		var qErr error
+		rows, qErr = db.QueryContext(ctx, `
+			SELECT t.name AS table_name, c.name AS column_name
+			FROM sys.computed_columns c
+			JOIN sys.tables t ON c.object_id = t.object_id
+			WHERE SCHEMA_NAME(t.schema_id) = 'dbo'
+			ORDER BY t.name, c.column_id`)
+		return qErr
+	})
 	if err != nil {
 		// sys.computed_columns not available; ignore gracefully.
 		return
@@ -465,23 +519,28 @@ func DetectComputedColumns(ctx context.Context, db *sql.DB, tables map[string]Ta
 
 // DetectForeignKeys queries Prod for all foreign key constraints in the dbo schema.
 func DetectForeignKeys(ctx context.Context, db *sql.DB) ([]coreSchema.ForeignKey, error) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT
-			fk.name AS constraint_name,
-			tp.name AS child_table,
-			cp.name AS child_column,
-			tr.name AS parent_table,
-			cr.name AS parent_column,
-			fk.delete_referential_action_desc AS delete_rule,
-			fk.update_referential_action_desc AS update_rule,
-			fkc.constraint_column_id AS ordinal
-		FROM sys.foreign_keys fk
-		JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
-		JOIN sys.tables tp ON fkc.parent_object_id = tp.object_id
-		JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
-		JOIN sys.tables tr ON fkc.referenced_object_id = tr.object_id
-		JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
-		ORDER BY fk.name, fkc.constraint_column_id`)
+	var rows *sql.Rows
+	err := retryOnTransientError(3, func() error {
+		var qErr error
+		rows, qErr = db.QueryContext(ctx, `
+			SELECT
+				fk.name AS constraint_name,
+				tp.name AS child_table,
+				cp.name AS child_column,
+				tr.name AS parent_table,
+				cr.name AS parent_column,
+				fk.delete_referential_action_desc AS delete_rule,
+				fk.update_referential_action_desc AS update_rule,
+				fkc.constraint_column_id AS ordinal
+			FROM sys.foreign_keys fk
+			JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+			JOIN sys.tables tp ON fkc.parent_object_id = tp.object_id
+			JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+			JOIN sys.tables tr ON fkc.referenced_object_id = tr.object_id
+			JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+			ORDER BY fk.name, fkc.constraint_column_id`)
+		return qErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to query foreign keys: %w", err)
 	}

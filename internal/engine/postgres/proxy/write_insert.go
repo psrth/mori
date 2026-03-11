@@ -71,7 +71,6 @@ func (w *WriteHandler) handleInsertReturning(
 ) error {
 	table := cl.Tables[0]
 	meta := w.tables[table]
-	pkCol := meta.PKColumns[0]
 
 	// Capture the full response from Shadow.
 	msgs, err := forwardAndCapture(rawMsg, w.shadowConn)
@@ -80,7 +79,7 @@ func (w *WriteHandler) handleInsertReturning(
 	}
 
 	// Parse the response to find PK column values in RETURNING data.
-	var pkIdx int = -1
+	pkIndices := make(map[string]int, len(meta.PKColumns))
 	var returnedPKs []string
 
 	for _, msg := range msgs {
@@ -88,18 +87,32 @@ func (w *WriteHandler) handleInsertReturning(
 		case 'T': // RowDescription
 			cols, parseErr := parseRowDescription(msg.Payload)
 			if parseErr == nil {
-				for i, col := range cols {
-					if col.Name == pkCol {
-						pkIdx = i
-						break
+				for _, pkc := range meta.PKColumns {
+					for i, col := range cols {
+						if col.Name == pkc {
+							pkIndices[pkc] = i
+							break
+						}
 					}
 				}
 			}
 		case 'D': // DataRow
-			if pkIdx >= 0 {
+			if len(pkIndices) == len(meta.PKColumns) {
 				vals, nulls, parseErr := parseDataRow(msg.Payload)
-				if parseErr == nil && pkIdx < len(vals) && !nulls[pkIdx] {
-					returnedPKs = append(returnedPKs, string(vals[pkIdx]))
+				if parseErr == nil {
+					hasNull := false
+					pkVals := make([]string, len(meta.PKColumns))
+					for j, pkc := range meta.PKColumns {
+						idx := pkIndices[pkc]
+						if idx >= len(vals) || nulls[idx] {
+							hasNull = true
+							break
+						}
+						pkVals[j] = string(vals[idx])
+					}
+					if !hasNull {
+						returnedPKs = append(returnedPKs, core.SerializeCompositePK(meta.PKColumns, pkVals))
+					}
 				}
 			}
 		}
@@ -200,7 +213,13 @@ func (w *WriteHandler) handleUpsert(
 	// For each inserted row, check if the conflict key exists in Prod.
 	hydratedCount := 0
 	var affectedPKs []string
-	pkCol := meta.PKColumns[0]
+
+	// Build SELECT list for all PK columns.
+	pkSelectCols := make([]string, len(meta.PKColumns))
+	for i, pkc := range meta.PKColumns {
+		pkSelectCols[i] = quoteIdent(pkc)
+	}
+	pkSelectList := strings.Join(pkSelectCols, ", ")
 
 	for _, row := range insertedRows {
 		// Build a WHERE clause from the conflict target columns and values.
@@ -212,13 +231,22 @@ func (w *WriteHandler) handleUpsert(
 		// Check if this row is already tracked in delta map by querying
 		// Shadow for the conflict key.
 		checkSQL := fmt.Sprintf("SELECT %s FROM %s WHERE %s LIMIT 1",
-			quoteIdent(pkCol), quoteIdent(table), whereClause)
+			pkSelectList, quoteIdent(table), whereClause)
 		shadowResult, err := execQuery(w.shadowConn, checkSQL)
 		if err == nil && shadowResult.Error == "" && len(shadowResult.RowValues) > 0 {
 			// Row already exists in Shadow — conflict will fire correctly.
 			// Track the PK for delta map.
-			if len(shadowResult.RowValues[0]) > 0 {
-				affectedPKs = append(affectedPKs, shadowResult.RowValues[0][0])
+			if len(shadowResult.RowValues[0]) >= len(meta.PKColumns) {
+				pkVals := make([]string, len(meta.PKColumns))
+				for j, pkc := range meta.PKColumns {
+					for ci, col := range shadowResult.Columns {
+						if col.Name == pkc {
+							pkVals[j] = shadowResult.RowValues[0][ci]
+							break
+						}
+					}
+				}
+				affectedPKs = append(affectedPKs, core.SerializeCompositePK(meta.PKColumns, pkVals))
 			}
 			continue
 		}
@@ -244,16 +272,30 @@ func (w *WriteHandler) handleUpsert(
 			continue
 		}
 
-		// Find PK value in the Prod result for delta tracking.
-		pkIdx := -1
-		for i, col := range prodResult.Columns {
-			if col.Name == pkCol {
-				pkIdx = i
-				break
+		// Find PK values in the Prod result for delta tracking.
+		pkIndices := make(map[string]int, len(meta.PKColumns))
+		for _, pkc := range meta.PKColumns {
+			for i, col := range prodResult.Columns {
+				if col.Name == pkc {
+					pkIndices[pkc] = i
+					break
+				}
 			}
 		}
-		if pkIdx >= 0 && !prodResult.RowNulls[0][pkIdx] {
-			affectedPKs = append(affectedPKs, prodResult.RowValues[0][pkIdx])
+		if len(pkIndices) == len(meta.PKColumns) {
+			hasNull := false
+			pkVals := make([]string, len(meta.PKColumns))
+			for j, pkc := range meta.PKColumns {
+				idx := pkIndices[pkc]
+				if prodResult.RowNulls[0][idx] {
+					hasNull = true
+					break
+				}
+				pkVals[j] = prodResult.RowValues[0][idx]
+			}
+			if !hasNull {
+				affectedPKs = append(affectedPKs, core.SerializeCompositePK(meta.PKColumns, pkVals))
+			}
 		}
 
 		// Hydrate: insert the Prod row into Shadow, skipping generated columns.
@@ -329,7 +371,6 @@ func (w *WriteHandler) handleUpsertReturning(
 ) error {
 	table := cl.Tables[0]
 	meta := w.tables[table]
-	pkCol := meta.PKColumns[0]
 
 	// Capture the full response from Shadow.
 	msgs, err := forwardAndCapture(rawMsg, w.shadowConn)
@@ -338,7 +379,7 @@ func (w *WriteHandler) handleUpsertReturning(
 	}
 
 	// Parse response for PK values.
-	var pkIdx int = -1
+	pkIndices := make(map[string]int, len(meta.PKColumns))
 	var returnedPKs []string
 
 	for _, msg := range msgs {
@@ -346,18 +387,32 @@ func (w *WriteHandler) handleUpsertReturning(
 		case 'T':
 			cols, parseErr := parseRowDescription(msg.Payload)
 			if parseErr == nil {
-				for i, col := range cols {
-					if col.Name == pkCol {
-						pkIdx = i
-						break
+				for _, pkc := range meta.PKColumns {
+					for i, col := range cols {
+						if col.Name == pkc {
+							pkIndices[pkc] = i
+							break
+						}
 					}
 				}
 			}
 		case 'D':
-			if pkIdx >= 0 {
+			if len(pkIndices) == len(meta.PKColumns) {
 				vals, nulls, parseErr := parseDataRow(msg.Payload)
-				if parseErr == nil && pkIdx < len(vals) && !nulls[pkIdx] {
-					returnedPKs = append(returnedPKs, string(vals[pkIdx]))
+				if parseErr == nil {
+					hasNull := false
+					pkVals := make([]string, len(meta.PKColumns))
+					for j, pkc := range meta.PKColumns {
+						idx := pkIndices[pkc]
+						if idx >= len(vals) || nulls[idx] {
+							hasNull = true
+							break
+						}
+						pkVals[j] = string(vals[idx])
+					}
+					if !hasNull {
+						returnedPKs = append(returnedPKs, core.SerializeCompositePK(meta.PKColumns, pkVals))
+					}
 				}
 			}
 		}

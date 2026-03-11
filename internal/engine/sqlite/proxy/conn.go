@@ -2175,6 +2175,22 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 			}
 		}
 
+	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, " RENAME TO ") && !strings.Contains(upper, "RENAME COLUMN"):
+		oldName, newName := parseAlterRenameTable(sqlStr, cl)
+		if oldName != "" && newName != "" {
+			p.schemaRegistry.RemoveTable(oldName)
+			p.schemaRegistry.RecordNewTable(newName)
+			if p.deltaMap != nil {
+				p.deltaMap.RenameTable(oldName, newName)
+			}
+			if p.tombstones != nil {
+				p.tombstones.RenameTable(oldName, newName)
+			}
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: RENAME TABLE %s → %s", connID, oldName, newName)
+			}
+		}
+
 	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "RENAME COLUMN"):
 		table, oldName, newName := parseAlterRenameColumn(sqlStr)
 		if table != "" && oldName != "" && newName != "" {
@@ -2248,6 +2264,23 @@ func parseAlterDropColumn(sqlStr string) (table, col string) {
 		return strings.Trim(m[1], `"`), strings.Trim(m[2], `"`)
 	}
 	return "", ""
+}
+
+// parseAlterRenameTable extracts the old and new table names from
+// "ALTER TABLE <old> RENAME TO <new>".
+func parseAlterRenameTable(sqlStr string, cl *core.Classification) (oldName, newName string) {
+	// Try to get old name from classification tables first.
+	if cl != nil && len(cl.Tables) > 0 {
+		oldName = cl.Tables[0]
+	}
+	re := regexp.MustCompile(`(?i)ALTER\s+TABLE\s+("?\w+"?)\s+RENAME\s+TO\s+("?\w+"?)`)
+	if m := re.FindStringSubmatch(sqlStr); len(m) > 2 {
+		if oldName == "" {
+			oldName = strings.Trim(m[1], `"`)
+		}
+		newName = strings.Trim(m[2], `"`)
+	}
+	return oldName, newName
 }
 
 func parseAlterRenameColumn(sqlStr string) (table, oldName, newName string) {

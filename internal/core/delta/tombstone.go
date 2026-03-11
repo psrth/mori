@@ -39,6 +39,10 @@ func (t *TombstoneSet) AnyTableTombstone(tables []string) bool {
 // ClearTable removes all tombstone entries for the given table.
 func (t *TombstoneSet) ClearTable(table string) { t.s.clearTable(table) }
 
+// RenameTable moves all tombstone entries from oldName to newName.
+// If newName already has entries, the two sets are merged.
+func (t *TombstoneSet) RenameTable(oldName, newName string) { t.s.renameTable(oldName, newName) }
+
 // Stage adds (table, pk) to the per-transaction staging buffer.
 func (t *TombstoneSet) Stage(table, pk string) { t.s.stage(table, pk) }
 

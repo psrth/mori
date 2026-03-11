@@ -88,6 +88,7 @@ func isLockConflict(err error) bool {
 	}
 	s := err.Error()
 	return strings.Contains(s, "1205") || strings.Contains(s, "1213") ||
+		strings.Contains(s, "2013") || strings.Contains(s, "1040") ||
 		strings.Contains(s, "Lock wait timeout") || strings.Contains(s, "Deadlock")
 }
 
@@ -120,7 +121,12 @@ func DetectTableMetadata(ctx context.Context, db *sql.DB, dbName string) (map[st
 
 	tables := make(map[string]TableMeta)
 	for _, tableName := range tableNames {
-		meta, err := detectTablePK(ctx, db, dbName, tableName)
+		var meta TableMeta
+		err := retryOnLockConflict(func() error {
+			var e error
+			meta, e = detectTablePK(ctx, db, dbName, tableName)
+			return e
+		}, 5)
 		if err != nil {
 			return nil, err
 		}

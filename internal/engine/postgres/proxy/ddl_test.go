@@ -129,6 +129,43 @@ func TestParseDDLChangesRenameColumn(t *testing.T) {
 	}
 }
 
+func TestParseDDLChangesRenameTable(t *testing.T) {
+	changes, err := parseDDLChanges("ALTER TABLE users RENAME TO customers")
+	if err != nil {
+		t.Fatalf("parseDDLChanges() error: %v", err)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("got %d changes, want 1", len(changes))
+	}
+	ch := changes[0]
+	if ch.Kind != ddlRenameTable {
+		t.Errorf("Kind = %d, want ddlRenameTable", ch.Kind)
+	}
+	if ch.OldName != "users" {
+		t.Errorf("OldName = %q, want %q", ch.OldName, "users")
+	}
+	if ch.NewName != "customers" {
+		t.Errorf("NewName = %q, want %q", ch.NewName, "customers")
+	}
+}
+
+func TestParseDDLChangesRenameTableSchemaQualified(t *testing.T) {
+	changes, err := parseDDLChanges("ALTER TABLE public.users RENAME TO customers")
+	if err != nil {
+		t.Fatalf("parseDDLChanges() error: %v", err)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("got %d changes, want 1", len(changes))
+	}
+	ch := changes[0]
+	if ch.Kind != ddlRenameTable {
+		t.Errorf("Kind = %d, want ddlRenameTable", ch.Kind)
+	}
+	if ch.NewName != "customers" {
+		t.Errorf("NewName = %q, want %q", ch.NewName, "customers")
+	}
+}
+
 func TestParseDDLChangesMultipleCommands(t *testing.T) {
 	changes, err := parseDDLChanges("ALTER TABLE users ADD COLUMN phone TEXT, DROP COLUMN fax")
 	if err != nil {

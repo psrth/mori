@@ -38,6 +38,24 @@ func (m *Map) ClearTable(table string) {
 	m.insertMu.Unlock()
 }
 
+// RenameTable moves all delta entries and insert counts from oldName to newName.
+// If newName already has entries, the two sets are merged.
+func (m *Map) RenameTable(oldName, newName string) {
+	m.s.renameTable(oldName, newName)
+	m.insertMu.Lock()
+	if count, ok := m.insertedTables[oldName]; ok {
+		m.insertedTables[newName] += count
+		delete(m.insertedTables, oldName)
+	}
+	if m.stagedInserts != nil {
+		if count, ok := m.stagedInserts[oldName]; ok {
+			m.stagedInserts[newName] += count
+			delete(m.stagedInserts, oldName)
+		}
+	}
+	m.insertMu.Unlock()
+}
+
 // IsDelta reports whether (table, pk) has been modified in Shadow.
 func (m *Map) IsDelta(table, pk string) bool { return m.s.has(table, pk) }
 

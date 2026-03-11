@@ -604,6 +604,23 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 			}
 		}
 
+	// Table rename via sp_rename (must be checked before column rename).
+	case reSpRenameTable.MatchString(sqlStr) && !reSpRename.MatchString(sqlStr):
+		oldName, newName := parseMSSQLSpRenameTable(sqlStr)
+		if oldName != "" && newName != "" {
+			p.schemaRegistry.RemoveTable(oldName)
+			p.schemaRegistry.RecordNewTable(newName)
+			if p.deltaMap != nil {
+				p.deltaMap.RenameTable(oldName, newName)
+			}
+			if p.tombstones != nil {
+				p.tombstones.RenameTable(oldName, newName)
+			}
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: RENAME TABLE %s -> %s", connID, oldName, newName)
+			}
+		}
+
 	// P1 §2.7: sp_rename column tracking.
 	case reSpRename.MatchString(sqlStr):
 		table, oldName, newName := parseMSSQLSpRename(sqlStr)
@@ -674,6 +691,9 @@ func parseMSSQLAlterDropColumn(sql string) (table, col string) {
 // Regex for sp_rename 't.old_col', 'new_col', 'COLUMN'
 var reSpRename = regexp.MustCompile(`(?i)(?:EXEC(?:UTE)?\s+)?SP_RENAME\s+'([^']+)'\s*,\s*'([^']+)'\s*,\s*'COLUMN'`)
 
+// Regex for sp_rename table renames (without 'COLUMN' third arg, or with 'OBJECT').
+var reSpRenameTable = regexp.MustCompile(`(?i)(?:EXEC(?:UTE)?\s+)?SP_RENAME\s+'([^']+)'\s*,\s*'([^']+)'\s*(?:,\s*'OBJECT')?\s*$`)
+
 // parseMSSQLSpRename parses "EXEC sp_rename 't.old', 'new', 'COLUMN'" for column renaming.
 func parseMSSQLSpRename(sql string) (table, oldName, newName string) {
 	m := reSpRename.FindStringSubmatch(sql)
@@ -693,6 +713,28 @@ func parseMSSQLSpRename(sql string) (table, oldName, newName string) {
 	}
 	newName = strings.ToLower(strings.Trim(m[2], "[]"))
 	return table, oldName, newName
+}
+
+// parseMSSQLSpRenameTable parses "EXEC sp_rename 'old_table', 'new_table'" for table renaming.
+func parseMSSQLSpRenameTable(sql string) (oldName, newName string) {
+	m := reSpRenameTable.FindStringSubmatch(sql)
+	if len(m) < 3 {
+		return "", ""
+	}
+	// First arg may be "schema.table" or just "table".
+	parts := strings.Split(m[1], ".")
+	switch len(parts) {
+	case 1:
+		oldName = strings.ToLower(strings.Trim(parts[0], "[]"))
+	case 2:
+		oldName = strings.ToLower(strings.Trim(parts[1], "[]"))
+	case 3:
+		oldName = strings.ToLower(strings.Trim(parts[2], "[]"))
+	default:
+		return "", ""
+	}
+	newName = strings.ToLower(strings.Trim(m[2], "[]"))
+	return oldName, newName
 }
 
 // Regex for ALTER TABLE ... ALTER COLUMN col newtype

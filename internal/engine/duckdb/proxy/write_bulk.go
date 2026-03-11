@@ -23,7 +23,7 @@ func (p *Proxy) handleBulkUpdate(sqlStr string, cl *core.Classification, connID 
 	if !ok || len(meta.PKColumns) == 0 {
 		return p.executeQuery(p.shadowDB, sqlStr, connID)
 	}
-	pkCol := meta.PKColumns[0]
+	pkCols := meta.PKColumns
 
 	// 1. Build a SELECT query to discover matching rows from Prod.
 	selectSQL := buildBulkUpdateSelect(sqlStr, table)
@@ -31,14 +31,14 @@ func (p *Proxy) handleBulkUpdate(sqlStr string, cl *core.Classification, connID 
 		if p.verbose {
 			log.Printf("[conn %d] bulk UPDATE: failed to build hydration query, executing on shadow only", connID)
 		}
-		return p.shadowOnlyUpdateWithTracking(sqlStr, table, pkCol, connID, txh)
+		return p.shadowOnlyUpdateWithTracking(sqlStr, table, pkCols[0], connID, txh)
 	}
 
 	// Rewrite for Prod compatibility.
 	if p.schemaRegistry != nil {
 		rewritten, skipProd := rewriteSQLForProd(selectSQL, p.schemaRegistry, cl.Tables)
 		if skipProd {
-			return p.shadowOnlyUpdateWithTracking(sqlStr, table, pkCol, connID, txh)
+			return p.shadowOnlyUpdateWithTracking(sqlStr, table, pkCols[0], connID, txh)
 		}
 		selectSQL = rewritten
 	}
@@ -56,16 +56,19 @@ func (p *Proxy) handleBulkUpdate(sqlStr string, cl *core.Classification, connID 
 		if p.verbose {
 			log.Printf("[conn %d] bulk UPDATE: Prod query failed: %v", connID, err)
 		}
-		return p.shadowOnlyUpdateWithTracking(sqlStr, table, pkCol, connID, txh)
+		return p.shadowOnlyUpdateWithTracking(sqlStr, table, pkCols[0], connID, txh)
 	}
 
-	// 3. Find PK column index.
-	pkIdx := findColIdx(cols, pkCol)
-	if pkIdx < 0 {
-		if p.verbose {
-			log.Printf("[conn %d] bulk UPDATE: PK column %q not in results", connID, pkCol)
+	// 3. Find PK column indices.
+	pkIdxs := make([]int, len(pkCols))
+	for i, col := range pkCols {
+		pkIdxs[i] = findColIdx(cols, col)
+		if pkIdxs[i] < 0 {
+			if p.verbose {
+				log.Printf("[conn %d] bulk UPDATE: PK column %q not in results", connID, col)
+			}
+			return p.executeQuery(p.shadowDB, sqlStr, connID)
 		}
-		return p.executeQuery(p.shadowDB, sqlStr, connID)
 	}
 
 	// 4. Hydrate each matching row into Shadow.
@@ -84,10 +87,21 @@ func (p *Proxy) handleBulkUpdate(sqlStr string, cl *core.Classification, connID 
 			}
 			break
 		}
-		if pkIdx >= len(row) || !row[pkIdx].Valid {
+
+		// Extract all PK column values.
+		pkVals := make([]string, len(pkCols))
+		valid := true
+		for j, idx := range pkIdxs {
+			if idx >= len(row) || !row[idx].Valid {
+				valid = false
+				break
+			}
+			pkVals[j] = row[idx].String
+		}
+		if !valid {
 			continue
 		}
-		pk := row[pkIdx].String
+		pk := core.SerializeCompositePK(pkCols, pkVals)
 
 		if p.deltaMap.IsDelta(table, pk) {
 			affectedPKs = append(affectedPKs, pk)
@@ -141,10 +155,11 @@ func (p *Proxy) handleBulkDelete(sqlStr string, cl *core.Classification, connID 
 	if !ok || len(meta.PKColumns) == 0 {
 		return p.executeQuery(p.shadowDB, sqlStr, connID)
 	}
-	pkCol := meta.PKColumns[0]
+	pkCols := meta.PKColumns
 
 	// 1. Build SELECT to discover matching PKs from Prod.
-	selectSQL := buildBulkDeleteSelect(sqlStr, table, pkCol)
+	// Select all PK columns for composite PK support.
+	selectSQL := buildBulkDeleteSelectMulti(sqlStr, table, pkCols)
 	if selectSQL == "" {
 		return p.executeQuery(p.shadowDB, sqlStr, connID)
 	}
@@ -174,16 +189,28 @@ func (p *Proxy) handleBulkDelete(sqlStr string, cl *core.Classification, connID 
 		return p.executeQuery(p.shadowDB, sqlStr, connID)
 	}
 
-	pkIdx := findColIdx(cols, pkCol)
-	if pkIdx < 0 {
-		return p.executeQuery(p.shadowDB, sqlStr, connID)
+	pkIdxs := make([]int, len(pkCols))
+	for i, col := range pkCols {
+		pkIdxs[i] = findColIdx(cols, col)
+		if pkIdxs[i] < 0 {
+			return p.executeQuery(p.shadowDB, sqlStr, connID)
+		}
 	}
 
 	// 3. Collect PKs to tombstone.
 	var prodPKs []string
 	for _, row := range rows {
-		if pkIdx < len(row) && row[pkIdx].Valid {
-			prodPKs = append(prodPKs, row[pkIdx].String)
+		pkVals := make([]string, len(pkCols))
+		valid := true
+		for j, idx := range pkIdxs {
+			if idx >= len(row) || !row[idx].Valid {
+				valid = false
+				break
+			}
+			pkVals[j] = row[idx].String
+		}
+		if valid {
+			prodPKs = append(prodPKs, core.SerializeCompositePK(pkCols, pkVals))
 		}
 	}
 
@@ -191,12 +218,29 @@ func (p *Proxy) handleBulkDelete(sqlStr string, cl *core.Classification, connID 
 	resp := p.executeQuery(p.shadowDB, sqlStr, connID)
 
 	// 5. Query Shadow for PKs that still exist (were deleted from Shadow).
-	shadowPKSQL := fmt.Sprintf(`SELECT "%s" FROM "%s"`, pkCol, table)
-	_, shadowRows, _, _ := queryToRows(p.shadowDB, shadowPKSQL)
+	shadowPKSelectCols := make([]string, len(pkCols))
+	for i, col := range pkCols {
+		shadowPKSelectCols[i] = fmt.Sprintf(`"%s"`, col)
+	}
+	shadowPKSQL := fmt.Sprintf(`SELECT %s FROM "%s"`, strings.Join(shadowPKSelectCols, ", "), table)
+	shadowCols, shadowRows, _, _ := queryToRows(p.shadowDB, shadowPKSQL)
+	shadowPKIdxs := make([]int, len(pkCols))
+	for i, col := range pkCols {
+		shadowPKIdxs[i] = findColIdx(shadowCols, col)
+	}
 	shadowPKSet := make(map[string]bool)
 	for _, row := range shadowRows {
-		if len(row) > 0 && row[0].Valid {
-			shadowPKSet[row[0].String] = true
+		pkVals := make([]string, len(pkCols))
+		valid := true
+		for j, idx := range shadowPKIdxs {
+			if idx < 0 || idx >= len(row) || !row[idx].Valid {
+				valid = false
+				break
+			}
+			pkVals[j] = row[idx].String
+		}
+		if valid {
+			shadowPKSet[core.SerializeCompositePK(pkCols, pkVals)] = true
 		}
 	}
 
@@ -263,12 +307,23 @@ func buildBulkUpdateSelect(updateSQL, table string) string {
 
 // buildBulkDeleteSelect builds a SELECT pk FROM table WHERE ... from a DELETE statement.
 func buildBulkDeleteSelect(deleteSQL, table, pkCol string) string {
+	return buildBulkDeleteSelectMulti(deleteSQL, table, []string{pkCol})
+}
+
+// buildBulkDeleteSelectMulti builds a SELECT with all PK columns from a DELETE statement.
+func buildBulkDeleteSelectMulti(deleteSQL, table string, pkCols []string) string {
 	upper := strings.ToUpper(strings.TrimSpace(deleteSQL))
+
+	quotedCols := make([]string, len(pkCols))
+	for i, col := range pkCols {
+		quotedCols[i] = fmt.Sprintf(`"%s"`, col)
+	}
+	selectCols := strings.Join(quotedCols, ", ")
 
 	whereIdx := strings.Index(upper, " WHERE ")
 	if whereIdx < 0 {
 		// No WHERE — select all PKs.
-		return fmt.Sprintf(`SELECT "%s" FROM "%s"`, pkCol, table)
+		return fmt.Sprintf(`SELECT %s FROM "%s"`, selectCols, table)
 	}
 
 	whereClause := strings.TrimSpace(deleteSQL[whereIdx+7:])
@@ -278,7 +333,7 @@ func buildBulkDeleteSelect(deleteSQL, table, pkCol string) string {
 	returningRe := regexp.MustCompile(`(?i)\s+RETURNING\s+.*$`)
 	whereClause = returningRe.ReplaceAllString(whereClause, "")
 
-	return fmt.Sprintf(`SELECT "%s" FROM "%s" WHERE %s`, pkCol, table, whereClause)
+	return fmt.Sprintf(`SELECT %s FROM "%s" WHERE %s`, selectCols, table, whereClause)
 }
 
 // findColIdx finds the index of a column by name (case-insensitive).

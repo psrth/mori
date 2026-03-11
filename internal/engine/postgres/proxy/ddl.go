@@ -152,6 +152,20 @@ func (dh *DDLHandler) applyChange(ch ddlChange) {
 			log.Printf("[conn %d] schema registry: CREATE TABLE %s", dh.connID, ch.Table)
 		}
 		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("CREATE TABLE %s", ch.Table))
+
+	case ddlRenameTable:
+		dh.schemaRegistry.RemoveTable(ch.OldName)
+		dh.schemaRegistry.RecordNewTable(ch.NewName)
+		if dh.deltaMap != nil {
+			dh.deltaMap.RenameTable(ch.OldName, ch.NewName)
+		}
+		if dh.tombstones != nil {
+			dh.tombstones.RenameTable(ch.OldName, ch.NewName)
+		}
+		if dh.verbose {
+			log.Printf("[conn %d] schema registry: RENAME TABLE %s -> %s", dh.connID, ch.OldName, ch.NewName)
+		}
+		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("RENAME TABLE %s -> %s", ch.OldName, ch.NewName))
 	}
 }
 

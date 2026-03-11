@@ -999,6 +999,16 @@ func (p *Proxy) trackWriteEffects(cl *core.Classification, strategy core.Routing
 			prefix := classify.KeyPrefix(key)
 			p.deltaMap.Add(prefix, key)
 		}
+		// After RENAME/RENAMENX, the source key no longer exists — remove it
+		// from the delta map to avoid orphaned entries.
+		if len(args) >= 3 {
+			cmdName := strings.ToUpper(args[0])
+			if cmdName == "RENAME" || cmdName == "RENAMENX" {
+				sourceKey := args[1]
+				sourcePrefix := classify.KeyPrefix(sourceKey)
+				p.deltaMap.Remove(sourcePrefix, sourceKey)
+			}
+		}
 		if err := delta.WriteDeltaMap(p.moriDir, p.deltaMap); err != nil {
 			if p.verbose {
 				log.Printf("[conn %d] failed to persist delta map: %v", connID, err)

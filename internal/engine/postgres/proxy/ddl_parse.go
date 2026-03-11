@@ -16,6 +16,7 @@ const (
 	ddlAlterType
 	ddlDropTable
 	ddlCreateTable
+	ddlRenameTable
 )
 
 type ddlChange struct {
@@ -188,24 +189,37 @@ func parseAlterColumnType(table string, cmd *pg_query.AlterTableCmd) (*ddlChange
 	}, nil
 }
 
-// parseRenameStmt extracts column rename changes. Only handles column renames;
-// table/index/etc. renames are ignored.
+// parseRenameStmt extracts column and table rename changes. Handles column
+// renames (ALTER TABLE ... RENAME COLUMN) and table renames (ALTER TABLE ...
+// RENAME TO). Other rename types (index, etc.) are ignored.
 func parseRenameStmt(stmt *pg_query.RenameStmt) ([]ddlChange, error) {
-	if stmt.GetRenameType() != pg_query.ObjectType_OBJECT_COLUMN {
+	switch stmt.GetRenameType() {
+	case pg_query.ObjectType_OBJECT_COLUMN:
+		table := rangeVarName(stmt.GetRelation())
+		if table == "" {
+			return nil, nil
+		}
+		return []ddlChange{{
+			Kind:    ddlRenameColumn,
+			Table:   table,
+			OldName: stmt.GetSubname(),
+			NewName: stmt.GetNewname(),
+		}}, nil
+
+	case pg_query.ObjectType_OBJECT_TABLE:
+		oldName := rangeVarName(stmt.GetRelation())
+		if oldName == "" {
+			return nil, nil
+		}
+		return []ddlChange{{
+			Kind:    ddlRenameTable,
+			OldName: oldName,
+			NewName: stmt.GetNewname(),
+		}}, nil
+
+	default:
 		return nil, nil
 	}
-
-	table := rangeVarName(stmt.GetRelation())
-	if table == "" {
-		return nil, nil
-	}
-
-	return []ddlChange{{
-		Kind:    ddlRenameColumn,
-		Table:   table,
-		OldName: stmt.GetSubname(),
-		NewName: stmt.GetNewname(),
-	}}, nil
 }
 
 // parseDropStmt extracts table drop changes. Only handles DROP TABLE;

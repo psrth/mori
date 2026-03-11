@@ -177,6 +177,79 @@ func TestPKSetSnapshotAndLoad(t *testing.T) {
 	}
 }
 
+func TestPKSetRenameTable(t *testing.T) {
+	s := newPKSet()
+	s.add("users", "1")
+	s.add("users", "2")
+	s.add("orders", "10")
+
+	s.renameTable("users", "customers")
+
+	// Old name should be gone.
+	if s.has("customers", "1") == false {
+		t.Error("has(customers, 1) = false after rename, want true")
+	}
+	if s.has("customers", "2") == false {
+		t.Error("has(customers, 2) = false after rename, want true")
+	}
+	if s.has("users", "1") {
+		t.Error("has(users, 1) = true after rename, want false")
+	}
+	// Other tables untouched.
+	if !s.has("orders", "10") {
+		t.Error("has(orders, 10) = false, want true")
+	}
+}
+
+func TestPKSetRenameTableMerge(t *testing.T) {
+	s := newPKSet()
+	s.add("old_t", "1")
+	s.add("old_t", "2")
+	s.add("new_t", "3")
+
+	s.renameTable("old_t", "new_t")
+
+	// All entries should be merged under new_t.
+	if got := s.countForTable("new_t"); got != 3 {
+		t.Errorf("countForTable(new_t) = %d after merge, want 3", got)
+	}
+	if s.countForTable("old_t") != 0 {
+		t.Error("old_t still has entries after rename")
+	}
+}
+
+func TestPKSetRenameTableWithStaged(t *testing.T) {
+	s := newPKSet()
+	s.add("users", "1")
+	s.stage("users", "2")
+
+	s.renameTable("users", "customers")
+
+	// Committed entry should be under new name.
+	pks := s.pks("customers")
+	if len(pks) != 1 || pks[0] != "1" {
+		t.Errorf("pks(customers) = %v, want [1]", pks)
+	}
+	// Staged entry should also be visible under new name.
+	if !s.has("customers", "2") {
+		t.Error("staged entry not visible under new name")
+	}
+	// Old name should be empty.
+	if s.has("users", "1") || s.has("users", "2") {
+		t.Error("old name still has entries after rename")
+	}
+}
+
+func TestPKSetRenameTableNonExistent(t *testing.T) {
+	s := newPKSet()
+	s.add("users", "1")
+	// Renaming a table that doesn't exist should be a no-op.
+	s.renameTable("missing", "other")
+	if !s.has("users", "1") {
+		t.Error("existing entries affected by no-op rename")
+	}
+}
+
 func TestPKSetConcurrentAccess(t *testing.T) {
 	s := newPKSet()
 	var wg sync.WaitGroup

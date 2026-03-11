@@ -105,6 +105,61 @@ func TestMapTables(t *testing.T) {
 	}
 }
 
+func TestMapRenameTable(t *testing.T) {
+	m := NewMap()
+	m.Add("users", "1")
+	m.Add("users", "2")
+	m.AddInsertCount("users", 5)
+
+	m.RenameTable("users", "customers")
+
+	// Delta entries moved.
+	if !m.IsDelta("customers", "1") || !m.IsDelta("customers", "2") {
+		t.Error("delta entries not moved to new name")
+	}
+	if m.IsDelta("users", "1") || m.IsDelta("users", "2") {
+		t.Error("delta entries still under old name")
+	}
+	// Insert count moved.
+	if got := m.InsertCountForTable("customers"); got != 5 {
+		t.Errorf("InsertCountForTable(customers) = %d, want 5", got)
+	}
+	if m.HasInserts("users") {
+		t.Error("old table still has insert count after rename")
+	}
+}
+
+func TestMapRenameTableMerge(t *testing.T) {
+	m := NewMap()
+	m.Add("old_t", "1")
+	m.AddInsertCount("old_t", 3)
+	m.Add("new_t", "2")
+	m.AddInsertCount("new_t", 7)
+
+	m.RenameTable("old_t", "new_t")
+
+	if got := m.CountForTable("new_t"); got != 2 {
+		t.Errorf("CountForTable(new_t) = %d, want 2", got)
+	}
+	if got := m.InsertCountForTable("new_t"); got != 10 {
+		t.Errorf("InsertCountForTable(new_t) = %d, want 10", got)
+	}
+}
+
+func TestMapRenameTableWithStagedInserts(t *testing.T) {
+	m := NewMap()
+	m.Add("users", "1")
+	m.StageInsertCount("users", 3)
+
+	m.RenameTable("users", "customers")
+
+	// Staged inserts should also be moved.
+	m.CommitInsertCounts()
+	if got := m.InsertCountForTable("customers"); got != 3 {
+		t.Errorf("InsertCountForTable(customers) = %d after commit, want 3", got)
+	}
+}
+
 func TestMapSnapshotAndLoad(t *testing.T) {
 	m := NewMap()
 	m.Add("users", "1")

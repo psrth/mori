@@ -1454,6 +1454,39 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
 
 	switch {
+	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, " RENAME TO ") && !strings.Contains(upper, "RENAME COLUMN"):
+		// Table rename: ALTER TABLE <old> RENAME TO <new>
+		oldName := ""
+		if len(cl.Tables) > 0 {
+			oldName = cl.Tables[0]
+		} else {
+			fields := strings.Fields(sqlStr)
+			if len(fields) >= 3 {
+				oldName = strings.Trim(fields[2], `"'`)
+			}
+		}
+		newName := ""
+		fields := strings.Fields(sqlStr)
+		for i, f := range fields {
+			if strings.EqualFold(f, "RENAME") && i+2 < len(fields) && strings.EqualFold(fields[i+1], "TO") {
+				newName = strings.Trim(fields[i+2], `"';`)
+				break
+			}
+		}
+		if oldName != "" && newName != "" {
+			p.schemaRegistry.RemoveTable(oldName)
+			p.schemaRegistry.RecordNewTable(newName)
+			if p.deltaMap != nil {
+				p.deltaMap.RenameTable(oldName, newName)
+			}
+			if p.tombstones != nil {
+				p.tombstones.RenameTable(oldName, newName)
+			}
+			if p.verbose {
+				log.Printf("[conn %d] schema registry: RENAME TABLE %s → %s", connID, oldName, newName)
+			}
+		}
+
 	case strings.HasPrefix(upper, "ALTER TABLE") && strings.Contains(upper, "RENAME COLUMN"):
 		table, oldName, newName := parseAlterRenameColumn(sqlStr)
 		if table != "" && oldName != "" && newName != "" {

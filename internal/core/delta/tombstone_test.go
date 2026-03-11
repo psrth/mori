@@ -104,6 +104,40 @@ func TestAnyTableTombstone(t *testing.T) {
 	}
 }
 
+func TestTombstoneRenameTable(t *testing.T) {
+	ts := NewTombstoneSet()
+	ts.Add("users", "1")
+	ts.Add("users", "2")
+	ts.Add("orders", "10")
+
+	ts.RenameTable("users", "customers")
+
+	if !ts.IsTombstoned("customers", "1") || !ts.IsTombstoned("customers", "2") {
+		t.Error("tombstone entries not moved to new name")
+	}
+	if ts.IsTombstoned("users", "1") {
+		t.Error("tombstone entries still under old name")
+	}
+	if !ts.IsTombstoned("orders", "10") {
+		t.Error("unrelated table affected by rename")
+	}
+}
+
+func TestTombstoneRenameTableMerge(t *testing.T) {
+	ts := NewTombstoneSet()
+	ts.Add("old_t", "1")
+	ts.Add("new_t", "2")
+
+	ts.RenameTable("old_t", "new_t")
+
+	if got := ts.CountForTable("new_t"); got != 2 {
+		t.Errorf("CountForTable(new_t) = %d, want 2", got)
+	}
+	if ts.CountForTable("old_t") != 0 {
+		t.Error("old_t still has entries after rename")
+	}
+}
+
 func TestTombstoneSnapshotAndLoad(t *testing.T) {
 	ts := NewTombstoneSet()
 	ts.Add("users", "1")

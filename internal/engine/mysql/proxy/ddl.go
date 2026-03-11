@@ -674,10 +674,10 @@ func (dh *DDLHandler) applyChange(ch mysqlDDLChange) {
 		dh.schemaRegistry.RemoveTable(ch.oldName)
 		dh.schemaRegistry.RecordNewTable(ch.newName)
 		if dh.deltaMap != nil {
-			dh.deltaMap.ClearTable(ch.oldName)
+			dh.deltaMap.RenameTable(ch.oldName, ch.newName)
 		}
 		if dh.tombstones != nil {
-			dh.tombstones.ClearTable(ch.oldName)
+			dh.tombstones.RenameTable(ch.oldName, ch.newName)
 		}
 		if dh.verbose {
 			log.Printf("[conn %d] schema registry: RENAME TABLE %s -> %s", dh.connID, ch.oldName, ch.newName)

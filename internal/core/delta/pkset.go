@@ -83,6 +83,35 @@ func (s *pkSet) clearTable(table string) {
 	}
 }
 
+// renameTable moves all entries from oldName to newName in both committed and staged.
+// If newName already has entries, the two sets are merged.
+func (s *pkSet) renameTable(oldName, newName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if old := s.entries[oldName]; old != nil {
+		if s.entries[newName] == nil {
+			s.entries[newName] = old
+		} else {
+			for pk := range old {
+				s.entries[newName][pk] = true
+			}
+		}
+		delete(s.entries, oldName)
+	}
+	if s.staged != nil {
+		if old := s.staged[oldName]; old != nil {
+			if s.staged[newName] == nil {
+				s.staged[newName] = old
+			} else {
+				for pk := range old {
+					s.staged[newName][pk] = true
+				}
+			}
+			delete(s.staged, oldName)
+		}
+	}
+}
+
 // tables returns all table names that have entries, sorted.
 func (s *pkSet) tables() []string {
 	s.mu.RLock()

@@ -105,7 +105,7 @@ func (w *WriteHandler) handleBulkUpdate(
 ) error {
 	table := cl.Tables[0]
 	meta := w.tables[table]
-	pkCol := meta.PKColumns[0]
+	pkCol := meta.PKColumns[0] // used for shadowOnlyUpdateWithDeltaTracking fallback
 
 	// 1. Build a SELECT query to discover matching rows from Prod.
 	selectSQL, err := buildBulkHydrationQuery(cl.RawSQL)
@@ -151,17 +151,19 @@ func (w *WriteHandler) handleBulkUpdate(
 		return w.shadowOnlyUpdateWithDeltaTracking(clientConn, rawMsg, cl.RawSQL, table, pkCol)
 	}
 
-	// 3. Find PK column index in results.
-	pkIdx := -1
-	for i, col := range result.Columns {
-		if col.Name == pkCol {
-			pkIdx = i
-			break
+	// 3. Find PK column indices in results.
+	pkIndices := make(map[string]int, len(meta.PKColumns))
+	for _, pkc := range meta.PKColumns {
+		for i, col := range result.Columns {
+			if col.Name == pkc {
+				pkIndices[pkc] = i
+				break
+			}
 		}
 	}
-	if pkIdx == -1 {
+	if len(pkIndices) != len(meta.PKColumns) {
 		if w.verbose {
-			log.Printf("[conn %d] bulk UPDATE: PK column %q not found in Prod results", w.connID, pkCol)
+			log.Printf("[conn %d] bulk UPDATE: not all PK columns found in Prod results", w.connID)
 		}
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
@@ -171,10 +173,21 @@ func (w *WriteHandler) handleBulkUpdate(
 	var affectedPKs []string
 	hydratedCount := 0
 	for i, row := range result.RowValues {
-		if result.RowNulls[i][pkIdx] {
-			continue // NULL PK, skip.
+		// Check for NULL in any PK column.
+		hasNullPK := false
+		pkVals := make([]string, len(meta.PKColumns))
+		for j, pkc := range meta.PKColumns {
+			idx := pkIndices[pkc]
+			if result.RowNulls[i][idx] {
+				hasNullPK = true
+				break
+			}
+			pkVals[j] = row[idx]
 		}
-		pk := row[pkIdx]
+		if hasNullPK {
+			continue
+		}
+		pk := core.SerializeCompositePK(meta.PKColumns, pkVals)
 
 		if w.deltaMap.IsDelta(table, pk) {
 			affectedPKs = append(affectedPKs, pk)
@@ -447,11 +460,9 @@ func (w *WriteHandler) hydrateRow(table, pk string) error {
 		return fmt.Errorf("no PK metadata for table %q", table)
 	}
 
-	// Build SELECT query using the first PK column.
-	// For composite PKs, a future phase will handle all columns.
-	pkCol := meta.PKColumns[0]
-	selectSQL := fmt.Sprintf("SELECT * FROM %s WHERE %s = %s",
-		quoteIdent(table), quoteIdent(pkCol), quoteLiteral(pk))
+	pkValues := core.DeserializeCompositePK(pk, meta.PKColumns)
+	whereClause := core.BuildCompositeWHERE(meta.PKColumns, pkValues, quoteIdent, quoteLiteral)
+	selectSQL := fmt.Sprintf("SELECT * FROM %s WHERE %s", quoteIdent(table), whereClause)
 
 	result, err := execQuery(w.prodConn, selectSQL)
 	if err != nil {

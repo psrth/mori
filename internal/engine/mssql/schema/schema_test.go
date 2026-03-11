@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -151,6 +152,85 @@ func TestComputeOffset(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("computeOffset(%d) = %d, want %d", tt.prodMax, got, tt.want)
 		}
+	}
+}
+
+func TestIsTransientError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  string
+		want bool
+	}{
+		{"deadlock 1205", "mssql: error 1205, deadlock victim", true},
+		{"timeout -2", "mssql: Error -2, connection timeout", true},
+		{"service error 40197", "error 40197: service error processing request", true},
+		{"service busy 40501", "error 40501: service is currently busy", true},
+		{"resource 49918", "error 49918: resource limit reached", true},
+		{"resource 49919", "error 49919: resource limit reached", true},
+		{"resource 49920", "error 49920: resource limit reached", true},
+		{"deadlock text", "Transaction was Deadlock victim", true},
+		{"timeout text", "connection timeout expired", true},
+		{"busy text", "service is currently busy", true},
+		{"normal error", "column not found", false},
+		{"nil-like", "", false},
+		{"syntax error", "incorrect syntax near 'SELECT'", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var err error
+			if tt.err != "" {
+				err = fmt.Errorf("%s", tt.err)
+			}
+			if got := isTransientError(err); got != tt.want {
+				t.Errorf("isTransientError(%q) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRetryOnTransientError_SucceedsImmediately(t *testing.T) {
+	calls := 0
+	err := retryOnTransientError(3, func() error {
+		calls++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1", calls)
+	}
+}
+
+func TestRetryOnTransientError_RetriesOnTransient(t *testing.T) {
+	calls := 0
+	err := retryOnTransientError(3, func() error {
+		calls++
+		if calls < 3 {
+			return fmt.Errorf("error 1205: Deadlock")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 3 {
+		t.Errorf("calls = %d, want 3", calls)
+	}
+}
+
+func TestRetryOnTransientError_NonTransientNotRetried(t *testing.T) {
+	calls := 0
+	err := retryOnTransientError(5, func() error {
+		calls++
+		return fmt.Errorf("column not found")
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d, want 1 (non-transient should not retry)", calls)
 	}
 }
 
