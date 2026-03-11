@@ -582,6 +582,16 @@ func (p *Proxy) classifyAndRoute(inline, cmd string, connID int64) routeDecision
 
 	strategy := p.router.Route(classification)
 
+	// Catch-all: unrecognized commands (OpOther/SubOther that aren't known
+	// meta commands) route to shadow instead of prod. This is safer because
+	// unknown commands could be writes that would mutate production data.
+	if strategy == core.StrategyProdDirect &&
+		classification.OpType == core.OpOther &&
+		classification.SubType == core.SubOther &&
+		!isKnownMetaCommand(cmd) {
+		strategy = core.StrategyShadowWrite
+	}
+
 	// WRITE GUARD L1: validate routing decision.
 	if err := validateRouteDecision(classification, strategy, connID, p.logger); err != nil {
 		return routeDecision{
@@ -741,6 +751,16 @@ func (p *Proxy) executeMergedRead(
 		return p.executeMergedMGET(args, prodConn, prodReader, shadowConn, shadowReader, connID)
 	}
 
+	// For EXISTS, check each key per-source (delta→shadow, tombstone→0, clean→prod).
+	if cmd == "EXISTS" && len(args) > 0 {
+		return p.executeMergedEXISTS(args, prodConn, prodReader, shadowConn, shadowReader, connID)
+	}
+
+	// For SDIFF/SINTER/SUNION, hydrate all source keys to shadow and execute there.
+	if (cmd == "SDIFF" || cmd == "SINTER" || cmd == "SUNION") && len(args) > 0 {
+		return p.executeMergedSetOp(cmdVal, args, prodConn, prodReader, shadowConn, shadowReader, connID)
+	}
+
 	// Default: forward to prod.
 	prodConn.Write(cmdBytes)
 	resp, err := ReadRESPValue(prodReader)
@@ -827,6 +847,107 @@ func (p *Proxy) executeMergedMGET(
 	}
 
 	return (&RESPValue{Type: '*', Array: results}).Bytes()
+}
+
+// executeMergedEXISTS handles EXISTS with multiple keys by checking each key
+// against delta/tombstone state individually and aggregating the count.
+func (p *Proxy) executeMergedEXISTS(
+	keys []string,
+	prodConn net.Conn, prodReader *bufio.Reader,
+	shadowConn net.Conn, shadowReader *bufio.Reader,
+	_ int64,
+) []byte {
+	// If database is fully shadowed, forward to shadow directly.
+	if p.schemaRegistry != nil && p.schemaRegistry.IsFullyShadowed("*") {
+		allArgs := make([]string, len(keys)+1)
+		allArgs[0] = "EXISTS"
+		copy(allArgs[1:], keys)
+		cmd := BuildCommandArray(allArgs...)
+		shadowConn.Write(cmd.Bytes())
+		resp, err := ReadRESPValue(shadowReader)
+		if err == nil {
+			return resp.Bytes()
+		}
+		return BuildInteger(0).Bytes()
+	}
+
+	// Separate keys by source.
+	var prodKeys []string
+	var shadowKeys []string
+	totalCount := int64(0)
+
+	for _, key := range keys {
+		prefix := classify.KeyPrefix(key)
+		if p.tombstones != nil && p.tombstones.IsTombstoned(prefix, key) {
+			// Tombstoned → does not exist, contributes 0.
+			continue
+		} else if p.deltaMap != nil && p.deltaMap.IsDelta(prefix, key) {
+			shadowKeys = append(shadowKeys, key)
+		} else {
+			prodKeys = append(prodKeys, key)
+		}
+	}
+
+	// Batch EXISTS on prod.
+	if len(prodKeys) > 0 {
+		prodArgs := make([]string, len(prodKeys)+1)
+		prodArgs[0] = "EXISTS"
+		copy(prodArgs[1:], prodKeys)
+		cmd := BuildCommandArray(prodArgs...)
+		prodConn.Write(cmd.Bytes())
+		resp, err := ReadRESPValue(prodReader)
+		if err == nil && resp.Type == ':' {
+			totalCount += resp.Int
+		}
+	}
+
+	// Batch EXISTS on shadow.
+	if len(shadowKeys) > 0 {
+		shadowArgs := make([]string, len(shadowKeys)+1)
+		shadowArgs[0] = "EXISTS"
+		copy(shadowArgs[1:], shadowKeys)
+		cmd := BuildCommandArray(shadowArgs...)
+		shadowConn.Write(cmd.Bytes())
+		resp, err := ReadRESPValue(shadowReader)
+		if err == nil && resp.Type == ':' {
+			totalCount += resp.Int
+		}
+	}
+
+	return BuildInteger(totalCount).Bytes()
+}
+
+// executeMergedSetOp handles SDIFF/SINTER/SUNION by hydrating all source keys
+// to shadow and executing the operation there. Set operations require all
+// operands to be co-located to produce correct results.
+func (p *Proxy) executeMergedSetOp(
+	cmdVal *RESPValue,
+	keys []string,
+	prodConn net.Conn, prodReader *bufio.Reader,
+	shadowConn net.Conn, shadowReader *bufio.Reader,
+	connID int64,
+) []byte {
+	// Hydrate every source key that isn't already in shadow.
+	for _, key := range keys {
+		prefix := classify.KeyPrefix(key)
+		if p.tombstones != nil && p.tombstones.IsTombstoned(prefix, key) {
+			// Tombstoned keys don't exist; shadow will see them as absent.
+			continue
+		}
+		if p.deltaMap != nil && p.deltaMap.IsDelta(prefix, key) {
+			continue // Already in shadow.
+		}
+		p.hydrateKey(key, prodConn, prodReader, shadowConn, shadowReader, connID)
+	}
+
+	// Execute the full command on shadow.
+	cmdBytes := cmdVal.Bytes()
+	shadowConn.Write(cmdBytes)
+	resp, err := ReadRESPValue(shadowReader)
+	if err != nil {
+		return BuildErrorReply("ERR shadow set operation failed").Bytes()
+	}
+	return resp.Bytes()
 }
 
 // hydrateKeys copies keys from prod to shadow before a write operation.
@@ -960,7 +1081,11 @@ func extractWriteKeys(args []string) []string {
 		if len(args) >= 2 {
 			return []string{args[1]} // destination key
 		}
-	case "ZUNIONSTORE", "ZINTERSTORE":
+	case "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE":
+		if len(args) >= 2 {
+			return []string{args[1]} // destination key
+		}
+	case "ZRANGESTORE":
 		if len(args) >= 2 {
 			return []string{args[1]} // destination key
 		}
@@ -1013,10 +1138,15 @@ func extractHydrationKeys(args []string) []string {
 		if len(args) >= 2 {
 			return args[1:]
 		}
-	case "ZUNIONSTORE", "ZINTERSTORE":
-		// ZUNIONSTORE dst numkeys key [key ...] — hydrate destination + source keys.
+	case "ZUNIONSTORE", "ZINTERSTORE", "ZDIFFSTORE":
+		// ZUNIONSTORE/ZDIFFSTORE dst numkeys key [key ...] — hydrate destination + source keys.
 		if len(args) >= 2 {
 			return args[1:]
+		}
+	case "ZRANGESTORE":
+		// ZRANGESTORE dst src min max — hydrate source key.
+		if len(args) >= 3 {
+			return []string{args[2]}
 		}
 	case "BITOP":
 		// BITOP op dst src [src ...] — hydrate source keys.
@@ -1032,6 +1162,22 @@ func extractHydrationKeys(args []string) []string {
 
 func isMultiKeyRead(cmd string) bool {
 	return cmd == "MGET" || cmd == "EXISTS" || cmd == "SDIFF" || cmd == "SINTER" || cmd == "SUNION"
+}
+
+// isKnownMetaCommand returns true for read-only meta/passthrough commands
+// that are safe to forward to prod even when unrecognized by the classifier.
+func isKnownMetaCommand(cmd string) bool {
+	switch cmd {
+	case "PING", "ECHO", "AUTH", "SELECT", "INFO", "CONFIG", "TIME",
+		"COMMAND", "CLIENT", "CLUSTER", "HELLO", "RESET",
+		"WAIT", "WAITAOF", "PUBSUB", "SCRIPT", "SLOWLOG",
+		"MEMORY", "LATENCY", "MODULE", "FUNCTION",
+		"WATCH", "UNWATCH",
+		"SUBSCRIBE", "PSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE",
+		"SSUBSCRIBE", "SUNSUBSCRIBE":
+		return true
+	}
+	return false
 }
 
 func truncateCmd(s string, maxLen int) string {

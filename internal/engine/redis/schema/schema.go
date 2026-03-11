@@ -31,9 +31,15 @@ func DetectKeyMetadata(info *connstr.ConnInfo) (map[string]KeyMeta, error) {
 	r := bufio.NewReader(conn)
 
 	// AUTH if needed.
-	if info.Password != "" {
-		if err := sendCommand(conn, r, "AUTH", info.Password); err != nil {
-			return nil, fmt.Errorf("AUTH: %w", err)
+	if info.Password != "" || info.Username != "" {
+		if info.Username != "" {
+			if err := sendCommand(conn, r, "AUTH", info.Username, info.Password); err != nil {
+				return nil, fmt.Errorf("AUTH: %w", err)
+			}
+		} else {
+			if err := sendCommand(conn, r, "AUTH", info.Password); err != nil {
+				return nil, fmt.Errorf("AUTH: %w", err)
+			}
 		}
 	}
 
@@ -281,9 +287,15 @@ func GetRedisInfo(info *connstr.ConnInfo) (string, error) {
 	r := bufio.NewReader(conn)
 
 	// AUTH if needed.
-	if info.Password != "" {
-		if err := sendCommand(conn, r, "AUTH", info.Password); err != nil {
-			return "", fmt.Errorf("AUTH: %w", err)
+	if info.Password != "" || info.Username != "" {
+		if info.Username != "" {
+			if err := sendCommand(conn, r, "AUTH", info.Username, info.Password); err != nil {
+				return "", fmt.Errorf("AUTH: %w", err)
+			}
+		} else {
+			if err := sendCommand(conn, r, "AUTH", info.Password); err != nil {
+				return "", fmt.Errorf("AUTH: %w", err)
+			}
 		}
 	}
 
@@ -341,9 +353,15 @@ func PingRedis(info *connstr.ConnInfo) error {
 	r := bufio.NewReader(conn)
 
 	// AUTH if needed.
-	if info.Password != "" {
-		if err := sendCommand(conn, r, "AUTH", info.Password); err != nil {
-			return fmt.Errorf("AUTH: %w", err)
+	if info.Password != "" || info.Username != "" {
+		if info.Username != "" {
+			if err := sendCommand(conn, r, "AUTH", info.Username, info.Password); err != nil {
+				return fmt.Errorf("AUTH: %w", err)
+			}
+		} else {
+			if err := sendCommand(conn, r, "AUTH", info.Password); err != nil {
+				return fmt.Errorf("AUTH: %w", err)
+			}
 		}
 	}
 

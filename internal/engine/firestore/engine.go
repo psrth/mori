@@ -78,10 +78,12 @@ func (e *firestoreEngine) NewClassifier(tables map[string]engine.TableMeta) core
 }
 
 func (e *firestoreEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.TableMeta) engine.Proxy {
-	// Extract credentials file from the connection string if present.
+	// Extract credentials file and database ID from the connection string.
 	credentialsFile := ""
+	databaseID := ""
 	if info, err := connstr.Parse(deps.ProdAddr); err == nil {
 		credentialsFile = info.CredentialsFile
+		databaseID = info.DatabaseID
 	}
 
 	return proxy.New(
@@ -89,6 +91,7 @@ func (e *firestoreEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engi
 		deps.ShadowAddr,
 		credentialsFile,
 		deps.DBName,
+		databaseID,
 		deps.ListenPort,
 		deps.Verbose,
 		deps.Classifier,

@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/firestore/apiv1/firestorepb"
 	"github.com/mori-dev/mori/internal/core"
@@ -12,6 +13,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type routeTarget int
@@ -121,7 +123,7 @@ func (p *Proxy) resolveTargetSDK(cl *core.Classification, strategy core.RoutingS
 		if strategy == core.StrategyMergedRead || strategy == core.StrategyJoinPatch {
 			switch methodName {
 			case "GetDocument", "BatchGetDocuments", "ListDocuments", "RunQuery",
-				"RunAggregationQuery":
+				"RunAggregationQuery", "ListCollectionIds":
 				return targetMerged
 			}
 		}
@@ -134,7 +136,7 @@ func (p *Proxy) resolveTargetSDK(cl *core.Classification, strategy core.RoutingS
 		if cl.OpType == core.OpRead && strategy == core.StrategyProdDirect {
 			switch methodName {
 			case "GetDocument", "BatchGetDocuments", "ListDocuments", "RunQuery",
-				"RunAggregationQuery":
+				"RunAggregationQuery", "ListCollectionIds":
 				if p.deltaMap.HasAnyDelta() || len(p.tombstones.Tables()) > 0 {
 					return targetMerged
 				}
@@ -225,6 +227,13 @@ func (p *Proxy) handleSDKRead(serverStream grpc.ServerStream, method string, con
 			return p.forwardToProd(serverStream, method, connID)
 		}
 
+		// If the request carries a transaction, use its read timestamp for prod-side snapshot isolation.
+		if txnSel, ok := req.GetConsistencySelector().(*firestorepb.GetDocumentRequest_Transaction); ok && txnSel != nil {
+			if rt := p.getTransactionReadTime(string(txnSel.Transaction)); rt != nil {
+				rh.readTime = rt
+			}
+		}
+
 		doc, err := rh.getDocument(ctx, req)
 		if err != nil {
 			return err
@@ -261,6 +270,12 @@ func (p *Proxy) handleSDKRead(serverStream grpc.ServerStream, method string, con
 			return p.forwardToProd(serverStream, method, connID)
 		}
 
+		if txnSel, ok := req.GetConsistencySelector().(*firestorepb.BatchGetDocumentsRequest_Transaction); ok && txnSel != nil {
+			if rt := p.getTransactionReadTime(string(txnSel.Transaction)); rt != nil {
+				rh.readTime = rt
+			}
+		}
+
 		results, err := rh.batchGetDocuments(ctx, req)
 		if err != nil {
 			return err
@@ -282,6 +297,12 @@ func (p *Proxy) handleSDKRead(serverStream grpc.ServerStream, method string, con
 		if err := proto.Unmarshal(f.payload, req); err != nil {
 			log.Printf("[conn %d] failed to unmarshal RunQueryRequest: %v — falling back to raw", connID, err)
 			return p.forwardToProd(serverStream, method, connID)
+		}
+
+		if txnSel, ok := req.GetConsistencySelector().(*firestorepb.RunQueryRequest_Transaction); ok && txnSel != nil {
+			if rt := p.getTransactionReadTime(string(txnSel.Transaction)); rt != nil {
+				rh.readTime = rt
+			}
 		}
 
 		results, err := rh.runQuery(ctx, req)
@@ -308,6 +329,12 @@ func (p *Proxy) handleSDKRead(serverStream grpc.ServerStream, method string, con
 			return p.forwardToProd(serverStream, method, connID)
 		}
 
+		if txnSel, ok := req.GetConsistencySelector().(*firestorepb.RunAggregationQueryRequest_Transaction); ok && txnSel != nil {
+			if rt := p.getTransactionReadTime(string(txnSel.Transaction)); rt != nil {
+				rh.readTime = rt
+			}
+		}
+
 		results, err := rh.runAggregationQuery(ctx, req)
 		if err != nil {
 			return err
@@ -323,6 +350,24 @@ func (p *Proxy) handleSDKRead(serverStream grpc.ServerStream, method string, con
 			}
 		}
 		return nil
+
+	case "ListCollectionIds":
+		req := &firestorepb.ListCollectionIdsRequest{}
+		if err := proto.Unmarshal(f.payload, req); err != nil {
+			log.Printf("[conn %d] failed to unmarshal ListCollectionIdsRequest: %v — falling back to raw", connID, err)
+			return p.forwardToProd(serverStream, method, connID)
+		}
+
+		resp, err := rh.listCollectionIds(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		respBytes, err := proto.Marshal(resp)
+		if err != nil {
+			return status.Errorf(codes.Internal, "failed to marshal ListCollectionIds response: %v", err)
+		}
+		return serverStream.SendMsg(&frame{payload: respBytes})
 
 	default:
 		// Should not reach here; fall back to prod.
@@ -443,6 +488,7 @@ func (p *Proxy) handleSDKWrite(serverStream grpc.ServerStream, method string, co
 				p.deltaMap.RollbackInsertCounts()
 				p.tombstones.Rollback()
 				delete(p.activeTransactions, txnID)
+				delete(p.txnReadTime, txnID)
 				if len(p.activeTransactions) == 0 {
 					p.inTransaction = false
 				}
@@ -589,6 +635,11 @@ func (p *Proxy) handleSDKTransaction(serverStream grpc.ServerStream, method stri
 			return p.forwardToShadow(serverStream, method, connID)
 		}
 
+		// Capture the current time BEFORE forwarding to shadow. This timestamp
+		// will be used as ReadTime for all prod-side reads within this transaction,
+		// providing snapshot isolation equivalent to Firestore's native transactions.
+		readTime := timestamppb.New(time.Now())
+
 		// Forward to shadow.
 		resp, err := p.sdk.shadow.BeginTransaction(ctx, req)
 		if err != nil {
@@ -602,6 +653,7 @@ func (p *Proxy) handleSDKTransaction(serverStream grpc.ServerStream, method stri
 		p.txnMu.Lock()
 		p.activeTransactions[txnID] = true
 		p.inTransaction = true
+		p.txnReadTime[txnID] = readTime
 		p.txnMu.Unlock()
 
 		if p.verbose {
@@ -635,6 +687,7 @@ func (p *Proxy) handleSDKTransaction(serverStream grpc.ServerStream, method stri
 			p.deltaMap.RollbackInsertCounts()
 			p.tombstones.Rollback()
 			delete(p.activeTransactions, txnID)
+			delete(p.txnReadTime, txnID)
 			if len(p.activeTransactions) == 0 {
 				p.inTransaction = false
 			}
@@ -664,6 +717,7 @@ func (p *Proxy) commitTransaction(txnID string) {
 		p.deltaMap.CommitInsertCounts()
 		p.tombstones.Commit()
 		delete(p.activeTransactions, txnID)
+		delete(p.txnReadTime, txnID)
 		if len(p.activeTransactions) == 0 {
 			p.inTransaction = false
 		}
@@ -675,6 +729,14 @@ func (p *Proxy) isActiveTransaction(txnID string) bool {
 	p.txnMu.Lock()
 	defer p.txnMu.Unlock()
 	return p.activeTransactions[txnID]
+}
+
+// getTransactionReadTime returns the prod-side read timestamp for a transaction,
+// or nil if the transaction has no stored read time.
+func (p *Proxy) getTransactionReadTime(txnID string) *timestamppb.Timestamp {
+	p.txnMu.Lock()
+	defer p.txnMu.Unlock()
+	return p.txnReadTime[txnID]
 }
 
 // populateTablesFromMetadata attempts to extract collection names from gRPC metadata

@@ -92,15 +92,15 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	}
 	ui.StepDone(fmt.Sprintf("Emulator ready on port %d", containerInfo.HostPort))
 
-	// 6. Seed shadow emulator with prod data.
+	// 6. Seed shadow emulator with prod data (including subcollections).
 	if len(collections) > 0 {
-		if err := ui.Spinner("Seeding shadow emulator from production...", func() error {
+		if err := ui.Spinner("Seeding shadow emulator from production (including subcollections)...", func() error {
 			shadowClient, e := newEmulatorClient(ctx, info.ProjectID, containerInfo.HostPort)
 			if e != nil {
 				return e
 			}
 			defer shadowClient.Close()
-			return schema.SeedShadow(ctx, prodClient, shadowClient, collections, schema.DefaultSeedLimit)
+			return schema.SeedShadowWithSubcollections(ctx, prodClient, shadowClient, collections, schema.DefaultSeedLimit, schema.DefaultMaxSeedDepth)
 		}); err != nil {
 			mgr.StopAndRemove(ctx, containerInfo.ContainerID)
 			return nil, fmt.Errorf("failed to seed shadow: %w", err)

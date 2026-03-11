@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/credentials/oauth"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Proxy is a gRPC reverse proxy that intercepts Firestore API calls
@@ -62,11 +63,16 @@ type Proxy struct {
 	txnMu             sync.Mutex
 	activeTransactions map[string]bool
 	inTransaction      bool // true if any transaction is staged (simplified: single-session)
+
+	// txnReadTime stores the prod-side read timestamp captured at BeginTransaction.
+	// All prod reads within a transaction use this timestamp for snapshot isolation,
+	// matching Firestore's guarantee that all reads in a transaction see a consistent snapshot.
+	txnReadTime map[string]*timestamppb.Timestamp
 }
 
 // New creates a Firestore Proxy.
 func New(
-	prodAddr, shadowAddr, credentialsFile, projectID string,
+	prodAddr, shadowAddr, credentialsFile, projectID, databaseID string,
 	listenPort int, verbose bool,
 	classifier core.Classifier, router *core.Router,
 	deltaMap *delta.Map, tombstones *delta.TombstoneSet,
@@ -74,8 +80,9 @@ func New(
 	schemaRegistry *coreSchema.Registry,
 	logger *logging.Logger,
 ) *Proxy {
-	// Extract database ID from connection string if available.
-	databaseID := "(default)"
+	if databaseID == "" {
+		databaseID = "(default)"
+	}
 
 	return &Proxy{
 		prodAddr:           prodAddr,
@@ -95,6 +102,7 @@ func New(
 		logger:             logger,
 		shutdownCh:         make(chan struct{}),
 		activeTransactions: make(map[string]bool),
+		txnReadTime:        make(map[string]*timestamppb.Timestamp),
 	}
 }
 

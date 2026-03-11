@@ -14,6 +14,7 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	wrapperspb "google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -27,16 +28,20 @@ type readHandler struct {
 	databaseID          string
 	verbose             bool
 	activeTransactionFn func(string) bool // checks if a txn ID is active
+
+	// readTime, when set, is used for all prod-side reads to provide snapshot
+	// isolation within a transaction. Captured at BeginTransaction time.
+	readTime *timestamppb.Timestamp
 }
 
 // getDocument performs a merged GetDocument: if the doc path is in the delta map,
 // read from shadow; if tombstoned, return NOT_FOUND; otherwise read from prod.
 func (h *readHandler) getDocument(ctx context.Context, req *firestorepb.GetDocumentRequest) (*firestorepb.Document, error) {
 	docPath := req.GetName()
-	collection, docID := splitDocPath(docPath)
+	collection, fullDocKey := splitDocPathFull(docPath)
 
 	// Check tombstone first — deleted docs should return NOT_FOUND.
-	if collection != "" && h.tombstones.IsTombstoned(collection, docID) {
+	if collection != "" && h.tombstones.IsTombstoned(collection, fullDocKey) {
 		if h.verbose {
 			log.Printf("[firestore-read] GetDocument %s: tombstoned → NOT_FOUND", docPath)
 		}
@@ -44,9 +49,9 @@ func (h *readHandler) getDocument(ctx context.Context, req *firestorepb.GetDocum
 	}
 
 	// Check delta map — if modified, read from shadow.
-	if collection != "" && h.deltaMap.IsDelta(collection, docID) {
+	if collection != "" && h.deltaMap.IsDelta(collection, fullDocKey) {
 		if h.verbose {
-			log.Printf("[firestore-read] GetDocument %s: delta → shadow", docPath)
+			log.Printf("[firestore-read] GetDocument %s: delta → shadow", fullDocKey)
 		}
 		return h.shadowClient.GetDocument(ctx, req)
 	}
@@ -54,6 +59,9 @@ func (h *readHandler) getDocument(ctx context.Context, req *firestorepb.GetDocum
 	// Default: read from prod.
 	if h.verbose {
 		log.Printf("[firestore-read] GetDocument %s: prod", docPath)
+	}
+	if h.readTime != nil {
+		req.ConsistencySelector = &firestorepb.GetDocumentRequest_ReadTime{ReadTime: h.readTime}
 	}
 	return h.prodClient.GetDocument(ctx, req)
 }
@@ -65,12 +73,12 @@ func (h *readHandler) batchGetDocuments(ctx context.Context, req *firestorepb.Ba
 	var results []*firestorepb.BatchGetDocumentsResponse
 
 	for _, docPath := range req.GetDocuments() {
-		collection, docID := splitDocPath(docPath)
+		collection, fullDocKey := splitDocPathFull(docPath)
 
 		// Check tombstone — return "missing" result.
-		if collection != "" && h.tombstones.IsTombstoned(collection, docID) {
+		if collection != "" && h.tombstones.IsTombstoned(collection, fullDocKey) {
 			if h.verbose {
-				log.Printf("[firestore-read] BatchGetDocuments %s: tombstoned → missing", docPath)
+				log.Printf("[firestore-read] BatchGetDocuments %s: tombstoned → missing", fullDocKey)
 			}
 			results = append(results, &firestorepb.BatchGetDocumentsResponse{
 				Result:  &firestorepb.BatchGetDocumentsResponse_Missing{Missing: docPath},
@@ -80,9 +88,9 @@ func (h *readHandler) batchGetDocuments(ctx context.Context, req *firestorepb.Ba
 		}
 
 		// Check delta — read from shadow.
-		if collection != "" && h.deltaMap.IsDelta(collection, docID) {
+		if collection != "" && h.deltaMap.IsDelta(collection, fullDocKey) {
 			if h.verbose {
-				log.Printf("[firestore-read] BatchGetDocuments %s: delta → shadow", docPath)
+				log.Printf("[firestore-read] BatchGetDocuments %s: delta → shadow", fullDocKey)
 			}
 			getReq := &firestorepb.GetDocumentRequest{Name: docPath}
 			doc, err := h.shadowClient.GetDocument(ctx, getReq)
@@ -106,6 +114,9 @@ func (h *readHandler) batchGetDocuments(ctx context.Context, req *firestorepb.Ba
 			log.Printf("[firestore-read] BatchGetDocuments %s: prod", docPath)
 		}
 		getReq := &firestorepb.GetDocumentRequest{Name: docPath}
+		if h.readTime != nil {
+			getReq.ConsistencySelector = &firestorepb.GetDocumentRequest_ReadTime{ReadTime: h.readTime}
+		}
 		doc, err := h.prodClient.GetDocument(ctx, getReq)
 		if err != nil {
 			if status.Code(err) == codes.NotFound {
@@ -132,6 +143,7 @@ func (h *readHandler) listDocuments(ctx context.Context, req *firestorepb.ListDo
 
 	// If no deltas or inserts for this collection, just query prod and filter tombstones.
 	if !h.deltaMap.AnyTableDelta([]string{collection}) && !h.deltaMap.HasInserts(collection) {
+		h.applyListDocumentsReadTime(req)
 		prodDocs, err := collectListDocuments(ctx, h.prodClient, req)
 		if err != nil {
 			return nil, err
@@ -160,6 +172,7 @@ func (h *readHandler) listDocuments(ctx context.Context, req *firestorepb.ListDo
 	}
 
 	// Query both backends via iterators.
+	h.applyListDocumentsReadTime(prodReq)
 	prodDocs, prodErr := collectListDocuments(ctx, h.prodClient, prodReq)
 	shadowDocs, shadowErr := collectListDocuments(ctx, h.shadowClient, req)
 
@@ -181,6 +194,71 @@ func (h *readHandler) listDocuments(ctx context.Context, req *firestorepb.ListDo
 	}
 
 	return resp, nil
+}
+
+// listCollectionIds performs a merged ListCollectionIds: queries both prod and
+// shadow, deduplicates collection IDs, and returns the union. This ensures that
+// shadow-only collections (created by writes to new collections) are visible.
+func (h *readHandler) listCollectionIds(ctx context.Context, req *firestorepb.ListCollectionIdsRequest) (*firestorepb.ListCollectionIdsResponse, error) {
+	origPageSize := req.GetPageSize()
+
+	// Collect from both backends via iterators.
+	prodIds, prodErr := collectCollectionIds(ctx, h.prodClient, req)
+	shadowIds, shadowErr := collectCollectionIds(ctx, h.shadowClient, req)
+
+	if prodErr != nil && shadowErr != nil {
+		return nil, fmt.Errorf("both backends failed: prod=%v, shadow=%v", prodErr, shadowErr)
+	}
+
+	// Merge: union of collection IDs from both backends.
+	seen := make(map[string]bool)
+	var merged []string
+
+	for _, id := range prodIds {
+		if !seen[id] {
+			seen[id] = true
+			merged = append(merged, id)
+		}
+	}
+	for _, id := range shadowIds {
+		if !seen[id] {
+			seen[id] = true
+			merged = append(merged, id)
+		}
+	}
+
+	// Sort for deterministic ordering.
+	sort.Strings(merged)
+
+	// Apply original page_size after merge.
+	resp := &firestorepb.ListCollectionIdsResponse{}
+	if origPageSize > 0 && int32(len(merged)) > origPageSize {
+		resp.CollectionIds = merged[:origPageSize]
+		if len(merged) > int(origPageSize) {
+			resp.NextPageToken = merged[origPageSize]
+		}
+	} else {
+		resp.CollectionIds = merged
+	}
+
+	return resp, nil
+}
+
+// collectCollectionIds iterates through a ListCollectionIds result and collects all IDs.
+func collectCollectionIds(ctx context.Context, client *firestore.Client, req *firestorepb.ListCollectionIdsRequest) ([]string, error) {
+	iter := client.ListCollectionIds(ctx, req)
+	var ids []string
+	for {
+		id, err := iter.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
 }
 
 // collectListDocuments iterates through a ListDocuments result and collects all documents.
@@ -209,24 +287,20 @@ func (h *readHandler) runQuery(ctx context.Context, req *firestorepb.RunQueryReq
 	sq := req.GetStructuredQuery()
 	var orderBy []*firestorepb.StructuredQuery_Order
 	var origLimit int32
-	isCollectionGroup := false
 	if sq != nil {
 		orderBy = sq.GetOrderBy()
 		if sq.GetLimit() != nil {
 			origLimit = sq.GetLimit().GetValue()
 		}
-		// Check if this is a collection group query (allDescendants).
-		if from := sq.GetFrom(); len(from) > 0 && from[0].GetAllDescendants() {
-			isCollectionGroup = true
-		}
 	}
 
-	// For collection group queries, use the full document path for dedup
-	// since the same collection ID can appear under different parent paths.
-	_ = isCollectionGroup // Used in merge logic below.
+	// Collection group queries are handled correctly by splitDocPathFull:
+	// delta/tombstone keys use the full document path, preventing collisions
+	// when the same collection ID appears under different parent paths.
 
 	// If no deltas for this collection, just query prod and filter tombstones.
 	if !h.deltaMap.AnyTableDelta([]string{collection}) && !h.deltaMap.HasInserts(collection) {
+		h.applyRunQueryReadTime(req)
 		results, err := collectQueryResults(ctx, h.prodClient, req)
 		if err != nil {
 			return nil, err
@@ -253,6 +327,7 @@ func (h *readHandler) runQuery(ctx context.Context, req *firestorepb.RunQueryReq
 	}
 
 	// Query both backends.
+	h.applyRunQueryReadTime(prodReq)
 	prodResults, prodErr := collectQueryResults(ctx, h.prodClient, prodReq)
 	shadowResults, shadowErr := collectQueryResults(ctx, h.shadowClient, req)
 
@@ -287,11 +362,13 @@ func (h *readHandler) runAggregationQuery(ctx context.Context, req *firestorepb.
 	aggQuery := req.GetStructuredAggregationQuery()
 	if aggQuery == nil {
 		// No structured aggregation query — forward to prod directly.
+		h.applyAggregationQueryReadTime(req)
 		return collectAggregationResults(ctx, h.prodClient, req)
 	}
 
 	baseQuery := aggQuery.GetStructuredQuery()
 	if baseQuery == nil {
+		h.applyAggregationQueryReadTime(req)
 		return collectAggregationResults(ctx, h.prodClient, req)
 	}
 
@@ -488,10 +565,10 @@ func mergeDocuments(prodDocs, shadowDocs []*firestorepb.Document, collection str
 	// Add all shadow docs first (they always win).
 	for _, doc := range shadowDocs {
 		path := doc.GetName()
-		_, docID := splitDocPath(path)
+		_, fullDocKey := splitDocPathFull(path)
 
 		// Skip tombstoned docs that somehow appear in shadow.
-		if ts.IsTombstoned(collection, docID) {
+		if ts.IsTombstoned(collection, fullDocKey) {
 			continue
 		}
 		merged = append(merged, doc)
@@ -504,15 +581,15 @@ func mergeDocuments(prodDocs, shadowDocs []*firestorepb.Document, collection str
 		if seen[path] {
 			continue
 		}
-		_, docID := splitDocPath(path)
+		_, fullDocKey := splitDocPathFull(path)
 
 		// Skip tombstoned docs.
-		if ts.IsTombstoned(collection, docID) {
+		if ts.IsTombstoned(collection, fullDocKey) {
 			continue
 		}
 		// Skip docs that have been modified (delta) — shadow version should be used,
 		// but if shadow didn't return it, it means it was deleted there.
-		if dm.IsDelta(collection, docID) {
+		if dm.IsDelta(collection, fullDocKey) {
 			continue
 		}
 
@@ -548,8 +625,8 @@ func mergeQueryResults(prodResults, shadowResults []*firestorepb.RunQueryRespons
 			continue
 		}
 		path := doc.GetName()
-		_, docID := splitDocPath(path)
-		if ts.IsTombstoned(collection, docID) {
+		_, fullDocKey := splitDocPathFull(path)
+		if ts.IsTombstoned(collection, fullDocKey) {
 			continue
 		}
 		merged = append(merged, r)
@@ -566,11 +643,11 @@ func mergeQueryResults(prodResults, shadowResults []*firestorepb.RunQueryRespons
 		if seen[path] {
 			continue
 		}
-		_, docID := splitDocPath(path)
-		if ts.IsTombstoned(collection, docID) {
+		_, fullDocKey := splitDocPathFull(path)
+		if ts.IsTombstoned(collection, fullDocKey) {
 			continue
 		}
-		if dm.IsDelta(collection, docID) {
+		if dm.IsDelta(collection, fullDocKey) {
 			continue
 		}
 		merged = append(merged, r)
@@ -587,8 +664,8 @@ func filterTombstoned(docs []*firestorepb.Document, collection string, ts *delta
 	}
 	var out []*firestorepb.Document
 	for _, doc := range docs {
-		_, docID := splitDocPath(doc.GetName())
-		if !ts.IsTombstoned(collection, docID) {
+		_, fullDocKey := splitDocPathFull(doc.GetName())
+		if !ts.IsTombstoned(collection, fullDocKey) {
 			out = append(out, doc)
 		}
 	}
@@ -607,12 +684,36 @@ func filterTombstonedQueryResults(results []*firestorepb.RunQueryResponse, colle
 			out = append(out, r)
 			continue
 		}
-		_, docID := splitDocPath(doc.GetName())
-		if !ts.IsTombstoned(collection, docID) {
+		_, fullDocKey := splitDocPathFull(doc.GetName())
+		if !ts.IsTombstoned(collection, fullDocKey) {
 			out = append(out, r)
 		}
 	}
 	return out
+}
+
+// applyListDocumentsReadTime sets the ReadTime consistency selector on a
+// ListDocumentsRequest if the readHandler has a transaction read timestamp.
+func (h *readHandler) applyListDocumentsReadTime(req *firestorepb.ListDocumentsRequest) {
+	if h.readTime != nil {
+		req.ConsistencySelector = &firestorepb.ListDocumentsRequest_ReadTime{ReadTime: h.readTime}
+	}
+}
+
+// applyRunQueryReadTime sets the ReadTime consistency selector on a
+// RunQueryRequest if the readHandler has a transaction read timestamp.
+func (h *readHandler) applyRunQueryReadTime(req *firestorepb.RunQueryRequest) {
+	if h.readTime != nil {
+		req.ConsistencySelector = &firestorepb.RunQueryRequest_ReadTime{ReadTime: h.readTime}
+	}
+}
+
+// applyAggregationQueryReadTime sets the ReadTime consistency selector on a
+// RunAggregationQueryRequest if the readHandler has a transaction read timestamp.
+func (h *readHandler) applyAggregationQueryReadTime(req *firestorepb.RunAggregationQueryRequest) {
+	if h.readTime != nil {
+		req.ConsistencySelector = &firestorepb.RunAggregationQueryRequest_ReadTime{ReadTime: h.readTime}
+	}
 }
 
 // splitDocPath extracts the collection name and document ID from a full document path.
@@ -632,6 +733,32 @@ func splitDocPath(path string) (collection, docID string) {
 	// For top-level: collection = parts[0], docID = parts[1]
 	// For subcollections: collection = parts[len-2], docID = parts[len-1]
 	return parts[len(parts)-2], parts[len(parts)-1]
+}
+
+// splitDocPathFull extracts the immediate collection name and the full relative
+// document path for use as delta/tombstone keys. Using the full relative path
+// (everything after "/documents/") prevents key collisions in subcollections.
+//
+// Examples:
+//
+//	"projects/p/databases/d/documents/users/abc123"           → ("users", "users/abc123")
+//	"projects/p/databases/d/documents/users/u1/comments/c1"   → ("comments", "users/u1/comments/c1")
+//
+// The collection return value is the immediate parent collection (last collection
+// segment), used for AnyTableDelta/HasInserts checks. The fullDocKey is the full
+// relative path, used for IsDelta/IsTombstoned per-document lookups.
+func splitDocPathFull(path string) (collection, fullDocKey string) {
+	const marker = "/documents/"
+	_, rest, found := strings.Cut(path, marker)
+	if !found {
+		return "", ""
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) < 2 {
+		return rest, ""
+	}
+	collection = parts[len(parts)-2]
+	return collection, rest
 }
 
 // extractCollectionFromParent extracts the collection name from a ListDocuments parent + collectionId.

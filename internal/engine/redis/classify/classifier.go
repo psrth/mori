@@ -219,6 +219,20 @@ var commandMap = map[string]opInfo{
 	"PEXPIRETIME": {core.OpRead, core.SubSelect, 1, false},
 	"OBJECT":      {core.OpRead, core.SubSelect, 0, false},
 
+	// --- Redis 6.2+ ---
+	"XREADGROUP": {core.OpWrite, core.SubUpdate, 0, true},  // consumer group read = ack = write
+	"XAUTOCLAIM": {core.OpWrite, core.SubUpdate, 1, false}, // re-claims pending entries
+	"ZDIFF":      {core.OpRead, core.SubSelect, 0, true},   // read-only sorted set diff
+	"ZDIFFSTORE": {core.OpWrite, core.SubInsert, 1, false}, // store = write (dest key only)
+	"ZRANGESTORE": {core.OpWrite, core.SubInsert, 1, false}, // store = write
+
+	// --- Redis 7.0+ sharded pub/sub ---
+	"SSUBSCRIBE":   {core.OpOther, core.SubOther, 0, true},
+	"SUNSUBSCRIBE": {core.OpOther, core.SubOther, 0, false},
+
+	// --- Redis 7.2+ ---
+	"WAITAOF": {core.OpOther, core.SubOther, 0, false},
+
 	// --- Function API (Redis 7.0+) ---
 	"FUNCTION": {core.OpOther, core.SubOther, 0, false},
 	"FCALL":    {core.OpWrite, core.SubInsert, 0, true},
@@ -269,7 +283,7 @@ var commandMap = map[string]opInfo{
 	"PSUBSCRIBE":   {core.OpOther, core.SubOther, 0, true},  // routed to both prod+shadow
 	"UNSUBSCRIBE":  {core.OpOther, core.SubOther, 0, false},
 	"PUNSUBSCRIBE": {core.OpOther, core.SubOther, 0, false},
-	"PUBLISH":      {core.OpWrite, core.SubInsert, 0, false}, // shadow-only (write guard)
+	"PUBLISH":      {core.OpWrite, core.SubNotify, 0, false}, // blocked — would affect prod subscribers
 	"PUBSUB":       {core.OpOther, core.SubOther, 0, false},
 
 	// --- Dangerous: blocked through Mori ---
@@ -340,13 +354,21 @@ func (c *RedisClassifier) Classify(query string) (*core.Classification, error) {
 		return cl, nil
 	}
 
-	// Special case: SORT with STORE is a write.
+	// Special case: PUBLISH is blocked — it would affect production subscribers.
+	if cmd == "PUBLISH" {
+		cl.OpType = core.OpWrite
+		cl.SubType = core.SubNotify
+		cl.NotSupportedMsg = "PUBLISH is not supported through Mori — it would affect production subscribers"
+		return cl, nil
+	}
+
+	// Special case: SORT with STORE is a write — track both source and destination prefixes.
 	if cmd == "SORT" {
-		for _, a := range args[1:] {
-			if strings.ToUpper(a) == "STORE" {
+		for i, a := range args[1:] {
+			if strings.ToUpper(a) == "STORE" && i+2 < len(args) {
 				cl.OpType = core.OpWrite
 				cl.SubType = core.SubInsert
-				cl.Tables = c.extractKeyPrefixes(args[1:2])
+				cl.Tables = c.extractKeyPrefixes([]string{args[1], args[i+2]})
 				return cl, nil
 			}
 		}
@@ -380,8 +402,13 @@ func (c *RedisClassifier) Classify(query string) (*core.Classification, error) {
 		cl.Tables = c.extractKeyPrefixes(keys)
 	}
 
-	// For EVAL/EVALSHA, extract KEYS from numkeys argument.
-	if cmd == "EVAL" || cmd == "EVALSHA" {
+	// For RENAME/RENAMENX, track both source and destination key prefixes.
+	if (cmd == "RENAME" || cmd == "RENAMENX") && len(args) >= 3 {
+		cl.Tables = c.extractKeyPrefixes([]string{args[1], args[2]})
+	}
+
+	// For EVAL/EVALSHA/EVALRO/EVALSHA_RO, extract KEYS from numkeys argument.
+	if cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVALRO" || cmd == "EVALSHA_RO" {
 		evalKeys := ExtractEvalKeys(args[1:])
 		if len(evalKeys) > 0 {
 			cl.Tables = c.extractKeyPrefixes(evalKeys)
@@ -477,10 +504,10 @@ func IsPubSubUnsubscribe(cmd string) bool {
 	return u == "UNSUBSCRIBE" || u == "PUNSUBSCRIBE"
 }
 
-// IsEvalCommand returns true if the command is EVAL or EVALSHA.
+// IsEvalCommand returns true if the command is EVAL, EVALSHA, EVALRO, or EVALSHA_RO.
 func IsEvalCommand(cmd string) bool {
 	u := strings.ToUpper(cmd)
-	return u == "EVAL" || u == "EVALSHA"
+	return u == "EVAL" || u == "EVALSHA" || u == "EVALRO" || u == "EVALSHA_RO"
 }
 
 // ExtractEvalKeys extracts the KEYS arguments from an EVAL/EVALSHA command.

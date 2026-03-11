@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -12,8 +13,15 @@ import (
 // TDSColumnInfo holds metadata for a single column from a COLMETADATA token.
 type TDSColumnInfo struct {
 	Name string
-	// We store the raw type byte and collation info for faithful re-emission.
-	TypeID byte
+	// Type metadata for faithful re-emission in synthesized responses.
+	TypeID     byte
+	MaxLen     int    // for variable-length types
+	FixedLen   int    // for fixed/nullable fixed-length types
+	Precision  byte   // for DECIMAL/NUMERIC
+	Scale      byte   // for DECIMAL/NUMERIC and temporal types
+	Collation  []byte // for string types (5 bytes)
+	IsNType    bool   // national (UTF-16) type
+	IsTextType bool   // string type
 }
 
 // TDSQueryResult holds the parsed result of executing a query on a TDS backend.
@@ -83,7 +91,17 @@ func parseTDSTokens(data []byte, result *TDSQueryResult) {
 			// Populate result columns.
 			result.Columns = make([]TDSColumnInfo, len(colMeta))
 			for i, cm := range colMeta {
-				result.Columns[i] = TDSColumnInfo{Name: cm.name, TypeID: cm.typeID}
+				result.Columns[i] = TDSColumnInfo{
+					Name:       cm.name,
+					TypeID:     cm.typeID,
+					MaxLen:     cm.maxLen,
+					FixedLen:   cm.fixedLen,
+					Precision:  cm.precision,
+					Scale:      cm.scale,
+					Collation:  cm.collation,
+					IsNType:    cm.isNType,
+					IsTextType: cm.isTextType,
+				}
 			}
 
 		case tokenRow:
@@ -1102,7 +1120,8 @@ func skipReturnValueToken(data []byte, pos int) int {
 }
 
 // buildTDSSelectResponse constructs a complete TDS tabular result from in-memory data.
-// Emits all columns as NVARCHAR(4000) for simplicity.
+// Preserves original column types when metadata is available, falling back to
+// NVARCHAR(4000) for columns without type info.
 func buildTDSSelectResponse(columns []TDSColumnInfo, values [][]string, nulls [][]bool) []byte {
 	var payload []byte
 
@@ -1116,12 +1135,8 @@ func buildTDSSelectResponse(columns []TDSColumnInfo, values [][]string, nulls []
 		payload = append(payload, 0, 0, 0, 0)
 		// Flags (2 bytes): 0x08 = nullable.
 		payload = append(payload, 0x08, 0x00)
-		// TYPE_INFO: NVARCHAR (0xE7) with max length 8000 (4000 chars * 2).
-		payload = append(payload, 0xE7)
-		// Max length (2 bytes LE): 8000.
-		payload = append(payload, 0x40, 0x1F) // 8000
-		// Collation (5 bytes): default.
-		payload = append(payload, 0x09, 0x04, 0xD0, 0x00, 0x34)
+		// TYPE_INFO: emit original type when available.
+		payload = append(payload, buildColMetaBytes(col)...)
 		// Column name: 1-byte length (chars) + UTF-16LE name.
 		nameUTF16 := encodeUTF16LE(col.Name)
 		nameChars := len(nameUTF16) / 2
@@ -1132,18 +1147,13 @@ func buildTDSSelectResponse(columns []TDSColumnInfo, values [][]string, nulls []
 	// ROW tokens.
 	for i, row := range values {
 		payload = append(payload, tokenRow)
-		for j, val := range row {
+		for j := range row {
 			isNull := len(nulls) > i && len(nulls[i]) > j && nulls[i][j]
-			if isNull {
-				// NULL: 0xFFFF for NVARCHAR.
-				payload = append(payload, 0xFF, 0xFF)
-			} else {
-				// Encode value as UTF-16LE with 2-byte length prefix.
-				valUTF16 := encodeUTF16LE(val)
-				dataLen := len(valUTF16)
-				payload = append(payload, byte(dataLen), byte(dataLen>>8))
-				payload = append(payload, valUTF16...)
+			col := TDSColumnInfo{}
+			if j < len(columns) {
+				col = columns[j]
 			}
+			payload = append(payload, encodeColumnValue(row[j], isNull, col)...)
 		}
 	}
 
@@ -1160,6 +1170,440 @@ func buildTDSSelectResponse(columns []TDSColumnInfo, values [][]string, nulls []
 	payload = append(payload, rcBuf...)
 
 	return buildTDSPacket(typeTabularResult, statusEOM, payload)
+}
+
+// buildColMetaBytes builds the TYPE_INFO bytes for a column in COLMETADATA.
+func buildColMetaBytes(col TDSColumnInfo) []byte {
+	tid := col.TypeID
+
+	switch {
+	// Nullable integer-family: INTN (0x26)
+	case tid == 0x26:
+		maxLen := col.FixedLen
+		if maxLen == 0 {
+			maxLen = 4 // default to int32
+		}
+		return []byte{tid, byte(maxLen)}
+
+	// Nullable bit: BITN (0x68)
+	case tid == 0x68:
+		return []byte{tid, 1}
+
+	// Nullable float: FLTN (0x6D)
+	case tid == 0x6D:
+		maxLen := col.FixedLen
+		if maxLen == 0 {
+			maxLen = 8
+		}
+		return []byte{tid, byte(maxLen)}
+
+	// Nullable money: MONEYN (0x6E)
+	case tid == 0x6E:
+		maxLen := col.FixedLen
+		if maxLen == 0 {
+			maxLen = 8
+		}
+		return []byte{tid, byte(maxLen)}
+
+	// Nullable datetime: DATETIMEN (0x6F)
+	case tid == 0x6F:
+		maxLen := col.FixedLen
+		if maxLen == 0 {
+			maxLen = 8
+		}
+		return []byte{tid, byte(maxLen)}
+
+	// GUID: GUIDN (0x24)
+	case tid == 0x24:
+		return []byte{tid, 16}
+
+	// DECIMAL/NUMERIC (0x6A, 0x6C)
+	case tid == 0x6A || tid == 0x6C:
+		maxLen := col.FixedLen
+		if maxLen == 0 {
+			maxLen = 17
+		}
+		return []byte{tid, byte(maxLen), col.Precision, col.Scale}
+
+	// NVARCHAR/NCHAR (0xE7, 0xEF)
+	case tid == 0xE7 || tid == 0xEF:
+		maxLen := col.MaxLen
+		if maxLen == 0 {
+			maxLen = 8000
+		}
+		collation := col.Collation
+		if len(collation) != 5 {
+			collation = []byte{0x09, 0x04, 0xD0, 0x00, 0x34}
+		}
+		b := []byte{tid, byte(maxLen), byte(maxLen >> 8)}
+		b = append(b, collation...)
+		return b
+
+	// VARCHAR/CHAR (0xA7, 0xAF)
+	case tid == 0xA7 || tid == 0xAF:
+		maxLen := col.MaxLen
+		if maxLen == 0 {
+			maxLen = 8000
+		}
+		collation := col.Collation
+		if len(collation) != 5 {
+			collation = []byte{0x09, 0x04, 0xD0, 0x00, 0x34}
+		}
+		b := []byte{tid, byte(maxLen), byte(maxLen >> 8)}
+		b = append(b, collation...)
+		return b
+
+	// VARBINARY (0xAD)
+	case tid == 0xAD:
+		maxLen := col.MaxLen
+		if maxLen == 0 {
+			maxLen = 8000
+		}
+		return []byte{tid, byte(maxLen), byte(maxLen >> 8)}
+
+	// DATE (0x28)
+	case tid == 0x28:
+		return []byte{tid}
+
+	// TIME/DATETIME2/DATETIMEOFFSET (0x29/0x2A/0x2B)
+	case tid == 0x29 || tid == 0x2A || tid == 0x2B:
+		return []byte{tid, col.Scale}
+
+	// Fixed-length types: emit as their nullable equivalent for safety.
+	case tid == 0x38: // INT → INTN
+		return []byte{0x26, 4}
+	case tid == 0x34: // SMALLINT → INTN
+		return []byte{0x26, 2}
+	case tid == 0x30: // TINYINT → INTN
+		return []byte{0x26, 1}
+	case tid == 0x7F: // BIGINT → INTN
+		return []byte{0x26, 8}
+	case tid == 0x32: // BIT → BITN
+		return []byte{0x68, 1}
+	case tid == 0x3B: // REAL → FLTN
+		return []byte{0x6D, 4}
+	case tid == 0x3E: // FLOAT → FLTN
+		return []byte{0x6D, 8}
+	case tid == 0x3D: // DATETIME → DATETIMEN
+		return []byte{0x6F, 8}
+	case tid == 0x3A: // SMALLDATETIME → DATETIMEN
+		return []byte{0x6F, 4}
+	case tid == 0x3C: // MONEY → MONEYN
+		return []byte{0x6E, 8}
+	case tid == 0x7A: // SMALLMONEY → MONEYN
+		return []byte{0x6E, 4}
+
+	default:
+		// Unknown type: fall back to NVARCHAR(4000).
+		return []byte{0xE7, 0x40, 0x1F, 0x09, 0x04, 0xD0, 0x00, 0x34}
+	}
+}
+
+// encodeColumnValue encodes a string value into the TDS binary format for its column type.
+func encodeColumnValue(val string, isNull bool, col TDSColumnInfo) []byte {
+	tid := col.TypeID
+	// Map fixed types to their nullable equivalents for encoding.
+	switch tid {
+	case 0x38, 0x34, 0x30, 0x7F:
+		tid = 0x26
+	case 0x32:
+		tid = 0x68
+	case 0x3B, 0x3E:
+		tid = 0x6D
+	case 0x3D, 0x3A:
+		tid = 0x6F
+	case 0x3C, 0x7A:
+		tid = 0x6E
+	}
+
+	switch {
+	case tid == 0x26: // INTN
+		if isNull {
+			return []byte{0}
+		}
+		n, err := parseInt64(val)
+		if err != nil {
+			return encodeAsNVARCHAR(val, isNull)
+		}
+		maxLen := col.FixedLen
+		if maxLen == 0 {
+			maxLen = 4
+		}
+		// Map fixed types.
+		switch col.TypeID {
+		case 0x30:
+			maxLen = 1
+		case 0x34:
+			maxLen = 2
+		case 0x38:
+			maxLen = 4
+		case 0x7F:
+			maxLen = 8
+		}
+		switch {
+		case maxLen <= 1:
+			return []byte{1, byte(n)}
+		case maxLen <= 2:
+			b := make([]byte, 3)
+			b[0] = 2
+			binary.LittleEndian.PutUint16(b[1:], uint16(n))
+			return b
+		case maxLen <= 4:
+			b := make([]byte, 5)
+			b[0] = 4
+			binary.LittleEndian.PutUint32(b[1:], uint32(n))
+			return b
+		default:
+			b := make([]byte, 9)
+			b[0] = 8
+			binary.LittleEndian.PutUint64(b[1:], uint64(n))
+			return b
+		}
+
+	case tid == 0x68: // BITN
+		if isNull {
+			return []byte{0}
+		}
+		if val == "1" || strings.EqualFold(val, "true") {
+			return []byte{1, 1}
+		}
+		return []byte{1, 0}
+
+	case tid == 0x6D: // FLTN
+		if isNull {
+			return []byte{0}
+		}
+		f, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return encodeAsNVARCHAR(val, isNull)
+		}
+		maxLen := col.FixedLen
+		if maxLen == 0 {
+			maxLen = 8
+		}
+		if col.TypeID == 0x3B {
+			maxLen = 4
+		}
+		if maxLen <= 4 {
+			b := make([]byte, 5)
+			b[0] = 4
+			binary.LittleEndian.PutUint32(b[1:], math.Float32bits(float32(f)))
+			return b
+		}
+		b := make([]byte, 9)
+		b[0] = 8
+		binary.LittleEndian.PutUint64(b[1:], math.Float64bits(f))
+		return b
+
+	case tid == 0x6E: // MONEYN
+		if isNull {
+			return []byte{0}
+		}
+		// Parse money: remove currency symbols, parse as float, multiply by 10000.
+		cleaned := strings.TrimLeft(val, "$£€ ")
+		f, err := strconv.ParseFloat(cleaned, 64)
+		if err != nil {
+			return encodeAsNVARCHAR(val, isNull)
+		}
+		raw := int64(f * 10000)
+		maxLen := col.FixedLen
+		if maxLen == 0 {
+			maxLen = 8
+		}
+		if col.TypeID == 0x7A {
+			maxLen = 4
+		}
+		if maxLen <= 4 {
+			b := make([]byte, 5)
+			b[0] = 4
+			binary.LittleEndian.PutUint32(b[1:], uint32(int32(raw)))
+			return b
+		}
+		b := make([]byte, 9)
+		b[0] = 8
+		hi := uint32(raw >> 32)
+		lo := uint32(raw)
+		binary.LittleEndian.PutUint32(b[1:], hi)
+		binary.LittleEndian.PutUint32(b[5:], lo)
+		return b
+
+	case tid == 0x6F: // DATETIMEN
+		// Datetime encoding is complex; fall back to NVARCHAR for synthesized responses.
+		return encodeAsNVARCHAR(val, isNull)
+
+	case tid == 0x24: // GUIDN
+		if isNull {
+			return []byte{0}
+		}
+		b := encodeGUID(val)
+		if b == nil {
+			return encodeAsNVARCHAR(val, isNull)
+		}
+		return append([]byte{16}, b...)
+
+	case tid == 0x6A || tid == 0x6C: // DECIMALN / NUMERICN
+		if isNull {
+			return []byte{0}
+		}
+		return encodeDecimalValue(val, col)
+
+	case tid == 0xE7 || tid == 0xEF: // NVARCHAR / NCHAR
+		return encodeAsNVARCHAR(val, isNull)
+
+	case tid == 0xA7 || tid == 0xAF: // VARCHAR / CHAR
+		if isNull {
+			return []byte{0xFF, 0xFF}
+		}
+		b := []byte(val)
+		dataLen := len(b)
+		out := make([]byte, 2+dataLen)
+		binary.LittleEndian.PutUint16(out, uint16(dataLen))
+		copy(out[2:], b)
+		return out
+
+	case tid == 0xAD: // VARBINARY
+		if isNull {
+			return []byte{0xFF, 0xFF}
+		}
+		// Value is hex-encoded string.
+		b, err := hexDecode(val)
+		if err != nil {
+			b = []byte(val)
+		}
+		dataLen := len(b)
+		out := make([]byte, 2+dataLen)
+		binary.LittleEndian.PutUint16(out, uint16(dataLen))
+		copy(out[2:], b)
+		return out
+
+	case tid == 0x28: // DATE
+		// Fall back to NVARCHAR for date values in synthesized responses.
+		return encodeAsNVARCHAR(val, isNull)
+
+	case tid == 0x29 || tid == 0x2A || tid == 0x2B: // TIME, DATETIME2, DATETIMEOFFSET
+		return encodeAsNVARCHAR(val, isNull)
+
+	default:
+		return encodeAsNVARCHAR(val, isNull)
+	}
+}
+
+// encodeAsNVARCHAR encodes a value as NVARCHAR (the fallback encoding).
+func encodeAsNVARCHAR(val string, isNull bool) []byte {
+	if isNull {
+		return []byte{0xFF, 0xFF}
+	}
+	valUTF16 := encodeUTF16LE(val)
+	dataLen := len(valUTF16)
+	out := make([]byte, 2+dataLen)
+	binary.LittleEndian.PutUint16(out, uint16(dataLen))
+	copy(out[2:], valUTF16)
+	return out
+}
+
+// parseInt64 parses a string as int64, handling decimal points by truncating.
+func parseInt64(s string) (int64, error) {
+	// Handle decimal points (e.g., "42.0" from float columns).
+	if dotIdx := strings.Index(s, "."); dotIdx >= 0 {
+		s = s[:dotIdx]
+	}
+	return strconv.ParseInt(s, 10, 64)
+}
+
+// encodeGUID encodes a GUID string (XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX) to 16 bytes.
+func encodeGUID(s string) []byte {
+	s = strings.ReplaceAll(s, "-", "")
+	if len(s) != 32 {
+		return nil
+	}
+	b, err := hexDecode(s)
+	if err != nil || len(b) != 16 {
+		return nil
+	}
+	// GUID byte order: first 3 groups are LE.
+	// Swap group 1 (4 bytes), group 2 (2 bytes), group 3 (2 bytes).
+	b[0], b[1], b[2], b[3] = b[3], b[2], b[1], b[0]
+	b[4], b[5] = b[5], b[4]
+	b[6], b[7] = b[7], b[6]
+	return b
+}
+
+// hexDecode decodes a hex string to bytes.
+func hexDecode(s string) ([]byte, error) {
+	if len(s)%2 != 0 {
+		return nil, fmt.Errorf("odd hex length")
+	}
+	b := make([]byte, len(s)/2)
+	for i := 0; i < len(s); i += 2 {
+		hi := hexVal(s[i])
+		lo := hexVal(s[i+1])
+		if hi < 0 || lo < 0 {
+			return nil, fmt.Errorf("invalid hex")
+		}
+		b[i/2] = byte(hi<<4 | lo)
+	}
+	return b, nil
+}
+
+func hexVal(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	case c >= 'A' && c <= 'F':
+		return int(c-'A') + 10
+	default:
+		return -1
+	}
+}
+
+// encodeDecimalValue encodes a decimal string to DECIMAL/NUMERIC TDS binary format.
+func encodeDecimalValue(val string, col TDSColumnInfo) []byte {
+	sign := byte(1) // positive
+	s := val
+	if strings.HasPrefix(s, "-") {
+		sign = 0
+		s = s[1:]
+	}
+
+	// Remove decimal point to get the unscaled integer.
+	scale := int(col.Scale)
+	if dotIdx := strings.Index(s, "."); dotIdx >= 0 {
+		fracPart := s[dotIdx+1:]
+		intPart := s[:dotIdx]
+		// Pad or truncate fractional part to match scale.
+		if len(fracPart) < scale {
+			fracPart += strings.Repeat("0", scale-len(fracPart))
+		} else if len(fracPart) > scale {
+			fracPart = fracPart[:scale]
+		}
+		s = intPart + fracPart
+	} else if scale > 0 {
+		s += strings.Repeat("0", scale)
+	}
+
+	// Parse the unscaled integer.
+	raw, err := strconv.ParseUint(strings.TrimLeft(s, "0"), 10, 64)
+	if err != nil && s != "" {
+		return encodeAsNVARCHAR(val, false)
+	}
+
+	// Encode as LE bytes.
+	maxLen := col.FixedLen
+	if maxLen == 0 {
+		maxLen = 17
+	}
+	dataLen := maxLen
+	buf := make([]byte, 1+dataLen)
+	buf[0] = byte(dataLen)
+	buf[1] = sign
+	// Write raw as LE bytes after the sign byte.
+	for i := 2; i < 1+dataLen && raw > 0; i++ {
+		buf[i] = byte(raw & 0xFF)
+		raw >>= 8
+	}
+	return buf
 }
 
 // quoteIdentMSSQL quotes a SQL identifier with brackets for MSSQL.

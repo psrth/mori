@@ -197,6 +197,40 @@ func (fke *FKEnforcer) CheckParentExists(fk coreSchema.ForeignKey, childValues m
 		fk.ChildTable, childColStr, valStr, parentTable)
 }
 
+// EnforceDeleteRestrict checks RESTRICT/NO ACTION FK constraints before a parent delete.
+// Returns an error if child rows exist that would be orphaned.
+func (fke *FKEnforcer) EnforceDeleteRestrict(table string, deletedPKs []string) error {
+	refFKs := fke.schemaRegistry.GetReferencingFKs(table)
+	if len(refFKs) == 0 {
+		return nil
+	}
+
+	meta, hasMeta := fke.tables[table]
+	if !hasMeta || len(meta.PKColumns) == 0 {
+		return nil
+	}
+	pkCol := meta.PKColumns[0]
+
+	for _, fk := range refFKs {
+		if len(fk.ParentColumns) != 1 || !strings.EqualFold(fk.ParentColumns[0], pkCol) {
+			continue
+		}
+		if len(fk.ChildColumns) != 1 {
+			continue
+		}
+
+		switch fk.OnDelete {
+		case "RESTRICT", "NO ACTION", "":
+			if fke.childRowsExist(fk.ChildTable, fk.ChildColumns[0], deletedPKs) {
+				return fmt.Errorf("update or delete on table %q violates foreign key constraint on table %q: "+
+					"key is still referenced from table %q",
+					table, fk.ChildTable, fk.ChildTable)
+			}
+		}
+	}
+	return nil
+}
+
 // EnforceDeleteCascade handles cascade/restrict logic when a parent row is deleted.
 func (fke *FKEnforcer) EnforceDeleteCascade(table string, deletedPKs []string) error {
 	refFKs := fke.schemaRegistry.GetReferencingFKs(table)

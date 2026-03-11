@@ -4,9 +4,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
@@ -39,6 +41,10 @@ type ExtHandler struct {
 	writeHandler *WriteHandler
 	// readHandler for dispatching reads extracted from RPCs.
 	readHandler *ReadHandler
+
+	// Cursor materialization: tracks cursors opened on Shadow via temp tables.
+	cursorMu            sync.RWMutex
+	materializedCursors map[int32][]string // cursor handle → temp table names
 }
 
 // HandleRPC processes a TDS RPC request packet. It attempts to extract
@@ -72,22 +78,42 @@ func (eh *ExtHandler) HandleRPC(
 		// Still forward to prod — sp_unprepare must reach the server.
 		return false, nil
 
-	// P2 §3.8: Cursor operations — forward to both backends.
+	// P2 §3.8: Cursor operations — materialize for dirty tables.
 	case "SP_CURSOROPEN", "SP_CURSORPREPARE", "SP_CURSORPREPEXEC":
 		return true, eh.handleCursorOpen(clientConn, allRaw, fullPayload, sqlText)
 
 	case "SP_CURSORFETCH":
-		// Cursor fetch — forward to prod (cursor state lives there).
+		// Check if this cursor was materialized on Shadow.
+		if handle := eh.extractCursorHandleFromRPC(fullPayload); handle != 0 {
+			if eh.isMaterializedCursor(handle) {
+				return true, forwardAndRelay(allRaw, eh.shadowConn, clientConn)
+			}
+		}
+		// Default: forward to prod (cursor state lives there).
 		return false, nil
 
 	case "SP_CURSORCLOSE", "SP_CURSORUNPREPARE":
-		// Forward to both backends to clean up cursor state.
+		if handle := eh.extractCursorHandleFromRPC(fullPayload); handle != 0 {
+			if temps := eh.getMaterializedCursorTemps(handle); temps != nil {
+				for _, t := range temps {
+					dropUtilTable(eh.shadowConn, t)
+				}
+				eh.removeMaterializedCursor(handle)
+				return true, forwardAndRelay(allRaw, eh.shadowConn, clientConn)
+			}
+		}
+		// Default: forward to both backends to clean up cursor state.
 		eh.shadowConn.Write(allRaw) //nolint: errcheck
 		drainTDSResponse(eh.shadowConn)
 		return false, nil
 
 	case "SP_CURSOREXECUTE":
-		// Forward to prod for cursor execution.
+		// Check if this is a materialized cursor.
+		if handle := eh.extractCursorHandleFromRPC(fullPayload); handle != 0 {
+			if eh.isMaterializedCursor(handle) {
+				return true, forwardAndRelay(allRaw, eh.shadowConn, clientConn)
+			}
+		}
 		return false, nil
 
 	default:
@@ -271,11 +297,11 @@ func skipRPCParam(payload []byte, pos int) int {
 	if pos >= len(payload) {
 		return pos
 	}
-	// TYPE_INFO + value (simplified skip).
+	// TYPE_INFO + value.
 	typeID := payload[pos]
 	pos++
 	switch typeID {
-	case 0x26: // INTN
+	case 0x26, 0x68, 0x6D, 0x6E, 0x6F, 0x24: // INTN, BITN, FLTN, MONEYN, DATETIMEN, GUIDN
 		if pos >= len(payload) {
 			return pos
 		}
@@ -286,7 +312,20 @@ func skipRPCParam(payload []byte, pos int) int {
 		dataLen := int(payload[pos])
 		pos++
 		pos += dataLen
-	case 0xE7: // NVARCHAR
+
+	case 0x6A, 0x6C: // DECIMALN, NUMERICN
+		if pos+3 > len(payload) {
+			return pos
+		}
+		pos += 3 // max length + precision + scale
+		if pos >= len(payload) {
+			return pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		pos += dataLen
+
+	case 0xE7, 0xEF: // NVARCHAR, NCHAR
 		if pos+7 > len(payload) {
 			return pos
 		}
@@ -319,8 +358,130 @@ func skipRPCParam(payload []byte, pos int) int {
 				pos += dataLen
 			}
 		}
+
+	case 0xA7, 0xAF: // VARCHAR, CHAR
+		if pos+7 > len(payload) {
+			return pos
+		}
+		maxLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2 + 5 // max length + collation
+		if maxLen == 0xFFFF {
+			if pos+8 > len(payload) {
+				return pos
+			}
+			pos += 8
+			for {
+				if pos+4 > len(payload) {
+					return pos
+				}
+				chunkLen := int(binary.LittleEndian.Uint32(payload[pos : pos+4]))
+				pos += 4
+				if chunkLen == 0 {
+					break
+				}
+				pos += chunkLen
+			}
+		} else {
+			if pos+2 > len(payload) {
+				return pos
+			}
+			dataLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+			pos += 2
+			if dataLen != 0xFFFF {
+				pos += dataLen
+			}
+		}
+
+	case 0xAD: // VARBINARY
+		if pos+2 > len(payload) {
+			return pos
+		}
+		maxLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+		if maxLen == 0xFFFF {
+			if pos+8 > len(payload) {
+				return pos
+			}
+			pos += 8
+			for {
+				if pos+4 > len(payload) {
+					return pos
+				}
+				chunkLen := int(binary.LittleEndian.Uint32(payload[pos : pos+4]))
+				pos += 4
+				if chunkLen == 0 {
+					break
+				}
+				pos += chunkLen
+			}
+		} else {
+			if pos+2 > len(payload) {
+				return pos
+			}
+			dataLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+			pos += 2
+			if dataLen != 0xFFFF {
+				pos += dataLen
+			}
+		}
+
+	case 0x28: // DATE (no metadata bytes, 1-byte length + 3-byte value)
+		if pos >= len(payload) {
+			return pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		pos += dataLen
+
+	case 0x29, 0x2A, 0x2B: // TIME, DATETIME2, DATETIMEOFFSET
+		if pos >= len(payload) {
+			return pos
+		}
+		pos++ // scale byte
+		if pos >= len(payload) {
+			return pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		pos += dataLen
+
+	case 0x62: // SQL_VARIANT
+		if pos+4 > len(payload) {
+			return pos
+		}
+		pos += 4 // max length
+		if pos+4 > len(payload) {
+			return pos
+		}
+		dataLen := int(binary.LittleEndian.Uint32(payload[pos : pos+4]))
+		pos += 4
+		pos += dataLen
+
+	case 0x30: // TINYINT (fixed 1)
+		pos++
+	case 0x32: // BIT (fixed 1)
+		pos++
+	case 0x34: // SMALLINT (fixed 2)
+		pos += 2
+	case 0x38: // INT (fixed 4)
+		pos += 4
+	case 0x3B: // REAL (fixed 4)
+		pos += 4
+	case 0x3E: // FLOAT (fixed 8)
+		pos += 8
+	case 0x7A: // SMALLMONEY (fixed 4)
+		pos += 4
+	case 0x3C: // MONEY (fixed 8)
+		pos += 8
+	case 0x7F: // BIGINT (fixed 8)
+		pos += 8
+	case 0x3D: // DATETIME (fixed 8)
+		pos += 8
+	case 0x3A: // SMALLDATETIME (fixed 4)
+		pos += 4
+
 	default:
-		// Unknown type — can't skip reliably, return current position.
+		// Unknown type — can't skip reliably, bail.
 		return len(payload)
 	}
 	return pos
@@ -361,13 +522,17 @@ func extractRPCParamValue(payload []byte, pos int) (interface{}, int) {
 			return nil, pos
 		}
 		switch dataLen {
-		case 4:
-			val := int32(binary.LittleEndian.Uint32(payload[pos : pos+4]))
-			pos += 4
+		case 1:
+			val := int64(payload[pos])
+			pos++
 			return val, pos
 		case 2:
-			val := int16(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+			val := int64(int16(binary.LittleEndian.Uint16(payload[pos : pos+2])))
 			pos += 2
+			return val, pos
+		case 4:
+			val := int64(int32(binary.LittleEndian.Uint32(payload[pos : pos+4])))
+			pos += 4
 			return val, pos
 		case 8:
 			val := int64(binary.LittleEndian.Uint64(payload[pos : pos+8]))
@@ -377,7 +542,189 @@ func extractRPCParamValue(payload []byte, pos int) (interface{}, int) {
 			pos += dataLen
 			return nil, pos
 		}
-	case 0xE7: // NVARCHAR
+
+	case 0x68: // BITN
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		pos++ // max length
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos >= len(payload) {
+			return nil, pos
+		}
+		if payload[pos] != 0 {
+			pos++
+			return "1", pos
+		}
+		pos++
+		return "0", pos
+
+	case 0x6D: // FLTN
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		pos++ // max length
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		switch dataLen {
+		case 4:
+			bits := binary.LittleEndian.Uint32(payload[pos : pos+4])
+			val := math.Float32frombits(bits)
+			pos += 4
+			return fmt.Sprintf("%g", val), pos
+		case 8:
+			bits := binary.LittleEndian.Uint64(payload[pos : pos+8])
+			val := math.Float64frombits(bits)
+			pos += 8
+			return fmt.Sprintf("%g", val), pos
+		default:
+			pos += dataLen
+			return nil, pos
+		}
+
+	case 0x6E: // MONEYN
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		pos++ // max length
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		switch dataLen {
+		case 4:
+			raw := int64(int32(binary.LittleEndian.Uint32(payload[pos : pos+4])))
+			pos += 4
+			whole := raw / 10000
+			frac := raw % 10000
+			if frac < 0 {
+				frac = -frac
+			}
+			return fmt.Sprintf("%d.%04d", whole, frac), pos
+		case 8:
+			hi := int64(int32(binary.LittleEndian.Uint32(payload[pos : pos+4])))
+			lo := int64(binary.LittleEndian.Uint32(payload[pos+4 : pos+8]))
+			raw := (hi << 32) | lo
+			pos += 8
+			whole := raw / 10000
+			frac := raw % 10000
+			if frac < 0 {
+				frac = -frac
+			}
+			return fmt.Sprintf("%d.%04d", whole, frac), pos
+		default:
+			pos += dataLen
+			return nil, pos
+		}
+
+	case 0x6F: // DATETIMEN
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		pos++ // max length
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		switch dataLen {
+		case 4:
+			days := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+			minutes := int(binary.LittleEndian.Uint16(payload[pos+2 : pos+4]))
+			base := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+			t := base.AddDate(0, 0, days).Add(time.Duration(minutes) * time.Minute)
+			pos += 4
+			return t.Format("2006-01-02T15:04:05"), pos
+		case 8:
+			days := int(int32(binary.LittleEndian.Uint32(payload[pos : pos+4])))
+			ticks := int64(binary.LittleEndian.Uint32(payload[pos+4 : pos+8]))
+			base := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
+			t := base.AddDate(0, 0, days)
+			ns := ticks * 10000000 / 3
+			t = t.Add(time.Duration(ns) * time.Nanosecond)
+			pos += 8
+			return t.Format("2006-01-02T15:04:05.000"), pos
+		default:
+			pos += dataLen
+			return nil, pos
+		}
+
+	case 0x24: // GUIDN
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		pos++ // max length
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos+dataLen > len(payload) || dataLen != 16 {
+			pos += dataLen
+			return nil, pos
+		}
+		d := payload[pos : pos+16]
+		guid := fmt.Sprintf("%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+			binary.LittleEndian.Uint32(d[0:4]),
+			binary.LittleEndian.Uint16(d[4:6]),
+			binary.LittleEndian.Uint16(d[6:8]),
+			d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15])
+		pos += 16
+		return guid, pos
+
+	case 0x6A, 0x6C: // DECIMALN, NUMERICN
+		if pos+3 > len(payload) {
+			return nil, pos
+		}
+		pos++                  // max length
+		_ = payload[pos]       // precision
+		scale := payload[pos+1] // scale
+		pos += 2
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		sign := payload[pos]
+		remaining := payload[pos+1 : pos+dataLen]
+		pos += dataLen
+		var raw uint64
+		for i := len(remaining) - 1; i >= 0; i-- {
+			raw = (raw << 8) | uint64(remaining[i])
+		}
+		str := fmt.Sprintf("%d", raw)
+		sc := int(scale)
+		if sc > 0 && sc < len(str) {
+			str = str[:len(str)-sc] + "." + str[len(str)-sc:]
+		} else if sc > 0 {
+			str = "0." + strings.Repeat("0", sc-len(str)) + str
+		}
+		if sign == 0 {
+			str = "-" + str
+		}
+		return str, pos
+
+	case 0xE7, 0xEF: // NVARCHAR, NCHAR
 		if pos+7 > len(payload) {
 			return nil, pos
 		}
@@ -385,7 +732,6 @@ func extractRPCParamValue(payload []byte, pos int) (interface{}, int) {
 		pos += 2 + 5
 		if maxLen == 0xFFFF {
 			str := readPLPString(payload, pos)
-			// Skip PLP data.
 			if pos+8 > len(payload) {
 				return str, pos
 			}
@@ -417,6 +763,92 @@ func extractRPCParamValue(payload []byte, pos int) (interface{}, int) {
 		str := decodeUTF16LE(payload[pos : pos+dataLen])
 		pos += dataLen
 		return str, pos
+
+	case 0xA7, 0xAF: // VARCHAR, CHAR
+		if pos+7 > len(payload) {
+			return nil, pos
+		}
+		maxLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2 + 5
+		if maxLen == 0xFFFF {
+			val, _, newPos := readPLPValue(payload, pos, false)
+			return val, newPos
+		}
+		if pos+2 > len(payload) {
+			return nil, pos
+		}
+		dataLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+		if dataLen == 0xFFFF {
+			return nil, pos
+		}
+		if pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		str := string(payload[pos : pos+dataLen])
+		pos += dataLen
+		return str, pos
+
+	case 0xAD: // VARBINARY
+		if pos+2 > len(payload) {
+			return nil, pos
+		}
+		maxLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+		if maxLen == 0xFFFF {
+			val, _, newPos := readPLPValue(payload, pos, false)
+			return val, newPos
+		}
+		if pos+2 > len(payload) {
+			return nil, pos
+		}
+		dataLen := int(binary.LittleEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+		if dataLen == 0xFFFF {
+			return nil, pos
+		}
+		if pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		val := fmt.Sprintf("%x", payload[pos:pos+dataLen])
+		pos += dataLen
+		return val, pos
+
+	case 0x28: // DATE
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		days := int(payload[pos]) | int(payload[pos+1])<<8 | int(payload[pos+2])<<16
+		base := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+		t := base.AddDate(0, 0, days)
+		pos += dataLen
+		return t.Format("2006-01-02"), pos
+
+	case 0x29, 0x2A, 0x2B: // TIME, DATETIME2, DATETIMEOFFSET
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		scale := payload[pos]
+		pos++
+		if pos >= len(payload) {
+			return nil, pos
+		}
+		dataLen := int(payload[pos])
+		pos++
+		if dataLen == 0 || pos+dataLen > len(payload) {
+			return nil, pos
+		}
+		// Use hex encoding as fallback — sufficient for classification.
+		val := fmt.Sprintf("%x", payload[pos:pos+dataLen])
+		pos += dataLen
+		_ = scale
+		return val, pos
+
 	default:
 		return nil, len(payload)
 	}
@@ -753,22 +1185,285 @@ func readPLPString(payload []byte, pos int) string {
 	return decodeUTF16LE(allData)
 }
 
-// handleCursorOpen processes cursor open RPCs by classifying the inner query.
-// If the query affects dirty tables, the cursor is opened on prod (as fallback).
-// Full cursor materialization via temp tables is a future enhancement.
+// handleCursorOpen processes cursor open RPCs. If the inner query references
+// dirty tables (deltas, tombstones, schema diffs), materializes the merged
+// data into temp tables on Shadow, rewrites the SQL, and opens the cursor
+// on Shadow. Otherwise, forwards to Prod.
 func (eh *ExtHandler) handleCursorOpen(
 	clientConn net.Conn,
 	allRaw []byte,
-	_ []byte,
+	fullPayload []byte,
 	sqlText string,
 ) error {
-	// For now, forward cursor opens to prod.
-	// Future: classify inner query, if dirty tables → materialize via merged read.
-	if eh.verbose && sqlText != "" {
-		log.Printf("[conn %d] ext: cursor open, forwarding to prod: %s",
-			eh.connID, truncateSQL(sqlText, 80))
+	// If no SQL text or no read handler, forward to Prod.
+	if sqlText == "" || eh.readHandler == nil {
+		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
 	}
-	return forwardAndRelay(allRaw, eh.prodConn, clientConn)
+
+	// Classify the inner query.
+	cl, err := eh.classifier.Classify(sqlText)
+	if err != nil || cl == nil || len(cl.Tables) == 0 {
+		if eh.verbose {
+			log.Printf("[conn %d] ext: cursor open, classify failed or no tables, forwarding to prod", eh.connID)
+		}
+		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
+	}
+
+	// Check for dirty tables.
+	var dirtyTables []string
+	for _, table := range cl.Tables {
+		if eh.readHandler.isTableDirty(table) {
+			dirtyTables = append(dirtyTables, table)
+		}
+	}
+
+	if len(dirtyTables) == 0 {
+		if eh.verbose {
+			log.Printf("[conn %d] ext: cursor open, no dirty tables, forwarding to prod: %s",
+				eh.connID, truncateSQL(sqlText, 80))
+		}
+		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
+	}
+
+	if eh.verbose {
+		log.Printf("[conn %d] ext: cursor open, materializing %d dirty tables: %s",
+			eh.connID, len(dirtyTables), truncateSQL(sqlText, 80))
+	}
+
+	// Materialize each dirty table into a temp table on Shadow.
+	rewriteMap := make(map[string]string) // original → temp table
+	var tempNames []string
+	for _, table := range dirtyTables {
+		baseSQL := "SELECT * FROM " + quoteIdentMSSQL(table)
+		baseCl := &core.Classification{
+			OpType:  core.OpRead,
+			SubType: core.SubSelect,
+			RawSQL:  baseSQL,
+			Tables:  []string{table},
+		}
+		columns, values, nulls, mergeErr := eh.readHandler.mergedReadCore(baseCl, baseSQL)
+		if mergeErr != nil {
+			if eh.verbose {
+				log.Printf("[conn %d] ext: cursor materialize failed for %s: %v", eh.connID, table, mergeErr)
+			}
+			// Clean up and fall back to Prod.
+			for _, tn := range tempNames {
+				dropUtilTable(eh.shadowConn, tn)
+			}
+			return forwardAndRelay(allRaw, eh.prodConn, clientConn)
+		}
+
+		tempName, matErr := materializeToTempTable(eh.shadowConn, "cursor_"+table, columns, values, nulls)
+		if matErr != nil {
+			if eh.verbose {
+				log.Printf("[conn %d] ext: cursor temp table creation failed for %s: %v", eh.connID, table, matErr)
+			}
+			for _, tn := range tempNames {
+				dropUtilTable(eh.shadowConn, tn)
+			}
+			return forwardAndRelay(allRaw, eh.prodConn, clientConn)
+		}
+		rewriteMap[table] = tempName
+		tempNames = append(tempNames, tempName)
+	}
+
+	// Rewrite the SQL to reference temp tables.
+	rewrittenSQL := sqlText
+	for original, temp := range rewriteMap {
+		rewrittenSQL = rewriteTableReference(rewrittenSQL, original, temp)
+	}
+
+	// Rebuild the cursor open RPC with rewritten SQL.
+	newRaw := eh.rebuildCursorOpenRPC(allRaw, fullPayload, sqlText, rewrittenSQL)
+
+	// Forward to Shadow and capture the cursor handle from the response.
+	if _, writeErr := eh.shadowConn.Write(newRaw); writeErr != nil {
+		for _, tn := range tempNames {
+			dropUtilTable(eh.shadowConn, tn)
+		}
+		return fmt.Errorf("sending cursor open to shadow: %w", writeErr)
+	}
+
+	handle, relayErr := eh.relayAndExtractHandle(eh.shadowConn, clientConn)
+	if relayErr != nil {
+		for _, tn := range tempNames {
+			dropUtilTable(eh.shadowConn, tn)
+		}
+		return relayErr
+	}
+
+	// Track the materialized cursor.
+	if handle != 0 {
+		eh.cursorMu.Lock()
+		if eh.materializedCursors == nil {
+			eh.materializedCursors = make(map[int32][]string)
+		}
+		eh.materializedCursors[handle] = tempNames
+		eh.cursorMu.Unlock()
+
+		if eh.verbose {
+			log.Printf("[conn %d] ext: cursor open materialized, handle=%d, %d temp tables",
+				eh.connID, handle, len(tempNames))
+		}
+	} else {
+		// No handle captured — clean up temp tables.
+		for _, tn := range tempNames {
+			dropUtilTable(eh.shadowConn, tn)
+		}
+	}
+
+	return nil
+}
+
+// rebuildCursorOpenRPC rebuilds a cursor open RPC message with a rewritten SQL parameter.
+// It finds the SQL text in the raw payload and replaces it with the new SQL.
+func (eh *ExtHandler) rebuildCursorOpenRPC(allRaw, fullPayload []byte, oldSQL, newSQL string) []byte {
+	// Find the old SQL in the raw payload (as UTF-16LE).
+	oldUTF16 := encodeUTF16LE(oldSQL)
+	newUTF16 := encodeUTF16LE(newSQL)
+
+	// Search for the old SQL bytes in allRaw.
+	idx := bytesIndex(allRaw, oldUTF16)
+	if idx < 0 {
+		// Can't find the SQL — return original.
+		return allRaw
+	}
+
+	// Calculate the length difference.
+	lenDiff := len(newUTF16) - len(oldUTF16)
+
+	// Build new raw message with replaced SQL.
+	newRaw := make([]byte, 0, len(allRaw)+lenDiff)
+	newRaw = append(newRaw, allRaw[:idx]...)
+	newRaw = append(newRaw, newUTF16...)
+	newRaw = append(newRaw, allRaw[idx+len(oldUTF16):]...)
+
+	// Update the 2-byte data length prefix before the SQL (if present).
+	// The length prefix is 2 bytes before the SQL data.
+	if idx >= 2 {
+		oldDataLen := binary.LittleEndian.Uint16(allRaw[idx-2 : idx])
+		if int(oldDataLen) == len(oldUTF16) {
+			newDataLen := uint16(len(newUTF16))
+			binary.LittleEndian.PutUint16(newRaw[idx-2:], newDataLen)
+		}
+	}
+
+	// Fix TDS packet header lengths (8-byte header, bytes 2-3 = total packet length).
+	// Rebuild packets to fix framing.
+	return rebuildTDSPacketFraming(newRaw)
+}
+
+// bytesIndex finds the first occurrence of needle in haystack.
+func bytesIndex(haystack, needle []byte) int {
+	for i := 0; i <= len(haystack)-len(needle); i++ {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			if haystack[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// rebuildTDSPacketFraming fixes TDS packet headers after payload modification.
+// TDS packets have an 8-byte header with total length at bytes 2-3.
+func rebuildTDSPacketFraming(raw []byte) []byte {
+	if len(raw) < 8 {
+		return raw
+	}
+	// For single-packet messages, just fix the length.
+	pktType := raw[0]
+	status := raw[1]
+
+	// Build a single EOM packet with all the payload.
+	payload := raw[8:]
+	totalLen := 8 + len(payload)
+	if totalLen > 0xFFFF {
+		totalLen = 0xFFFF // TDS max packet size
+	}
+
+	result := make([]byte, 8+len(payload))
+	result[0] = pktType
+	result[1] = status | statusEOM
+	binary.BigEndian.PutUint16(result[2:4], uint16(totalLen))
+	result[4] = 0 // SPID
+	result[5] = 0
+	result[6] = 0 // PacketID
+	result[7] = 0
+	copy(result[8:], payload)
+
+	return result
+}
+
+// isMaterializedCursor checks if a cursor handle was materialized on Shadow.
+func (eh *ExtHandler) isMaterializedCursor(handle int32) bool {
+	eh.cursorMu.RLock()
+	defer eh.cursorMu.RUnlock()
+	_, ok := eh.materializedCursors[handle]
+	return ok
+}
+
+// getMaterializedCursorTemps returns temp table names for a materialized cursor.
+func (eh *ExtHandler) getMaterializedCursorTemps(handle int32) []string {
+	eh.cursorMu.RLock()
+	defer eh.cursorMu.RUnlock()
+	return eh.materializedCursors[handle]
+}
+
+// removeMaterializedCursor removes a cursor from the materialized tracking.
+func (eh *ExtHandler) removeMaterializedCursor(handle int32) {
+	eh.cursorMu.Lock()
+	delete(eh.materializedCursors, handle)
+	eh.cursorMu.Unlock()
+}
+
+// extractCursorHandleFromRPC extracts the cursor handle (first int param) from an RPC payload.
+func (eh *ExtHandler) extractCursorHandleFromRPC(fullPayload []byte) int32 {
+	_, _, ok := parseRPCPayload(fullPayload)
+	if !ok {
+		return 0
+	}
+	// The first parameter after proc name + option flags is the cursor handle.
+	// Re-parse to get to the first param position.
+	if len(fullPayload) < 4 {
+		return 0
+	}
+	allHeadersLen := int(binary.LittleEndian.Uint32(fullPayload[0:4]))
+	if allHeadersLen < 4 || allHeadersLen > len(fullPayload) {
+		allHeadersLen = 0
+	}
+	pos := allHeadersLen
+	if pos+2 > len(fullPayload) {
+		return 0
+	}
+	nameLen := int(binary.LittleEndian.Uint16(fullPayload[pos : pos+2]))
+	pos += 2
+	if nameLen == 0xFFFF {
+		pos += 2
+	} else {
+		pos += nameLen * 2
+	}
+	if pos+2 > len(fullPayload) {
+		return 0
+	}
+	pos += 2 // OptionFlags
+
+	// First param should be the cursor handle (INTN).
+	val, _ := extractRPCParamValue(fullPayload, pos)
+	switch v := val.(type) {
+	case int64:
+		return int32(v)
+	case int32:
+		return v
+	case int16:
+		return int32(v)
+	}
+	return 0
 }
 
 // parseHandleFromParam parses a string-encoded int32 handle.

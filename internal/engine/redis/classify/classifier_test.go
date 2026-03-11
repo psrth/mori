@@ -60,7 +60,7 @@ func TestClassify(t *testing.T) {
 		{"ZADD", "ZADD leaderboard 100 player1", core.OpWrite, core.SubUpdate, []string{"leaderboard"}},
 		{"ZINCRBY", "ZINCRBY leaderboard 5 player1", core.OpWrite, core.SubUpdate, []string{"leaderboard"}},
 		{"XADD", "XADD stream:events * key val", core.OpWrite, core.SubUpdate, []string{"stream"}},
-		{"RENAME", "RENAME old:key new:key", core.OpWrite, core.SubUpdate, []string{"old"}},
+		{"RENAME", "RENAME old:key new:key", core.OpWrite, core.SubUpdate, []string{"old", "new"}},
 		{"EXPIRE", "EXPIRE session:abc 3600", core.OpWrite, core.SubUpdate, []string{"session"}},
 		{"PERSIST", "PERSIST session:abc", core.OpWrite, core.SubUpdate, []string{"session"}},
 
@@ -109,12 +109,12 @@ func TestClassify(t *testing.T) {
 
 		// SORT with STORE
 		{"SORT read", "SORT mylist LIMIT 0 10", core.OpRead, core.SubSelect, []string{"mylist"}},
-		{"SORT write", "SORT mylist STORE result:sorted", core.OpWrite, core.SubInsert, []string{"mylist"}},
+		{"SORT write", "SORT mylist STORE result:sorted", core.OpWrite, core.SubInsert, []string{"mylist", "result"}},
 
 		// Pub/Sub
 		{"SUBSCRIBE", "SUBSCRIBE channel1", core.OpOther, core.SubOther, nil},
 		{"PSUBSCRIBE", "PSUBSCRIBE chan:*", core.OpOther, core.SubOther, nil},
-		{"PUBLISH", "PUBLISH channel1 hello", core.OpWrite, core.SubInsert, nil},
+		{"PUBLISH", "PUBLISH channel1 hello", core.OpWrite, core.SubNotify, nil},
 
 		// Lua scripting
 		{"EVAL", `EVAL "return 1" 2 user:1 session:2 arg1`, core.OpWrite, core.SubInsert, []string{"user", "session"}},
@@ -147,6 +147,20 @@ func TestClassify(t *testing.T) {
 		{"GETDEL", "GETDEL key:1", core.OpWrite, core.SubDelete, []string{"key"}},
 		{"EXPIRETIME", "EXPIRETIME session:abc", core.OpRead, core.SubSelect, []string{"session"}},
 		{"PEXPIRETIME", "PEXPIRETIME session:abc", core.OpRead, core.SubSelect, []string{"session"}},
+
+		// EVALRO/EVALSHA_RO — key extraction
+		{"EVALRO", `EVALRO "return redis.call('GET',KEYS[1])" 1 user:1`, core.OpRead, core.SubSelect, []string{"user"}},
+		{"EVALSHA_RO", "EVALSHA_RO abc123 2 user:1 session:2", core.OpRead, core.SubSelect, []string{"user", "session"}},
+
+		// RENAME includes both source and destination prefixes
+		{"RENAMENX", "RENAMENX old:key new:key", core.OpWrite, core.SubUpdate, []string{"old", "new"}},
+
+		// New commands (Redis 6.2+/7.0+)
+		{"XREADGROUP", "XREADGROUP GROUP mygroup consumer1 COUNT 10 STREAMS stream:1 >", core.OpWrite, core.SubUpdate, nil},
+		{"XAUTOCLAIM", "XAUTOCLAIM stream:1 mygroup consumer1 0", core.OpWrite, core.SubUpdate, []string{"stream"}},
+		{"ZDIFF", "ZDIFF 2 zset:1 zset:2", core.OpRead, core.SubSelect, nil},
+		{"ZDIFFSTORE", "ZDIFFSTORE dest:zset 2 zset:1 zset:2", core.OpWrite, core.SubInsert, []string{"dest"}},
+		{"ZRANGESTORE", "ZRANGESTORE dest:zset src:zset 0 10", core.OpWrite, core.SubInsert, []string{"dest"}},
 
 		// Dangerous commands — blocked
 		{"SHUTDOWN", "SHUTDOWN NOSAVE", core.OpOther, core.SubNotSupported, nil},
@@ -242,13 +256,13 @@ func TestIsPubSubUnsubscribe(t *testing.T) {
 }
 
 func TestIsEvalCommand(t *testing.T) {
-	evals := []string{"EVAL", "EVALSHA", "eval", "evalsha"}
+	evals := []string{"EVAL", "EVALSHA", "EVALRO", "EVALSHA_RO", "eval", "evalsha", "evalro", "evalsha_ro"}
 	for _, cmd := range evals {
 		if !IsEvalCommand(cmd) {
 			t.Errorf("IsEvalCommand(%q) = false, want true", cmd)
 		}
 	}
-	nonEvals := []string{"GET", "SET", "SCRIPT", "EVALRO"}
+	nonEvals := []string{"GET", "SET", "SCRIPT", "FCALL"}
 	for _, cmd := range nonEvals {
 		if IsEvalCommand(cmd) {
 			t.Errorf("IsEvalCommand(%q) = true, want false", cmd)

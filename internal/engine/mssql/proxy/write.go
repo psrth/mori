@@ -395,6 +395,14 @@ func (w *WriteHandler) handleUpdate(
 		}
 	}
 
+	// Hydrate cross-table FROM references before executing.
+	if len(cl.Tables) >= 1 {
+		fromTables := extractUpdateFromTables(cl.RawSQL, cl.Tables[0])
+		if len(fromTables) > 0 {
+			w.hydrateReferencedTables(fromTables)
+		}
+	}
+
 	if len(cl.PKs) == 0 {
 		// Bulk update: attempt hydration for single-table UPDATEs with PK metadata.
 		if !cl.IsJoin && len(cl.Tables) == 1 {
@@ -575,12 +583,50 @@ func (w *WriteHandler) handleDelete(
 		return forwardAndRelay(rawMsg, w.shadowConn, clientConn)
 	}
 
+	// FK RESTRICT pre-check: block if child rows exist for RESTRICT/NO ACTION.
+	if w.fkEnforcer != nil && len(cl.Tables) == 1 {
+		var deletedPKs []string
+		for _, pk := range cl.PKs {
+			if pk.Table == cl.Tables[0] {
+				deletedPKs = append(deletedPKs, pk.PK)
+			}
+		}
+		if len(deletedPKs) > 0 {
+			if err := w.fkEnforcer.EnforceDeleteRestrict(cl.Tables[0], deletedPKs); err != nil {
+				if w.verbose {
+					log.Printf("[conn %d] FK RESTRICT violation on DELETE: %v", w.connID, err)
+				}
+				errPkt := buildErrorResponse(err.Error())
+				clientConn.Write(errPkt) //nolint:errcheck
+				return nil
+			}
+		}
+	}
+
 	// Point delete: execute on Shadow and tombstone.
 	if err := forwardAndRelay(rawMsg, w.shadowConn, clientConn); err != nil {
 		return err
 	}
 
 	w.addTombstones(cl)
+
+	// FK CASCADE post-action: cascade deletes to child tables.
+	if w.fkEnforcer != nil && len(cl.Tables) == 1 {
+		var deletedPKs []string
+		for _, pk := range cl.PKs {
+			if pk.Table == cl.Tables[0] {
+				deletedPKs = append(deletedPKs, pk.PK)
+			}
+		}
+		if len(deletedPKs) > 0 {
+			if err := w.fkEnforcer.EnforceDeleteCascade(cl.Tables[0], deletedPKs); err != nil {
+				if w.verbose {
+					log.Printf("[conn %d] FK CASCADE warning on DELETE: %v", w.connID, err)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -624,6 +670,29 @@ func (w *WriteHandler) handleDeleteWithOutput(clientConn net.Conn, rawMsg []byte
 		}
 	} else {
 		w.addTombstones(cl)
+	}
+
+	// FK CASCADE post-action for OUTPUT-captured PKs.
+	if w.fkEnforcer != nil {
+		var outputPKs []string
+		if hasMeta && len(meta.PKColumns) > 0 && result.Error == "" {
+			pkCol := meta.PKColumns[0]
+			pkIdx := findColumnIndex(result.Columns, pkCol)
+			if pkIdx >= 0 {
+				for i, row := range result.RowValues {
+					if pkIdx < len(row) && !result.RowNulls[i][pkIdx] {
+						outputPKs = append(outputPKs, row[pkIdx])
+					}
+				}
+			}
+		}
+		if len(outputPKs) > 0 {
+			if err := w.fkEnforcer.EnforceDeleteCascade(table, outputPKs); err != nil {
+				if w.verbose {
+					log.Printf("[conn %d] FK CASCADE warning on DELETE OUTPUT: %v", w.connID, err)
+				}
+			}
+		}
 	}
 
 	if !w.inTxn() {
@@ -692,6 +761,18 @@ func (w *WriteHandler) handleBulkDelete(
 		log.Printf("[conn %d] bulk DELETE: discovered %d PKs from Prod", w.connID, len(discoveredPKs))
 	}
 
+	// FK RESTRICT pre-check before executing.
+	if w.fkEnforcer != nil && len(discoveredPKs) > 0 {
+		if err := w.fkEnforcer.EnforceDeleteRestrict(table, discoveredPKs); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] FK RESTRICT violation on bulk DELETE: %v", w.connID, err)
+			}
+			errPkt := buildErrorResponse(err.Error())
+			clientConn.Write(errPkt) //nolint:errcheck
+			return nil
+		}
+	}
+
 	// Execute DELETE on Shadow, relay response to client.
 	if err := forwardAndRelay(rawMsg, w.shadowConn, clientConn); err != nil {
 		return err
@@ -704,6 +785,15 @@ func (w *WriteHandler) handleBulkDelete(
 		} else {
 			w.tombstones.Add(table, pk)
 			w.deltaMap.Remove(table, pk)
+		}
+	}
+
+	// FK CASCADE post-action.
+	if w.fkEnforcer != nil && len(discoveredPKs) > 0 {
+		if err := w.fkEnforcer.EnforceDeleteCascade(table, discoveredPKs); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] FK CASCADE warning on bulk DELETE: %v", w.connID, err)
+			}
 		}
 	}
 
@@ -1062,6 +1152,111 @@ func parseMergeDetails(rawSQL string) (columns []string, values [][]string) {
 	}
 
 	return columns, values
+}
+
+// ---------------------------------------------------------------------------
+// Cross-table UPDATE...FROM hydration
+// ---------------------------------------------------------------------------
+
+// reUpdateFrom matches UPDATE target SET ... FROM table_refs.
+// T-SQL: UPDATE t1 SET ... FROM t2 [alias] [JOIN t3 [alias] ON ...]
+var reUpdateFrom = regexp.MustCompile(`(?i)\bFROM\s+(.+?)(?:\s+WHERE\b|\s+ORDER\s+BY\b|\s+OPTION\b|\s*;|\s*$)`)
+var reTableRef = regexp.MustCompile(`(?i)(?:^|JOIN)\s+\[?(\w+)\]?(?:\s+(?:AS\s+)?\[?(\w+)\]?)?`)
+
+// extractUpdateFromTables extracts table names from the FROM clause of an
+// UPDATE...FROM statement, excluding the main target table.
+func extractUpdateFromTables(rawSQL, targetTable string) []string {
+	upper := strings.ToUpper(rawSQL)
+
+	// Only applies to UPDATE statements with FROM.
+	setIdx := strings.Index(upper, " SET ")
+	if setIdx < 0 {
+		return nil
+	}
+
+	// Look for FROM after SET...WHERE region.
+	afterSet := upper[setIdx:]
+	fromIdx := strings.Index(afterSet, " FROM ")
+	if fromIdx < 0 {
+		return nil
+	}
+
+	// Extract the FROM clause content.
+	fromStart := setIdx + fromIdx
+	m := reUpdateFrom.FindStringSubmatch(rawSQL[fromStart:])
+	if len(m) < 2 {
+		return nil
+	}
+	fromContent := m[1]
+
+	// Extract table names from FROM clause.
+	seen := make(map[string]bool)
+	var tables []string
+	for _, tm := range reTableRef.FindAllStringSubmatch(fromContent, -1) {
+		if len(tm) < 2 {
+			continue
+		}
+		tableName := strings.Trim(tm[1], "[]")
+		lower := strings.ToLower(tableName)
+		// Skip the target table and SQL keywords that might be captured.
+		if strings.EqualFold(tableName, targetTable) || seen[lower] {
+			continue
+		}
+		// Skip common keywords that the regex might capture.
+		if lower == "on" || lower == "set" || lower == "where" || lower == "inner" ||
+			lower == "left" || lower == "right" || lower == "outer" || lower == "cross" {
+			continue
+		}
+		seen[lower] = true
+		tables = append(tables, tableName)
+	}
+	return tables
+}
+
+// hydrateReferencedTables hydrates rows from FROM-clause referenced tables into Shadow.
+func (w *WriteHandler) hydrateReferencedTables(tables []string) {
+	for _, table := range tables {
+		meta, ok := w.tables[table]
+		if !ok || len(meta.PKColumns) == 0 {
+			continue
+		}
+		pkCol := meta.PKColumns[0]
+		selectSQL := fmt.Sprintf("SELECT * FROM %s", quoteIdentMSSQL(table))
+		selectSQL = w.capSQL(selectSQL)
+
+		result, err := execTDSQuery(w.prodConn, selectSQL)
+		if err != nil || result.Error != "" {
+			if w.verbose {
+				log.Printf("[conn %d] UPDATE FROM: failed to query Prod for %s", w.connID, table)
+			}
+			continue
+		}
+
+		pkIdx := findColumnIndex(result.Columns, pkCol)
+		if pkIdx < 0 {
+			continue
+		}
+
+		skipCols := toSkipSet(meta.GeneratedCols)
+		hydrated := 0
+		for i, row := range result.RowValues {
+			if result.RowNulls[i][pkIdx] {
+				continue
+			}
+			pk := row[pkIdx]
+			if w.deltaMap.IsDelta(table, pk) {
+				continue // Already in Shadow.
+			}
+			insertSQL := buildHydrationInsertMSSQL(table, result.Columns, row, result.RowNulls[i], skipCols, meta)
+			shadowResult, err := execTDSQuery(w.shadowConn, insertSQL)
+			if err == nil && shadowResult.Error == "" {
+				hydrated++
+			}
+		}
+		if w.verbose && hydrated > 0 {
+			log.Printf("[conn %d] UPDATE FROM: hydrated %d rows from %s", w.connID, hydrated, table)
+		}
+	}
 }
 
 // buildMergeWhere builds a WHERE clause from merge key columns and values.

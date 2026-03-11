@@ -32,18 +32,18 @@ func (h *writeHandler) createDocument(ctx context.Context, req *firestorepb.Crea
 	}
 
 	// Track delta.
-	collection, docID := splitDocPath(doc.GetName())
-	if collection != "" && docID != "" {
+	collection, fullDocKey := splitDocPathFull(doc.GetName())
+	if collection != "" && fullDocKey != "" {
 		if h.inTransaction {
-			h.deltaMap.Stage(collection, docID)
+			h.deltaMap.Stage(collection, fullDocKey)
 			h.deltaMap.StageInsertCount(collection, 1)
 		} else {
-			h.deltaMap.Add(collection, docID)
+			h.deltaMap.Add(collection, fullDocKey)
 			h.deltaMap.MarkInserted(collection)
 		}
 		h.persistDelta()
 		if h.verbose {
-			log.Printf("[firestore-write] CreateDocument: tracked delta %s/%s (txn=%v)", collection, docID, h.inTransaction)
+			log.Printf("[firestore-write] CreateDocument: tracked delta %s/%s (txn=%v)", collection, fullDocKey, h.inTransaction)
 		}
 	}
 
@@ -80,16 +80,16 @@ func (h *writeHandler) updateDocument(ctx context.Context, req *firestorepb.Upda
 	}
 
 	// Track delta.
-	collection, docID := splitDocPath(doc.GetName())
-	if collection != "" && docID != "" {
+	collection, fullDocKey := splitDocPathFull(doc.GetName())
+	if collection != "" && fullDocKey != "" {
 		if h.inTransaction {
-			h.deltaMap.Stage(collection, docID)
+			h.deltaMap.Stage(collection, fullDocKey)
 		} else {
-			h.deltaMap.Add(collection, docID)
+			h.deltaMap.Add(collection, fullDocKey)
 		}
 		h.persistDelta()
 		if h.verbose {
-			log.Printf("[firestore-write] UpdateDocument: tracked delta %s/%s (txn=%v)", collection, docID, h.inTransaction)
+			log.Printf("[firestore-write] UpdateDocument: tracked delta %s/%s (txn=%v)", collection, fullDocKey, h.inTransaction)
 		}
 	}
 
@@ -120,19 +120,19 @@ func (h *writeHandler) deleteDocument(ctx context.Context, req *firestorepb.Dele
 	}
 
 	// Track tombstone.
-	collection, docID := splitDocPath(req.GetName())
-	if collection != "" && docID != "" {
+	collection, fullDocKey := splitDocPathFull(req.GetName())
+	if collection != "" && fullDocKey != "" {
 		if h.inTransaction {
-			h.tombstones.Stage(collection, docID)
+			h.tombstones.Stage(collection, fullDocKey)
 		} else {
-			h.tombstones.Add(collection, docID)
+			h.tombstones.Add(collection, fullDocKey)
 		}
 		// Remove from delta map if it was there — it's now tombstoned.
-		h.deltaMap.Remove(collection, docID)
+		h.deltaMap.Remove(collection, fullDocKey)
 		h.persistTombstone()
 		h.persistDelta()
 		if h.verbose {
-			log.Printf("[firestore-write] DeleteDocument: tracked tombstone %s/%s (txn=%v)", collection, docID, h.inTransaction)
+			log.Printf("[firestore-write] DeleteDocument: tracked tombstone %s/%s (txn=%v)", collection, fullDocKey, h.inTransaction)
 		}
 	}
 
@@ -195,42 +195,54 @@ func (h *writeHandler) trackWrite(w *firestorepb.Write) {
 	switch op := w.GetOperation().(type) {
 	case *firestorepb.Write_Update:
 		if op.Update != nil {
-			collection, docID := splitDocPath(op.Update.GetName())
-			if collection != "" && docID != "" {
+			collection, fullDocKey := splitDocPathFull(op.Update.GetName())
+			if collection != "" && fullDocKey != "" {
 				if h.inTransaction {
-					h.deltaMap.Stage(collection, docID)
+					h.deltaMap.Stage(collection, fullDocKey)
 				} else {
-					h.deltaMap.Add(collection, docID)
+					h.deltaMap.Add(collection, fullDocKey)
+				}
+				// Detect new document creation: Write_Update with Precondition{Exists: false}
+				// indicates a create via Commit/BatchWrite. Track insert count so that
+				// HasInserts() returns true and merged reads include the shadow query path.
+				if precond := w.GetCurrentDocument(); precond != nil {
+					if existsCond, ok := precond.GetConditionType().(*firestorepb.Precondition_Exists); ok && !existsCond.Exists {
+						if h.inTransaction {
+							h.deltaMap.StageInsertCount(collection, 1)
+						} else {
+							h.deltaMap.MarkInserted(collection)
+						}
+					}
 				}
 				if h.verbose {
-					log.Printf("[firestore-write] Commit/BatchWrite: tracked delta %s/%s (txn=%v)", collection, docID, h.inTransaction)
+					log.Printf("[firestore-write] Commit/BatchWrite: tracked delta %s/%s (txn=%v)", collection, fullDocKey, h.inTransaction)
 				}
 			}
 		}
 	case *firestorepb.Write_Delete:
-		collection, docID := splitDocPath(op.Delete)
-		if collection != "" && docID != "" {
+		collection, fullDocKey := splitDocPathFull(op.Delete)
+		if collection != "" && fullDocKey != "" {
 			if h.inTransaction {
-				h.tombstones.Stage(collection, docID)
+				h.tombstones.Stage(collection, fullDocKey)
 			} else {
-				h.tombstones.Add(collection, docID)
+				h.tombstones.Add(collection, fullDocKey)
 			}
-			h.deltaMap.Remove(collection, docID)
+			h.deltaMap.Remove(collection, fullDocKey)
 			if h.verbose {
-				log.Printf("[firestore-write] Commit/BatchWrite: tracked tombstone %s/%s (txn=%v)", collection, docID, h.inTransaction)
+				log.Printf("[firestore-write] Commit/BatchWrite: tracked tombstone %s/%s (txn=%v)", collection, fullDocKey, h.inTransaction)
 			}
 		}
 	case *firestorepb.Write_Transform:
 		if op.Transform != nil {
-			collection, docID := splitDocPath(op.Transform.GetDocument())
-			if collection != "" && docID != "" {
+			collection, fullDocKey := splitDocPathFull(op.Transform.GetDocument())
+			if collection != "" && fullDocKey != "" {
 				if h.inTransaction {
-					h.deltaMap.Stage(collection, docID)
+					h.deltaMap.Stage(collection, fullDocKey)
 				} else {
-					h.deltaMap.Add(collection, docID)
+					h.deltaMap.Add(collection, fullDocKey)
 				}
 				if h.verbose {
-					log.Printf("[firestore-write] Commit/BatchWrite: tracked delta (transform) %s/%s (txn=%v)", collection, docID, h.inTransaction)
+					log.Printf("[firestore-write] Commit/BatchWrite: tracked delta (transform) %s/%s (txn=%v)", collection, fullDocKey, h.inTransaction)
 				}
 			}
 		}
@@ -265,14 +277,14 @@ func (h *writeHandler) evaluatePrecondition(ctx context.Context, docPath string,
 		return nil
 	}
 
-	collection, docID := splitDocPath(docPath)
-	if collection == "" || docID == "" {
+	collection, fullDocKey := splitDocPathFull(docPath)
+	if collection == "" || fullDocKey == "" {
 		return nil
 	}
 
 	switch cond := precondition.GetConditionType().(type) {
 	case *firestorepb.Precondition_Exists:
-		exists := h.documentExists(ctx, collection, docID, docPath)
+		exists := h.documentExists(ctx, collection, fullDocKey, docPath)
 		if cond.Exists && !exists {
 			return status.Errorf(codes.FailedPrecondition,
 				"document %q does not exist (precondition: exists=true)", docPath)
@@ -284,7 +296,7 @@ func (h *writeHandler) evaluatePrecondition(ctx context.Context, docPath string,
 
 	case *firestorepb.Precondition_UpdateTime:
 		// Check update_time against the correct backend.
-		if h.tombstones.IsTombstoned(collection, docID) {
+		if h.tombstones.IsTombstoned(collection, fullDocKey) {
 			return status.Errorf(codes.FailedPrecondition,
 				"document %q has been deleted (precondition: update_time)", docPath)
 		}
@@ -296,14 +308,14 @@ func (h *writeHandler) evaluatePrecondition(ctx context.Context, docPath string,
 }
 
 // documentExists checks if a document exists by consulting the correct backend.
-func (h *writeHandler) documentExists(ctx context.Context, collection, docID, docPath string) bool {
+func (h *writeHandler) documentExists(ctx context.Context, collection, fullDocKey, docPath string) bool {
 	// Tombstoned = intentionally deleted.
-	if h.tombstones.IsTombstoned(collection, docID) {
+	if h.tombstones.IsTombstoned(collection, fullDocKey) {
 		return false
 	}
 
 	// In delta map = exists in shadow.
-	if h.deltaMap.IsDelta(collection, docID) {
+	if h.deltaMap.IsDelta(collection, fullDocKey) {
 		getReq := &firestorepb.GetDocumentRequest{Name: docPath}
 		_, err := h.shadowClient.GetDocument(ctx, getReq)
 		return err == nil
