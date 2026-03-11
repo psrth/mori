@@ -21,10 +21,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
             echo "Release ${GITHUB_REF_NAME} already exists"
           else
             gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
               --title "${GITHUB_REF_NAME}" \
               --generate-notes
           fi
@@ -86,7 +87,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "${GITHUB_REF_NAME}" dist/pkg/*.tar.gz --clobber
+          gh release upload "${GITHUB_REF_NAME}" dist/pkg/*.tar.gz --repo "${GITHUB_REPOSITORY}" --clobber
 
   checksums:
     needs: [create-release, build-and-upload]
@@ -111,4 +112,4 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh release upload "${GITHUB_REF_NAME}" dist/pkg/checksums.txt --clobber
+          gh release upload "${GITHUB_REF_NAME}" dist/pkg/checksums.txt --repo "${GITHUB_REPOSITORY}" --clobber
