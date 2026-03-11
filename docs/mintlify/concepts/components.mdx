@@ -11,7 +11,7 @@ Mori tracks three types of divergence between prod and shadow. Together, they te
 The Delta Map is a set of `(table, primary_key)` pairs identifying rows that have been **modified locally** (inserted or updated in shadow). When a row is in the Delta Map, shadow holds the authoritative version — prod's version is stale.
 
 **How it's used:**
-- During a [merged read](/docs/concepts/strategies#merged-read-single-table), prod results for delta PKs are discarded in favor of shadow results
+- During a [merged read](/concepts/strategies#merged-read-single-table), prod results for delta PKs are discarded in favor of shadow results
 - The router checks whether any table has delta entries to decide between Prod Direct and Merged Read strategies
 - INSERT adds the new row's PK; UPDATE adds the modified row's PK
 

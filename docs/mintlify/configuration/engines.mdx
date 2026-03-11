@@ -1,7 +1,7 @@
 ---
-title: "Database Engines"
+title: "Overview"
 description: "Supported database engines, wire protocols, and implementation details."
-sidebarTitle: "Database Engines"
+sidebarTitle: "Overview"
 ---
 
 Mori supports 9 database engines across SQL, NoSQL, and embedded categories. Each engine uses the real wire protocol -- your application connects to Mori with its standard driver, no code changes required.
@@ -10,15 +10,15 @@ Mori supports 9 database engines across SQL, NoSQL, and embedded categories. Eac
 
 | Engine | Category | Wire Protocol | Default Port | Shadow Strategy | Status |
 |--------|----------|---------------|-------------|-----------------|--------|
-| [PostgreSQL](/docs/engines/postgres) | SQL | pgwire v3 | 5432 | Docker container | **Stable** |
-| [CockroachDB](/docs/engines/cockroachdb) | SQL | pgwire v3 | 26257 | Docker container | **Stable** |
-| [MySQL](/docs/engines/mysql) | SQL | MySQL wire | 3306 | Docker container | Supported |
-| [MariaDB](/docs/engines/mariadb) | SQL | MySQL wire | 3306 | Docker container | Supported |
-| [MS SQL Server](/docs/engines/mssql) | SQL | TDS | 1433 | Docker container | Supported |
-| [SQLite](/docs/engines/sqlite) | Embedded | pgwire (exposed) | N/A | Local file copy | Supported |
-| [DuckDB](/docs/engines/duckdb) | Embedded | pgwire (exposed) | N/A | Local file copy | Supported |
-| [Redis](/docs/engines/redis) | NoSQL | RESP | 6379 | Docker container | Supported |
-| [Firestore](/docs/engines/firestore) | NoSQL | gRPC | N/A | Emulator container | Supported |
+| [PostgreSQL](/engines/postgres) | SQL | pgwire v3 | 5432 | Docker container | **Stable** |
+| [CockroachDB](/engines/cockroachdb) | SQL | pgwire v3 | 26257 | Docker container | **Stable** |
+| [MySQL](/engines/mysql) | SQL | MySQL wire | 3306 | Docker container | Supported |
+| [MariaDB](/engines/mariadb) | SQL | MySQL wire | 3306 | Docker container | Supported |
+| [MS SQL Server](/engines/mssql) | SQL | TDS | 1433 | Docker container | Supported |
+| [SQLite](/engines/sqlite) | Embedded | pgwire (exposed) | N/A | Local file copy | Supported |
+| [DuckDB](/engines/duckdb) | Embedded | pgwire (exposed) | N/A | Local file copy | Supported |
+| [Redis](/engines/redis) | NoSQL | RESP | 6379 | Docker container | Supported |
+| [Firestore](/engines/firestore) | NoSQL | gRPC | N/A | Emulator container | Supported |
 
 ## By Category
 
@@ -45,5 +45,5 @@ SQLite and DuckDB are embedded databases (no server process). Mori exposes them 
 Redis uses the RESP protocol with a command-based classifier (~155 Redis commands mapped). Firestore uses gRPC with a method-name classifier. Both support full copy-on-write semantics with delta tracking at the key/document level.
 
 <Info>
-All 9 engines share the same copy-on-write model: reads from prod, writes to shadow, transparent merging. The wire protocol and classification strategy differ per engine, but the [core invariants](/docs/concepts/safety) are identical.
+All 9 engines share the same copy-on-write model: reads from prod, writes to shadow, transparent merging. The wire protocol and classification strategy differ per engine, but the [core invariants](/concepts/safety) are identical.
 </Info>

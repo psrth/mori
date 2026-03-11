@@ -9,7 +9,7 @@ sidebarTitle: "Quick Start"
 If you're setting up Mori with an AI coding agent, download the [`skill.md`](https://moridb.sh/skill.md) file and add it to your project root. Point your agent at it -- it contains everything needed to install, initialize, and start Mori.
 
 ```bash
-curl -o skill.md https://raw.githubusercontent.com/psrth/mori/main/skill.md
+curl -fsSL https://moridb.sh/skill.md -o skill.md
 ```
 
 Your agent can read `skill.md` and handle the rest autonomously.
@@ -26,7 +26,7 @@ Your agent can read `skill.md` and handle the rest autonomously.
 
 <CodeGroup>
 ```bash curl (recommended)
-curl -fsSL https://raw.githubusercontent.com/psrth/mori/main/install.sh | sh
+curl -fsSL https://moridb.sh/install.sh | sh
 ```
 ```bash go install
 go install github.com/psrth/mori/cmd/mori@latest
