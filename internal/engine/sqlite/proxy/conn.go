@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -901,6 +902,13 @@ func (p *Proxy) trackBulkUpdateDeltas(sqlStr, table, pkCol string, connID int64,
 func (p *Proxy) handleDelete(clientConn net.Conn, sqlStr string, cl *core.Classification, connID int64, txh *TxnHandler) {
 	inTxn := txh != nil && txh.InTxn()
 
+	// DELETE ... RETURNING: hydrate from Prod before deletion so we can
+	// return the full row data (including Prod-only rows).
+	if cl.HasReturning {
+		p.handleDeleteReturning(clientConn, sqlStr, cl, connID, txh)
+		return
+	}
+
 	if len(cl.PKs) > 0 {
 		// FK enforcement: check RESTRICT constraints before delete.
 		fke := NewFKEnforcer(p, connID)
@@ -1044,6 +1052,128 @@ func (p *Proxy) handleDelete(clientConn net.Conn, sqlStr string, cl *core.Classi
 			p.tombstones.Add(table, pk)
 			p.deltaMap.Remove(table, pk)
 		}
+	}
+
+	if !inTxn {
+		delta.WriteTombstoneSet(p.moriDir, p.tombstones)
+		delta.WriteDeltaMap(p.moriDir, p.deltaMap)
+	}
+}
+
+// handleDeleteReturning handles DELETE ... RETURNING by hydrating rows from Prod
+// before deletion so that the RETURNING clause can return complete row data,
+// including rows that only exist in Prod (not yet in Shadow).
+func (p *Proxy) handleDeleteReturning(clientConn net.Conn, sqlStr string, cl *core.Classification, connID int64, txh *TxnHandler) {
+	inTxn := txh != nil && txh.InTxn()
+
+	if len(cl.Tables) != 1 {
+		// Multi-table or no-table: fall back to plain shadow execution.
+		resp := p.executeQuery(p.shadowDB, sqlStr, connID)
+		clientConn.Write(resp)
+		return
+	}
+
+	table := cl.Tables[0]
+	meta, hasMeta := p.tables[table]
+	if !hasMeta || len(meta.PKColumns) == 0 {
+		// No PK info: fall back to plain shadow execution.
+		resp := p.executeQuery(p.shadowDB, sqlStr, connID)
+		clientConn.Write(resp)
+		return
+	}
+
+	pkCol := meta.PKColumns[0]
+	skipCols := toSkipSet(meta.GeneratedCols)
+
+	// FK enforcement: check RESTRICT constraints before delete.
+	fke := NewFKEnforcer(p, connID)
+	if fke != nil {
+		var deletedPKs []string
+		for _, pk := range cl.PKs {
+			deletedPKs = append(deletedPKs, pk.PK)
+		}
+		if len(deletedPKs) > 0 {
+			if err := fke.CheckDeleteRestrict(table, deletedPKs); err != nil {
+				clientConn.Write(buildSQLErrorResponse(err.Error()))
+				if txh != nil && txh.InTxn() {
+					txh.SetErrorState()
+				}
+				return
+			}
+		}
+	}
+
+	// Discover affected PKs from Prod.
+	whereClause := extractWhereFromSQL(sqlStr)
+	var selectSQL string
+	if whereClause != "" {
+		selectSQL = fmt.Sprintf(`SELECT %q FROM %q WHERE %s`, pkCol, table, whereClause)
+	} else {
+		selectSQL = fmt.Sprintf(`SELECT %q FROM %q`, pkCol, table)
+	}
+
+	if p.schemaRegistry != nil {
+		rewritten, skipProd := rewriteForProd(selectSQL, p.schemaRegistry, cl.Tables)
+		if skipProd {
+			resp := p.executeQuery(p.shadowDB, sqlStr, connID)
+			clientConn.Write(resp)
+			return
+		}
+		selectSQL = rewritten
+	}
+
+	if p.maxRowsHydrate > 0 {
+		selectSQL += fmt.Sprintf(" LIMIT %d", p.maxRowsHydrate)
+	}
+
+	_, prodPKRows, _, prodErr := p.safeProdQuery(selectSQL, connID)
+
+	// Hydrate Prod-only rows into Shadow before executing the DELETE,
+	// so that the RETURNING clause sees complete data.
+	var allPKs []string
+	if prodErr == nil {
+		for _, row := range prodPKRows {
+			if len(row) == 0 || !row[0].Valid {
+				continue
+			}
+			pk := row[0].String
+			allPKs = append(allPKs, pk)
+
+			// Skip rows already in Shadow (already in delta map).
+			if p.deltaMap.IsDelta(table, pk) {
+				continue
+			}
+
+			// Hydrate from Prod into Shadow.
+			escapedPK := strings.ReplaceAll(pk, "'", "''")
+			hydrateSQL := fmt.Sprintf(`SELECT * FROM %q WHERE %q = '%s'`, table, pkCol, escapedPK)
+			cols, rows, _, err := p.safeProdQuery(hydrateSQL, connID)
+			if err != nil || len(rows) == 0 {
+				continue
+			}
+			insertSQL := buildHydrateInsert(table, cols, rows[0], skipCols)
+			p.shadowDB.Exec(insertSQL)
+		}
+	}
+
+	// Now execute the DELETE ... RETURNING on Shadow. The hydrated rows
+	// ensure RETURNING has access to the full data.
+	resp := p.executeQuery(p.shadowDB, sqlStr, connID)
+	clientConn.Write(resp)
+
+	// Tombstone all affected PKs.
+	for _, pk := range allPKs {
+		if inTxn {
+			p.tombstones.Stage(table, pk)
+		} else {
+			p.tombstones.Add(table, pk)
+			p.deltaMap.Remove(table, pk)
+		}
+	}
+
+	// FK CASCADE/SET NULL enforcement on child tables.
+	if fke != nil && len(allPKs) > 0 {
+		fke.EnforceDeleteCascade(table, allPKs)
 	}
 
 	if !inTxn {
@@ -1400,35 +1530,77 @@ func (p *Proxy) executeAggregateRead(sqlStr string, cl *core.Classification, con
 	count := len(baseRows)
 	countStr := fmt.Sprintf("%d", count)
 
-	columns := []string{"count"}
+	alias := extractCountAlias(sqlStr)
+	columns := []string{alias}
 	rows := [][]sql.NullString{{{String: countStr, Valid: true}}}
 	nulls := [][]bool{{false}}
 	return buildMergedResponse(columns, rows, nulls)
 }
 
-// materializeAndReexecute materializes merged data into a temp table and re-executes
-// the original query on Shadow. Used for complex aggregates, window functions, etc.
+// materializeAndReexecute materializes merged data for all dirty tables into temp
+// tables and re-executes the original query on Shadow. Used for complex aggregates,
+// window functions, set operations, CTEs, and derived tables.
 func (p *Proxy) materializeAndReexecute(sqlStr string, cl *core.Classification, connID int64) []byte {
 	if len(cl.Tables) == 0 {
 		return p.safeProdExecQuery(sqlStr, connID)
 	}
-	table := cl.Tables[0]
 
-	// Build base SELECT * FROM table.
-	baseSQL := fmt.Sprintf(`SELECT * FROM %q`, table)
-	baseSQL = p.capSQL(baseSQL)
-	utilName, err := p.materializeToUtilTable(baseSQL, table, connID, p.maxRowsHydrate)
-	if err != nil {
-		if p.verbose {
-			log.Printf("[conn %d] materialization failed: %v", connID, err)
+	// Identify which tables are dirty (have deltas, tombstones, or schema diffs).
+	var dirtyTables []string
+	for _, table := range cl.Tables {
+		if p.isTableDirty(table) {
+			dirtyTables = append(dirtyTables, table)
 		}
-		return p.executeQuery(p.shadowDB, sqlStr, connID)
 	}
-	defer p.dropUtilTable(utilName)
 
-	// Rewrite query to reference the temp table instead.
-	rewritten := rewriteTableRef(sqlStr, table, utilName)
+	// If no dirty tables, execute directly on Prod.
+	if len(dirtyTables) == 0 {
+		return p.safeProdExecQuery(sqlStr, connID)
+	}
+
+	// Materialize each dirty table into a temp table, rewrite the query.
+	rewritten := sqlStr
+	var utilNames []string
+	for _, table := range dirtyTables {
+		baseSQL := fmt.Sprintf(`SELECT * FROM %q`, table)
+		baseSQL = p.capSQL(baseSQL)
+		utilName, err := p.materializeToUtilTable(baseSQL, table, connID, p.maxRowsHydrate)
+		if err != nil {
+			if p.verbose {
+				log.Printf("[conn %d] materialization failed for %s: %v", connID, table, err)
+			}
+			// Fall back to shadow-only execution.
+			return p.executeQuery(p.shadowDB, sqlStr, connID)
+		}
+		utilNames = append(utilNames, utilName)
+		rewritten = rewriteTableRef(rewritten, table, utilName)
+	}
+
+	// Clean up temp tables when done.
+	defer func() {
+		for _, name := range utilNames {
+			p.dropUtilTable(name)
+		}
+	}()
+
 	return p.executeQuery(p.shadowDB, rewritten, connID)
+}
+
+// isTableDirty returns true if a table has deltas, tombstones, or schema diffs.
+func (p *Proxy) isTableDirty(table string) bool {
+	if p.deltaMap != nil && p.deltaMap.CountForTable(table) > 0 {
+		return true
+	}
+	if p.tombstones != nil && p.tombstones.CountForTable(table) > 0 {
+		return true
+	}
+	if p.schemaRegistry != nil {
+		diff := p.schemaRegistry.GetDiff(table)
+		if diff != nil && (diff.IsNewTable || diff.IsFullyShadowed || len(diff.Added) > 0 || len(diff.Dropped) > 0 || len(diff.Renamed) > 0) {
+			return true
+		}
+	}
+	return false
 }
 
 // executeWindowFuncRead handles window function queries.
@@ -1449,61 +1621,8 @@ func (p *Proxy) executeComplexRead(sqlStr string, cl *core.Classification, connI
 // executeJoinPatch handles JOIN queries involving dirty tables.
 // P2 3.6: Materializes dirty tables into temp tables and rewrites the query.
 func (p *Proxy) executeJoinPatch(sqlStr string, cl *core.Classification, connID int64) []byte {
-	if len(cl.Tables) == 0 {
-		return p.safeProdExecQuery(sqlStr, connID)
-	}
-
-	// Identify which tables have deltas/tombstones (are "dirty").
-	var dirtyTables []string
-	for _, table := range cl.Tables {
-		isDirty := false
-		if p.deltaMap != nil && p.deltaMap.CountForTable(table) > 0 {
-			isDirty = true
-		}
-		if p.tombstones != nil && p.tombstones.CountForTable(table) > 0 {
-			isDirty = true
-		}
-		if p.schemaRegistry != nil {
-			diff := p.schemaRegistry.GetDiff(table)
-			if diff != nil && (diff.IsNewTable || diff.IsFullyShadowed || len(diff.Added) > 0 || len(diff.Dropped) > 0 || len(diff.Renamed) > 0) {
-				isDirty = true
-			}
-		}
-		if isDirty {
-			dirtyTables = append(dirtyTables, table)
-		}
-	}
-
-	// If no dirty tables, execute directly on Prod.
-	if len(dirtyTables) == 0 {
-		return p.safeProdExecQuery(sqlStr, connID)
-	}
-
-	// Materialize each dirty table into a temp table, rewrite the query.
-	rewritten := sqlStr
-	var utilNames []string
-	for _, table := range dirtyTables {
-		baseSQL := fmt.Sprintf(`SELECT * FROM %q`, table)
-		utilName, err := p.materializeToUtilTable(baseSQL, table, connID, p.maxRowsHydrate)
-		if err != nil {
-			if p.verbose {
-				log.Printf("[conn %d] JOIN patch: materialization failed for %s: %v", connID, table, err)
-			}
-			// Fall back to shadow-only execution.
-			return p.executeQuery(p.shadowDB, sqlStr, connID)
-		}
-		utilNames = append(utilNames, utilName)
-		rewritten = rewriteTableRef(rewritten, table, utilName)
-	}
-
-	// Clean up temp tables when done.
-	defer func() {
-		for _, name := range utilNames {
-			p.dropUtilTable(name)
-		}
-	}()
-
-	return p.executeQuery(p.shadowDB, rewritten, connID)
+	// Delegate to the shared multi-table materialization path.
+	return p.materializeAndReexecute(sqlStr, cl, connID)
 }
 
 // rewriteTableRef replaces a table name in SQL with a different name.
@@ -2081,6 +2200,14 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 				log.Printf("[conn %d] schema registry: CREATE TABLE %s", connID, table)
 			}
 		}
+		// Detect FK constraints defined in the new CREATE TABLE DDL.
+		if len(cl.Tables) > 0 {
+			if err := DetectForeignKeys(context.Background(), p.shadowDB, p.schemaRegistry, cl.Tables); err != nil {
+				if p.verbose {
+					log.Printf("[conn %d] FK detection after CREATE TABLE failed: %v", connID, err)
+				}
+			}
+		}
 
 	case strings.HasPrefix(upper, "DROP TABLE"):
 		for _, table := range cl.Tables {
@@ -2093,6 +2220,15 @@ func (p *Proxy) trackDDLEffects(cl *core.Classification, connID int64) {
 			}
 			if p.verbose {
 				log.Printf("[conn %d] schema registry: DROP TABLE %s", connID, table)
+			}
+		}
+	}
+
+	// Re-detect FK constraints after ALTER TABLE (may have added constraints).
+	if strings.HasPrefix(upper, "ALTER TABLE") && len(cl.Tables) > 0 {
+		if err := DetectForeignKeys(context.Background(), p.shadowDB, p.schemaRegistry, cl.Tables); err != nil {
+			if p.verbose {
+				log.Printf("[conn %d] FK detection after ALTER TABLE failed: %v", connID, err)
 			}
 		}
 	}
@@ -2236,6 +2372,32 @@ func extractInsertPKValues(sqlStr, table, pkCol string) []string {
 	}
 
 	return pks
+}
+
+// reCountAlias matches COUNT(...) AS alias in a SELECT expression.
+var reCountAlias = regexp.MustCompile(`(?i)\bCOUNT\s*\([^)]*\)\s+AS\s+("?[a-zA-Z_]\w*"?)`)
+
+// extractCountAlias extracts the column alias from a bare COUNT query.
+// For "SELECT COUNT(*) AS total FROM t" it returns "total".
+// For "SELECT COUNT(*) FROM t" it returns "count(*)" to match SQLite's default.
+func extractCountAlias(sqlStr string) string {
+	if m := reCountAlias.FindStringSubmatch(sqlStr); len(m) > 1 {
+		return strings.Trim(m[1], `"`)
+	}
+	// No explicit alias — match what SQLite returns natively.
+	upper := strings.ToUpper(sqlStr)
+	if idx := strings.Index(upper, "COUNT"); idx >= 0 {
+		// Extract the full COUNT(...) expression for use as the column name.
+		rest := sqlStr[idx:]
+		parenStart := strings.Index(rest, "(")
+		if parenStart >= 0 {
+			parenEnd := strings.Index(rest[parenStart:], ")")
+			if parenEnd >= 0 {
+				return strings.ToLower(rest[:parenStart+parenEnd+1])
+			}
+		}
+	}
+	return "count"
 }
 
 // extractUpsertConflictValues extracts conflict key values from an INSERT ... ON CONFLICT

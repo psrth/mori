@@ -70,7 +70,7 @@ func (m *Manager) Pull(ctx context.Context, imageName string) error {
 // Create creates and starts a Shadow MySQL container with a fixed port.
 // It waits for MySQL to be ready before returning.
 func (m *Manager) Create(ctx context.Context, cfg ContainerConfig) (*ContainerInfo, error) {
-	name, err := generateContainerName()
+	name, err := generateContainerName(cfg.Image)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate container name: %w", err)
 	}
@@ -245,10 +245,14 @@ func extractContainerID(output string) string {
 	return strings.TrimSpace(output)
 }
 
-func generateContainerName() (string, error) {
+func generateContainerName(image string) (string, error) {
+	prefix := "mori-mysql-shadow-"
+	if strings.Contains(image, "mariadb") {
+		prefix = "mori-mariadb-shadow-"
+	}
 	b := make([]byte, 6)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
-	return "mori-mysql-shadow-" + hex.EncodeToString(b), nil
+	return prefix + hex.EncodeToString(b), nil
 }

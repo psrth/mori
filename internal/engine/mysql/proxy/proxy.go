@@ -34,6 +34,7 @@ type Proxy struct {
 	schemaRegistry *coreSchema.Registry
 	moriDir        string
 	maxRowsHydrate int
+	useReturning   bool // MariaDB 10.5+: use INSERT ... RETURNING for PK extraction
 	logger         *logging.Logger
 
 	listenerMu sync.Mutex
@@ -54,6 +55,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 	logger *logging.Logger,
 	maxRowsHydrate int,
 	tlsParams tlsutil.TLSParams,
+	useReturning bool,
 ) *Proxy {
 	return &Proxy{
 		prodAddr:       prodAddr,
@@ -70,6 +72,7 @@ func New(prodAddr, shadowAddr, shadowDBName string, listenPort int, verbose bool
 		schemaRegistry: schemaRegistry,
 		moriDir:        moriDir,
 		maxRowsHydrate: maxRowsHydrate,
+		useReturning:   useReturning,
 		logger:         logger,
 		shutdownCh:     make(chan struct{}),
 	}

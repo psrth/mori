@@ -96,6 +96,7 @@ func (e *mysqlEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.T
 			CertPath:   deps.CertPath,
 			KeyPath:    deps.KeyPath,
 		},
+		false, // useReturning: MySQL does not support RETURNING
 	)
 }
 

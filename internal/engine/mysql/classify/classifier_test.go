@@ -416,3 +416,117 @@ func TestClassifyWithParams(t *testing.T) {
 		t.Errorf("PK = %q, want %q", cl.PKs[0].PK, "42")
 	}
 }
+
+func TestClassify_MariaDBReturning(t *testing.T) {
+	c := New(nil)
+	tests := []struct {
+		name         string
+		sql          string
+		wantOp       core.OpType
+		wantSub      core.SubType
+		wantReturn   bool
+		wantTables   []string
+	}{
+		{
+			"insert returning star",
+			"INSERT INTO users (name) VALUES ('test') RETURNING *",
+			core.OpWrite, core.SubInsert, true,
+			[]string{"users"},
+		},
+		{
+			"insert returning id",
+			"INSERT INTO users (name) VALUES ('test') RETURNING id",
+			core.OpWrite, core.SubInsert, true,
+			nil,
+		},
+		{
+			"delete returning star",
+			"DELETE FROM users WHERE id = 1 RETURNING *",
+			core.OpWrite, core.SubDelete, true,
+			[]string{"users"},
+		},
+		{
+			"replace returning id",
+			"REPLACE INTO users (id, name) VALUES (1, 'test') RETURNING id",
+			core.OpWrite, core.SubInsert, true,
+			nil,
+		},
+		{
+			"insert without returning",
+			"INSERT INTO users (name) VALUES ('test')",
+			core.OpWrite, core.SubInsert, false,
+			nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl, err := c.Classify(tt.sql)
+			if err != nil {
+				t.Fatalf("Classify(%q) error: %v", tt.sql, err)
+			}
+			if cl.OpType != tt.wantOp {
+				t.Errorf("OpType = %v, want %v", cl.OpType, tt.wantOp)
+			}
+			if cl.SubType != tt.wantSub {
+				t.Errorf("SubType = %v, want %v", cl.SubType, tt.wantSub)
+			}
+			if cl.HasReturning != tt.wantReturn {
+				t.Errorf("HasReturning = %v, want %v", cl.HasReturning, tt.wantReturn)
+			}
+			if tt.wantTables != nil {
+				if len(cl.Tables) != len(tt.wantTables) {
+					t.Errorf("Tables = %v, want %v", cl.Tables, tt.wantTables)
+				} else {
+					for i, want := range tt.wantTables {
+						if cl.Tables[i] != want {
+							t.Errorf("Tables[%d] = %q, want %q", i, cl.Tables[i], want)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestClassify_ExecuteImmediate(t *testing.T) {
+	c := New(nil)
+	cl, err := c.Classify("EXECUTE IMMEDIATE 'SELECT 1'")
+	if err != nil {
+		t.Fatalf("Classify error: %v", err)
+	}
+	if cl.OpType != core.OpOther {
+		t.Errorf("OpType = %v, want OpOther", cl.OpType)
+	}
+	if cl.SubType != core.SubExecute {
+		t.Errorf("SubType = %v, want SubExecute", cl.SubType)
+	}
+}
+
+func TestClassify_MariaDBSequence(t *testing.T) {
+	c := New(nil)
+	tests := []struct {
+		name    string
+		sql     string
+		wantOp  core.OpType
+		wantSub core.SubType
+	}{
+		{"create sequence", "CREATE SEQUENCE seq1", core.OpDDL, core.SubCreate},
+		{"drop sequence", "DROP SEQUENCE seq1", core.OpDDL, core.SubDrop},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cl, err := c.Classify(tt.sql)
+			if err != nil {
+				t.Fatalf("Classify(%q) error: %v", tt.sql, err)
+			}
+			if cl.OpType != tt.wantOp {
+				t.Errorf("OpType = %v, want %v", cl.OpType, tt.wantOp)
+			}
+			if cl.SubType != tt.wantSub {
+				t.Errorf("SubType = %v, want %v", cl.SubType, tt.wantSub)
+			}
+		})
+	}
+}

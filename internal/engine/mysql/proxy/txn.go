@@ -88,11 +88,12 @@ func (th *TxnHandler) handleBegin(clientConn net.Conn, rawPkt []byte) error {
 		return nil
 	}
 
-	// Shadow succeeded — send BEGIN with REPEATABLE READ to Prod for consistent reads.
-	// MySQL uses: START TRANSACTION WITH CONSISTENT SNAPSHOT
-	// (or simply BEGIN for compatibility — the router opens REPEATABLE READ isolation
-	// on shadow already via the container's default, so standard BEGIN is sufficient).
-	hadProdError, err := th.forwardAndRelayTxn(rawPkt, th.prodConn, clientConn)
+	// Shadow succeeded — send REPEATABLE READ + READ ONLY to Prod for:
+	// 1. Consistent snapshot: all Prod reads within the txn see the same data,
+	//    preventing phantom rows during merged reads.
+	// 2. Read-only: defense-in-depth on top of the three-layer write guard.
+	prodBeginPkt := buildCOMQuery(0, "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+	hadProdError, err := th.forwardAndRelayTxn(prodBeginPkt, th.prodConn, clientConn)
 	if err != nil {
 		return fmt.Errorf("prod BEGIN: %w", err)
 	}

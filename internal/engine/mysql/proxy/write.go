@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 
 	"vitess.io/vitess/go/vt/sqlparser"
@@ -29,6 +30,8 @@ type WriteHandler struct {
 	verbose        bool
 	logger         *logging.Logger
 	maxRowsHydrate int
+	inTxn          bool // set by conn handler when inside a transaction
+	useReturning   bool // MariaDB 10.5+: use INSERT ... RETURNING for PK extraction
 }
 
 // HandleWrite dispatches a write operation based on the routing strategy.
@@ -40,6 +43,10 @@ func (w *WriteHandler) HandleWrite(
 ) error {
 	switch strategy {
 	case core.StrategyShadowWrite:
+		// Route REPLACE INTO through the upsert-like hydration path.
+		if isReplaceInto(cl.RawSQL) {
+			return w.handleReplace(clientConn, rawPkt, cl)
+		}
 		return w.handleInsert(clientConn, rawPkt, cl)
 	case core.StrategyHydrateAndWrite:
 		if cl.SubType == core.SubInsert && cl.HasOnConflict {
@@ -53,7 +60,20 @@ func (w *WriteHandler) HandleWrite(
 	}
 }
 
-// handleInsert executes an INSERT on Shadow and marks the table as having inserts.
+// isReplaceInto checks if the SQL is a REPLACE INTO statement.
+func isReplaceInto(sql string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(sql))
+	return strings.HasPrefix(upper, "REPLACE")
+}
+
+// isAutoIncrement reports whether the table has a single auto-increment PK.
+func isAutoIncrement(meta schema.TableMeta) bool {
+	return meta.PKType == "serial" || meta.PKType == "bigserial"
+}
+
+// handleInsert executes an INSERT on Shadow and extracts per-row PKs for
+// precise delta tracking when possible. Falls back to aggregate insert count
+// tracking for INSERT...SELECT and expression-based non-auto-increment PKs.
 func (w *WriteHandler) handleInsert(clientConn net.Conn, rawPkt []byte, cl *core.Classification) error {
 	// FK enforcement: check parent rows exist before inserting.
 	if w.fkEnforcer != nil && len(cl.Tables) > 0 {
@@ -63,12 +83,552 @@ func (w *WriteHandler) handleInsert(clientConn net.Conn, rawPkt []byte, cl *core
 		}
 	}
 
-	if err := forwardAndRelay(rawPkt, w.shadowConn, clientConn); err != nil {
+	if len(cl.Tables) == 0 {
+		return forwardAndRelay(rawPkt, w.shadowConn, clientConn)
+	}
+	table := cl.Tables[0]
+	meta, hasMeta := w.tables[table]
+
+	// MariaDB 10.5+: use RETURNING for precise PK tracking.
+	if w.useReturning && hasMeta && len(meta.PKColumns) > 0 {
+		return w.handleInsertReturning(clientConn, rawPkt, cl, table, meta)
+	}
+
+	// Execute on Shadow, capture OK packet metadata.
+	result, err := w.forwardAndCaptureOK(rawPkt, clientConn)
+	if err != nil {
 		return err
 	}
-	for _, table := range cl.Tables {
-		w.deltaMap.MarkInserted(table)
+	if result == nil {
+		// ERR packet was relayed to client — nothing to track.
+		return nil
 	}
+
+	tracked := false
+
+	// Path 1: Auto-increment PK — derive PKs from last_insert_id + affected_rows.
+	if hasMeta && len(meta.PKColumns) == 1 && isAutoIncrement(meta) &&
+		result.lastInsertID > 0 && result.affectedRows > 0 {
+		for i := uint64(0); i < result.affectedRows; i++ {
+			pk := fmt.Sprintf("%d", result.lastInsertID+i)
+			w.addOrStageDelta(table, pk)
+		}
+		tracked = true
+		if w.verbose {
+			log.Printf("[conn %d] INSERT: tracked %d auto-increment PKs for %s (start=%d)",
+				w.connID, result.affectedRows, table, result.lastInsertID)
+		}
+	}
+
+	// Path 2: Non-auto-increment with parseable VALUES — extract PKs from SQL.
+	if !tracked && hasMeta && len(meta.PKColumns) > 0 {
+		pks := w.extractInsertPKs(cl.RawSQL, table, meta)
+		if len(pks) > 0 {
+			for _, pk := range pks {
+				w.addOrStageDelta(table, pk)
+			}
+			tracked = true
+			if w.verbose {
+				log.Printf("[conn %d] INSERT: tracked %d parsed PKs for %s", w.connID, len(pks), table)
+			}
+		}
+	}
+
+	// Path 3: Fallback — aggregate insert count tracking.
+	if !tracked {
+		if w.inTxn {
+			w.deltaMap.StageInsertCount(table, int(result.affectedRows))
+		} else {
+			w.deltaMap.MarkInserted(table)
+		}
+	}
+
+	w.persistDelta()
+	return nil
+}
+
+// handleInsertReturning handles INSERT on MariaDB 10.5+ using RETURNING to
+// extract per-row PKs. Handles two modes:
+//   - User-written RETURNING (cl.HasReturning): executes as-is, relays result set.
+//   - Proxy-injected RETURNING: appends RETURNING pk_cols, builds synthetic OK.
+func (w *WriteHandler) handleInsertReturning(
+	clientConn net.Conn, rawPkt []byte, cl *core.Classification,
+	table string, meta schema.TableMeta,
+) error {
+	if cl.HasReturning {
+		return w.handleInsertUserReturning(clientConn, cl, table, meta)
+	}
+	return w.handleInsertProxyReturning(clientConn, rawPkt, cl, table, meta)
+}
+
+// handleInsertUserReturning executes a user-written INSERT ... RETURNING on
+// shadow, relays the result set to the client, and extracts PKs for delta tracking.
+func (w *WriteHandler) handleInsertUserReturning(
+	clientConn net.Conn, cl *core.Classification,
+	table string, meta schema.TableMeta,
+) error {
+	result, err := execMySQLQuery(w.shadowConn, cl.RawSQL)
+	if err != nil {
+		return fmt.Errorf("shadow INSERT RETURNING: %w", err)
+	}
+
+	// Relay raw response to client (they expect the result set from RETURNING).
+	if _, err := clientConn.Write(result.RawMsgs); err != nil {
+		return fmt.Errorf("relaying RETURNING result: %w", err)
+	}
+
+	if result.Error != "" {
+		return nil // ERR relayed, nothing to track.
+	}
+
+	// Extract PKs from the result set for delta tracking.
+	pks := extractPKsFromResult(result, meta.PKColumns)
+	for _, pk := range pks {
+		w.addOrStageDelta(table, pk)
+	}
+
+	w.persistDelta()
+	if w.verbose {
+		log.Printf("[conn %d] INSERT RETURNING: tracked %d PKs for %s", w.connID, len(pks), table)
+	}
+	return nil
+}
+
+// handleInsertProxyReturning appends RETURNING to the INSERT for PK extraction,
+// executes on shadow, builds a synthetic OK for the client, and tracks PKs.
+func (w *WriteHandler) handleInsertProxyReturning(
+	clientConn net.Conn, rawPkt []byte, cl *core.Classification,
+	table string, meta schema.TableMeta,
+) error {
+	// Build RETURNING clause with PK columns.
+	pkColList := buildPKColumnList(meta.PKColumns)
+	modifiedSQL := strings.TrimRight(strings.TrimSpace(cl.RawSQL), ";")
+	modifiedSQL += " RETURNING " + pkColList
+
+	result, err := execMySQLQuery(w.shadowConn, modifiedSQL)
+	if err != nil {
+		// RETURNING failed — fall back to the standard MySQL path.
+		if w.verbose {
+			log.Printf("[conn %d] INSERT RETURNING failed, falling back: %v", w.connID, err)
+		}
+		return w.handleInsertFallback(clientConn, rawPkt, cl, table)
+	}
+
+	if result.Error != "" {
+		// Relay the error to client.
+		if _, err := clientConn.Write(result.RawMsgs); err != nil {
+			return fmt.Errorf("relaying error: %w", err)
+		}
+		return nil
+	}
+
+	// Extract PKs from the RETURNING result set.
+	pks := extractPKsFromResult(result, meta.PKColumns)
+	for _, pk := range pks {
+		w.addOrStageDelta(table, pk)
+	}
+
+	// Build synthetic OK packet for the client (they sent a plain INSERT, expect OK).
+	affectedRows := uint64(len(result.RowValues))
+	var lastInsertID uint64
+	if isAutoIncrement(meta) && len(result.RowValues) > 0 && len(result.RowValues[0]) > 0 {
+		if id, parseErr := strconv.ParseUint(result.RowValues[0][0], 10, 64); parseErr == nil {
+			lastInsertID = id
+		}
+	}
+	okPkt := buildOKPacketFull(affectedRows, lastInsertID)
+	if _, err := clientConn.Write(okPkt); err != nil {
+		return fmt.Errorf("writing synthetic OK: %w", err)
+	}
+
+	w.persistDelta()
+	if w.verbose {
+		log.Printf("[conn %d] INSERT RETURNING (proxy): tracked %d PKs for %s", w.connID, len(pks), table)
+	}
+	return nil
+}
+
+// handleInsertFallback re-executes the INSERT using the standard MySQL path
+// (forwardAndCaptureOK + 3-path PK extraction) when RETURNING fails.
+func (w *WriteHandler) handleInsertFallback(
+	clientConn net.Conn, rawPkt []byte, cl *core.Classification,
+	table string,
+) error {
+	meta := w.tables[table]
+	result, err := w.forwardAndCaptureOK(rawPkt, clientConn)
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return nil
+	}
+
+	tracked := false
+
+	if len(meta.PKColumns) == 1 && isAutoIncrement(meta) &&
+		result.lastInsertID > 0 && result.affectedRows > 0 {
+		for i := uint64(0); i < result.affectedRows; i++ {
+			pk := fmt.Sprintf("%d", result.lastInsertID+i)
+			w.addOrStageDelta(table, pk)
+		}
+		tracked = true
+	}
+
+	if !tracked && len(meta.PKColumns) > 0 {
+		pks := w.extractInsertPKs(cl.RawSQL, table, meta)
+		if len(pks) > 0 {
+			for _, pk := range pks {
+				w.addOrStageDelta(table, pk)
+			}
+			tracked = true
+		}
+	}
+
+	if !tracked {
+		if w.inTxn {
+			w.deltaMap.StageInsertCount(table, int(result.affectedRows))
+		} else {
+			w.deltaMap.MarkInserted(table)
+		}
+	}
+
+	w.persistDelta()
+	return nil
+}
+
+// extractPKsFromResult extracts serialized PK values from a RETURNING result set.
+// It matches the PK column names against the result set columns and builds
+// serialized PK strings for delta tracking.
+func extractPKsFromResult(result *QueryResult, pkColumns []string) []string {
+	if len(result.RowValues) == 0 || len(result.Columns) == 0 {
+		return nil
+	}
+
+	// Map PK column names to their indices in the result set.
+	pkIndices := make([]int, len(pkColumns))
+	for i, pk := range pkColumns {
+		pkIndices[i] = -1
+		for j, col := range result.Columns {
+			if strings.EqualFold(col.Name, pk) {
+				pkIndices[i] = j
+				break
+			}
+		}
+		if pkIndices[i] == -1 {
+			return nil // PK column not found in result set.
+		}
+	}
+
+	var pks []string
+	for _, row := range result.RowValues {
+		pkVals := make([]string, len(pkColumns))
+		valid := true
+		for i, idx := range pkIndices {
+			if idx >= len(row) {
+				valid = false
+				break
+			}
+			pkVals[i] = row[idx]
+		}
+		if valid {
+			pks = append(pks, serializeCompositePK(pkColumns, pkVals))
+		}
+	}
+	return pks
+}
+
+// insertOKResult holds the metadata extracted from an INSERT's OK packet.
+type insertOKResult struct {
+	affectedRows uint64
+	lastInsertID uint64
+}
+
+// forwardAndCaptureOK sends a packet to Shadow, reads the response, relays it
+// to the client, and returns the OK packet metadata. Returns nil if the response
+// was an ERR packet (which is still relayed to the client).
+func (w *WriteHandler) forwardAndCaptureOK(rawPkt []byte, clientConn net.Conn) (*insertOKResult, error) {
+	if _, err := w.shadowConn.Write(rawPkt); err != nil {
+		return nil, fmt.Errorf("sending to shadow: %w", err)
+	}
+
+	pkt, err := readMySQLPacket(w.shadowConn)
+	if err != nil {
+		return nil, fmt.Errorf("reading shadow response: %w", err)
+	}
+
+	// Relay the response to client.
+	if _, err := clientConn.Write(pkt.Raw); err != nil {
+		return nil, fmt.Errorf("relaying to client: %w", err)
+	}
+
+	if isERRPacket(pkt.Payload) {
+		return nil, nil
+	}
+
+	if isOKPacket(pkt.Payload) {
+		r := &insertOKResult{}
+		if len(pkt.Payload) > 1 {
+			r.affectedRows = readLenEncUint64(pkt.Payload[1:])
+			arSize := lenEncIntSize(pkt.Payload[1:])
+			liOffset := 1 + arSize
+			if liOffset < len(pkt.Payload) {
+				r.lastInsertID = readLenEncUint64(pkt.Payload[liOffset:])
+			}
+		}
+		return r, nil
+	}
+
+	// Unexpected result set — drain and relay it.
+	for {
+		p, err := readMySQLPacket(w.shadowConn)
+		if err != nil {
+			return nil, fmt.Errorf("draining result set: %w", err)
+		}
+		if _, err := clientConn.Write(p.Raw); err != nil {
+			return nil, fmt.Errorf("relaying result set: %w", err)
+		}
+		if isEOFPacket(p.Payload) || isERRPacket(p.Payload) {
+			break
+		}
+	}
+	return &insertOKResult{}, nil
+}
+
+// extractInsertPKs parses an INSERT statement with Vitess and extracts PK
+// values from the VALUES clause. Returns nil if parsing fails or the INSERT
+// is not a simple VALUES-based INSERT (e.g., INSERT...SELECT).
+func (w *WriteHandler) extractInsertPKs(sql, table string, meta schema.TableMeta) []string {
+	parser, _ := sqlparser.New(sqlparser.Options{MySQLServerVersion: "8.0.30"})
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		return nil
+	}
+	ins, ok := stmt.(*sqlparser.Insert)
+	if !ok || ins.Table == nil {
+		return nil
+	}
+
+	// Extract column names from INSERT.
+	var insertCols []string
+	for _, col := range ins.Columns {
+		insertCols = append(insertCols, col.String())
+	}
+	if len(insertCols) == 0 {
+		return nil
+	}
+
+	// Find which insert columns correspond to PK columns.
+	pkIndices := make(map[int]string) // index in insertCols -> PK col name
+	for i, col := range insertCols {
+		colLower := strings.ToLower(strings.Trim(col, "`"))
+		for _, pkCol := range meta.PKColumns {
+			if strings.EqualFold(colLower, pkCol) {
+				pkIndices[i] = pkCol
+			}
+		}
+	}
+	if len(pkIndices) != len(meta.PKColumns) {
+		return nil // Not all PK columns present in INSERT column list.
+	}
+
+	// Extract VALUES rows.
+	valRows := extractInsertValues(ins)
+	if len(valRows) == 0 {
+		return nil // INSERT...SELECT or no values.
+	}
+
+	var pks []string
+	for _, row := range valRows {
+		pkVals := make([]string, 0, len(meta.PKColumns))
+		allLiteral := true
+		for _, pkCol := range meta.PKColumns {
+			found := false
+			for idx, mappedCol := range pkIndices {
+				if mappedCol == pkCol && idx < len(row) {
+					val := strings.Trim(row[idx], "'")
+					// Skip function calls and expressions (e.g., UUID(), NOW()).
+					if strings.Contains(val, "(") {
+						allLiteral = false
+						break
+					}
+					pkVals = append(pkVals, val)
+					found = true
+					break
+				}
+			}
+			if !found || !allLiteral {
+				allLiteral = false
+				break
+			}
+		}
+		if allLiteral && len(pkVals) == len(meta.PKColumns) {
+			pks = append(pks, serializeCompositePK(meta.PKColumns, pkVals))
+		}
+	}
+	return pks
+}
+
+// addOrStageDelta adds a PK to the delta map, using Stage when in a transaction.
+func (w *WriteHandler) addOrStageDelta(table, pk string) {
+	if w.inTxn {
+		w.deltaMap.Stage(table, pk)
+	} else {
+		w.deltaMap.Add(table, pk)
+	}
+}
+
+// persistDelta writes the delta map to disk in autocommit mode.
+// In txn mode, persistence is deferred to COMMIT.
+func (w *WriteHandler) persistDelta() {
+	if w.inTxn {
+		return
+	}
+	if err := delta.WriteDeltaMap(w.moriDir, w.deltaMap); err != nil {
+		if w.verbose {
+			log.Printf("[conn %d] failed to persist delta map: %v", w.connID, err)
+		}
+	}
+}
+
+// handleReplace handles REPLACE INTO statements with upsert-like hydration.
+// REPLACE has delete+insert semantics: if a row with the same PK/unique key
+// exists, it is deleted and re-inserted. We hydrate matching Prod rows into
+// Shadow before executing, and tombstone any replaced Prod-only rows.
+func (w *WriteHandler) handleReplace(clientConn net.Conn, rawPkt []byte, cl *core.Classification) error {
+	if len(cl.Tables) == 0 {
+		return forwardAndRelay(rawPkt, w.shadowConn, clientConn)
+	}
+	table := cl.Tables[0]
+
+	// FK enforcement for the INSERT part.
+	if w.fkEnforcer != nil {
+		if err := w.fkEnforcer.EnforceInsert(table, cl.RawSQL); err != nil {
+			clientConn.Write(buildFKErrorPacket(err.Error()))
+			return nil
+		}
+	}
+
+	meta, ok := w.tables[table]
+	if !ok || len(meta.PKColumns) == 0 {
+		// No PK info — fall back to simple insert path.
+		return w.handleInsert(clientConn, rawPkt, cl)
+	}
+
+	// Parse REPLACE to extract column list and VALUES using Vitess.
+	parser, _ := sqlparser.New(sqlparser.Options{MySQLServerVersion: "8.0.30"})
+	stmt, err := parser.Parse(cl.RawSQL)
+	if err != nil {
+		return w.handleInsert(clientConn, rawPkt, cl)
+	}
+	ins, ok := stmt.(*sqlparser.Insert)
+	if !ok || ins.Table == nil {
+		return w.handleInsert(clientConn, rawPkt, cl)
+	}
+
+	// Extract column names from REPLACE.
+	var insertCols []string
+	for _, col := range ins.Columns {
+		insertCols = append(insertCols, col.String())
+	}
+
+	// Find which insert columns correspond to PK columns.
+	pkIndices := make(map[int]string)
+	for i, col := range insertCols {
+		colLower := strings.ToLower(strings.Trim(col, "`"))
+		for _, pkCol := range meta.PKColumns {
+			if strings.EqualFold(colLower, pkCol) {
+				pkIndices[i] = pkCol
+			}
+		}
+	}
+
+	// Extract VALUES rows.
+	valRows := extractInsertValues(ins)
+
+	// For each row, extract PK, check Prod, hydrate if needed.
+	var trackedPKs []string
+	var prodOnlyPKs []string // PKs that exist in Prod but not Shadow — need tombstoning.
+	for _, row := range valRows {
+		pkValues := make(map[string]string)
+		allPKsFound := true
+		for idx, pkCol := range pkIndices {
+			if idx < len(row) {
+				val := strings.Trim(row[idx], "'")
+				if strings.Contains(val, "(") {
+					allPKsFound = false // Expression — can't extract.
+					break
+				}
+				pkValues[pkCol] = val
+			} else {
+				allPKsFound = false
+				break
+			}
+		}
+		if !allPKsFound || len(pkValues) == 0 {
+			continue
+		}
+
+		// Serialize the PK.
+		pkVals := make([]string, 0, len(meta.PKColumns))
+		for _, col := range meta.PKColumns {
+			pkVals = append(pkVals, pkValues[col])
+		}
+		serialized := serializeCompositePK(meta.PKColumns, pkVals)
+		trackedPKs = append(trackedPKs, serialized)
+
+		if w.deltaMap.IsDelta(table, serialized) {
+			continue // Already in Shadow.
+		}
+
+		// Hydrate from Prod so Shadow has the row to replace.
+		if err := w.hydrateRow(table, pkValues); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] REPLACE hydration failed for %s: %v", w.connID, table, err)
+			}
+			// Row doesn't exist in Prod — that's fine, REPLACE will just insert.
+		} else {
+			prodOnlyPKs = append(prodOnlyPKs, serialized)
+		}
+	}
+
+	// Execute REPLACE on Shadow.
+	result, err := w.forwardAndCaptureOK(rawPkt, clientConn)
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return nil // ERR packet relayed.
+	}
+
+	// Track all PKs as deltas.
+	for _, pk := range trackedPKs {
+		w.addOrStageDelta(table, pk)
+	}
+
+	// Tombstone Prod-only PKs that were replaced (the Prod version is now stale).
+	for _, pk := range prodOnlyPKs {
+		if w.inTxn {
+			w.tombstones.Stage(table, pk)
+		} else {
+			w.tombstones.Add(table, pk)
+		}
+	}
+
+	// Persist.
+	w.persistDelta()
+	if !w.inTxn && len(prodOnlyPKs) > 0 {
+		if err := delta.WriteTombstoneSet(w.moriDir, w.tombstones); err != nil {
+			if w.verbose {
+				log.Printf("[conn %d] failed to persist tombstones: %v", w.connID, err)
+			}
+		}
+	}
+
+	if w.verbose {
+		log.Printf("[conn %d] REPLACE: tracked %d PKs, tombstoned %d Prod-only rows for %s",
+			w.connID, len(trackedPKs), len(prodOnlyPKs), table)
+	}
+
 	return nil
 }
 

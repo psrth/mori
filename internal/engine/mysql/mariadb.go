@@ -3,7 +3,9 @@ package mysql
 import (
 	"context"
 
+	"github.com/mori-dev/mori/internal/core/tlsutil"
 	"github.com/mori-dev/mori/internal/engine"
+	"github.com/mori-dev/mori/internal/engine/mysql/proxy"
 	"github.com/mori-dev/mori/internal/registry"
 )
 
@@ -44,4 +46,34 @@ func (e *mariadbEngine) Init(ctx context.Context, opts engine.InitOptions) (*eng
 		ContainerPort: result.Container.HostPort,
 		TableCount:    len(result.Dump.Tables),
 	}, nil
+}
+
+// NewProxy overrides the MySQL NewProxy to enable RETURNING-based PK tracking.
+// MariaDB 10.5+ supports INSERT ... RETURNING which provides PG-level delta
+// fidelity for all INSERT patterns (composite PKs, UUIDs, INSERT...SELECT).
+func (e *mariadbEngine) NewProxy(deps engine.ProxyDeps, tables map[string]engine.TableMeta) engine.Proxy {
+	return proxy.New(
+		deps.ProdAddr,
+		deps.ShadowAddr,
+		deps.DBName,
+		deps.ListenPort,
+		deps.Verbose,
+		deps.Classifier,
+		deps.Router,
+		deps.DeltaMap,
+		deps.Tombstones,
+		convertTablesToMySQL(tables),
+		deps.MoriDir,
+		deps.SchemaReg,
+		deps.Logger,
+		deps.MaxRowsHydrate,
+		tlsutil.TLSParams{
+			ServerName: deps.ProdHost,
+			SSLMode:    deps.SSLMode,
+			CACertPath: deps.CACertPath,
+			CertPath:   deps.CertPath,
+			KeyPath:    deps.KeyPath,
+		},
+		true, // useReturning: MariaDB 10.5+ supports INSERT ... RETURNING
+	)
 }

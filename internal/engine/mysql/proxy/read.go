@@ -29,6 +29,7 @@ type QueryResult struct {
 	RawMsgs      []byte // all raw response bytes for relay
 	Error        string // error message if the response was an ERR packet
 	AffectedRows uint64 // from OK packet for writes
+	LastInsertID uint64 // from OK packet for auto-increment inserts
 }
 
 // ReadHandler encapsulates merged read logic for a single MySQL connection.
@@ -379,10 +380,16 @@ func execMySQLQuery(conn net.Conn, sql string) (*QueryResult, error) {
 	}
 
 	// OK packet (e.g., for queries returning no result set).
+	// Format: header(0x00) + affected_rows(lenenc) + last_insert_id(lenenc) + ...
 	if isOKPacket(first.Payload) {
-		// Parse affected_rows from OK packet: header(0x00) + affected_rows(lenenc) + ...
 		if len(first.Payload) > 1 {
 			result.AffectedRows = readLenEncUint64(first.Payload[1:])
+			// Advance past affected_rows to read last_insert_id.
+			arSize := lenEncIntSize(first.Payload[1:])
+			liOffset := 1 + arSize
+			if liOffset < len(first.Payload) {
+				result.LastInsertID = readLenEncUint64(first.Payload[liOffset:])
+			}
 		}
 		return result, nil
 	}

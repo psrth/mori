@@ -242,6 +242,10 @@ func (c *MySQLClassifier) classifySelect(sel *sqlparser.Select, cl *core.Classif
 			if !cl.HasAggregate && hasAggregateExpr(expr) {
 				cl.HasAggregate = true
 			}
+			if !cl.HasComplexAgg && hasComplexAggregateExpr(expr) {
+				cl.HasComplexAgg = true
+				cl.HasAggregate = true
+			}
 			if !cl.HasWindowFunc && hasWindowFuncExpr(expr) {
 				cl.HasWindowFunc = true
 				cl.IsComplexRead = true
@@ -485,8 +489,42 @@ func containsAggregate(expr sqlparser.Expr) bool {
 			"bit_and", "bit_or", "bit_xor":
 			return true
 		}
+	// Vitess uses dedicated AST types for certain aggregate functions.
 	case *sqlparser.CountStar:
 		return true
+	case *sqlparser.Count, *sqlparser.Sum, *sqlparser.Avg, *sqlparser.Min, *sqlparser.Max:
+		return true
+	case *sqlparser.GroupConcatExpr, *sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg:
+		return true
+	}
+	return false
+}
+
+// hasComplexAggregateExpr checks if a select expression contains a MySQL complex
+// aggregate that cannot be re-aggregated in Go and requires materialization.
+func hasComplexAggregateExpr(expr sqlparser.SelectExpr) bool {
+	ae, ok := expr.(*sqlparser.AliasedExpr)
+	if !ok {
+		return false
+	}
+	return containsComplexAggregate(ae.Expr)
+}
+
+func containsComplexAggregate(expr sqlparser.Expr) bool {
+	if expr == nil {
+		return false
+	}
+	switch expr.(type) {
+	case *sqlparser.GroupConcatExpr, *sqlparser.JSONArrayAgg, *sqlparser.JSONObjectAgg:
+		return true
+	}
+	// Also check FuncExpr in case Vitess version uses it as fallback.
+	if e, ok := expr.(*sqlparser.FuncExpr); ok {
+		name := strings.ToLower(e.Name.String())
+		switch name {
+		case "group_concat", "json_arrayagg", "json_objectagg":
+			return true
+		}
 	}
 	return false
 }
@@ -669,6 +707,10 @@ func (c *MySQLClassifier) classifyRegex(trimmed string, cl *core.Classification)
 		if m := reReplaceTable.FindStringSubmatch(upper); len(m) > 1 {
 			cl.Tables = appendUnique(cl.Tables, cleanTableName(m[1]))
 		}
+		// MariaDB 10.5+: detect RETURNING clause on REPLACE.
+		if reReturning.MatchString(upper) {
+			cl.HasReturning = true
+		}
 	case hasPrefix(upper, "CREATE"):
 		cl.OpType = core.OpDDL
 		cl.SubType = core.SubCreate
@@ -723,6 +765,9 @@ func (c *MySQLClassifier) classifyRegex(trimmed string, cl *core.Classification)
 	case hasPrefix(upper, "USE"), hasPrefix(upper, "HELP"):
 		cl.OpType = core.OpOther
 		cl.SubType = core.SubOther
+	case hasPrefix(upper, "EXECUTE"):
+		cl.OpType = core.OpOther
+		cl.SubType = core.SubExecute
 	case hasPrefix(upper, "WITH"):
 		c.classifyCTERegex(trimmed, upper, cl)
 	default:
@@ -754,6 +799,10 @@ func (c *MySQLClassifier) classifySelectRegex(raw, upper string, cl *core.Classi
 		cl.IsMetadataQuery = true
 	}
 	cl.HasAggregate = reAggregate.MatchString(upper) || strings.Contains(upper, "GROUP BY")
+	if reComplexAggregate.MatchString(upper) {
+		cl.HasComplexAgg = true
+		cl.HasAggregate = true
+	}
 	cl.HasSetOp = reSetOp.MatchString(upper)
 	if reSubqueryFrom.MatchString(upper) {
 		cl.IsComplexRead = true
@@ -775,6 +824,10 @@ func (c *MySQLClassifier) classifyInsertRegex(upper string, cl *core.Classificat
 	if strings.Contains(upper, "ON DUPLICATE KEY UPDATE") {
 		cl.HasOnConflict = true
 	}
+	// MariaDB 10.5+: detect RETURNING clause on INSERT.
+	if reReturning.MatchString(upper) {
+		cl.HasReturning = true
+	}
 }
 
 func (c *MySQLClassifier) classifyUpdateRegex(raw, upper string, cl *core.Classification) {
@@ -791,6 +844,10 @@ func (c *MySQLClassifier) classifyDeleteRegex(raw, upper string, cl *core.Classi
 	cl.Tables = extractDeleteTablesRegex(upper)
 	cl.IsJoin = len(cl.Tables) > 1
 	cl.PKs = c.extractPKsRegex(raw, cl.Tables)
+	// MariaDB 10.5+: detect RETURNING clause on DELETE.
+	if reReturning.MatchString(upper) {
+		cl.HasReturning = true
+	}
 }
 
 func (c *MySQLClassifier) classifyCTERegex(raw, upper string, cl *core.Classification) {
@@ -806,6 +863,10 @@ func (c *MySQLClassifier) classifyCTERegex(raw, upper string, cl *core.Classific
 	cl.Tables = extractFromTablesRegex(upper)
 	cl.IsJoin = len(cl.Tables) > 1 || reJoin.MatchString(upper)
 	cl.HasAggregate = reAggregate.MatchString(upper) || strings.Contains(upper, "GROUP BY")
+	if reComplexAggregate.MatchString(upper) {
+		cl.HasComplexAgg = true
+		cl.HasAggregate = true
+	}
 	if reWindowFunc.MatchString(upper) || strings.Contains(upper, " OVER(") || strings.Contains(upper, " OVER ") {
 		cl.HasWindowFunc = true
 	}
@@ -851,7 +912,8 @@ func (c *MySQLClassifier) extractPKsRegex(raw string, tables []string) []core.Ta
 var (
 	reJoin         = regexp.MustCompile(`(?i)\b(INNER|LEFT|RIGHT|CROSS|NATURAL|STRAIGHT_JOIN)\s+JOIN\b`)
 	reLimit        = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)`)
-	reAggregate    = regexp.MustCompile(`(?i)\b(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(`)
+	reAggregate        = regexp.MustCompile(`(?i)\b(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(`)
+	reComplexAggregate = regexp.MustCompile(`(?i)\b(GROUP_CONCAT|JSON_ARRAYAGG|JSON_OBJECTAGG)\s*\(`)
 	reSetOp        = regexp.MustCompile(`(?i)\b(UNION|INTERSECT|EXCEPT)\b`)
 	reSubqueryFrom = regexp.MustCompile(`(?i)\bFROM\s*\(`)
 	reWindowFunc   = regexp.MustCompile(`(?i)\b(ROW_NUMBER|RANK|DENSE_RANK|NTILE|LAG|LEAD|FIRST_VALUE|LAST_VALUE|NTH_VALUE)\s*\(`)
@@ -860,6 +922,7 @@ var (
 	reReplaceTable   = regexp.MustCompile(`(?i)REPLACE\s+INTO\s+` + tablePattern)
 	reTruncateTable  = regexp.MustCompile(`(?i)TRUNCATE\s+(?:TABLE\s+)?` + tablePattern)
 	reExplainAnalyze = regexp.MustCompile(`(?i)^EXPLAIN\s+ANALYZE\b`)
+	reReturning      = regexp.MustCompile(`(?i)\bRETURNING\b`)
 
 	reFromClause = regexp.MustCompile(`(?i)\bFROM\s+(` + tableListPattern + `)`)
 	reJoinTable  = regexp.MustCompile(`(?i)\bJOIN\s+` + tablePattern)

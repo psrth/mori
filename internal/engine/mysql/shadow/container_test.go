@@ -6,7 +6,7 @@ import (
 )
 
 func TestGenerateContainerName(t *testing.T) {
-	name, err := generateContainerName()
+	name, err := generateContainerName("mysql:8.0")
 	if err != nil {
 		t.Fatalf("generateContainerName() error: %v", err)
 	}
@@ -18,9 +18,22 @@ func TestGenerateContainerName(t *testing.T) {
 	}
 }
 
+func TestGenerateContainerName_MariaDB(t *testing.T) {
+	name, err := generateContainerName("mariadb:10.11")
+	if err != nil {
+		t.Fatalf("generateContainerName() error: %v", err)
+	}
+	if !strings.HasPrefix(name, "mori-mariadb-shadow-") {
+		t.Errorf("container name %q does not have expected mariadb prefix", name)
+	}
+	if len(name) != len("mori-mariadb-shadow-")+12 {
+		t.Errorf("container name %q has unexpected length %d", name, len(name))
+	}
+}
+
 func TestGenerateContainerName_Unique(t *testing.T) {
-	name1, _ := generateContainerName()
-	name2, _ := generateContainerName()
+	name1, _ := generateContainerName("mysql:8.0")
+	name2, _ := generateContainerName("mysql:8.0")
 	if name1 == name2 {
 		t.Error("two generated names should be different")
 	}

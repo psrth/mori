@@ -144,6 +144,25 @@ func buildOKPacketWithAffectedRows(affectedRows uint64) []byte {
 	return pkt
 }
 
+// buildOKPacketFull constructs a MySQL OK packet with affected rows and last insert ID.
+func buildOKPacketFull(affectedRows, lastInsertID uint64) []byte {
+	var payload []byte
+	payload = append(payload, 0x00) // OK header
+	payload = append(payload, encodeLenEncInt(affectedRows)...)
+	payload = append(payload, encodeLenEncInt(lastInsertID)...)
+	payload = append(payload, 0x02, 0x00) // status flags (SERVER_STATUS_AUTOCOMMIT)
+	payload = append(payload, 0x00, 0x00) // warnings
+
+	pktLen := len(payload)
+	pkt := make([]byte, 4+pktLen)
+	pkt[0] = byte(pktLen)
+	pkt[1] = byte(pktLen >> 8)
+	pkt[2] = byte(pktLen >> 16)
+	pkt[3] = 1 // sequence number
+	copy(pkt[4:], payload)
+	return pkt
+}
+
 // encodeLenEncInt encodes an integer as MySQL length-encoded integer.
 func encodeLenEncInt(n uint64) []byte {
 	if n < 251 {

@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 
+	"vitess.io/vitess/go/vt/sqlparser"
+
 	"github.com/mori-dev/mori/internal/core"
 	"github.com/mori-dev/mori/internal/core/delta"
 	coreSchema "github.com/mori-dev/mori/internal/core/schema"
@@ -27,14 +29,41 @@ type DDLHandler struct {
 }
 
 // HandleDDL executes a DDL statement on Shadow and updates the schema registry.
+// Before forwarding to Shadow, FK constraints are extracted (for proxy-layer
+// enforcement) and stripped (because Shadow may lack referenced parent rows).
 func (dh *DDLHandler) HandleDDL(
 	clientConn net.Conn,
 	rawPkt []byte,
 	cl *core.Classification,
 ) error {
-	// Execute DDL on Shadow, relay response to client.
-	if err := forwardAndRelay(rawPkt, dh.shadowConn, clientConn); err != nil {
+	// Extract FK metadata BEFORE stripping — we need to remember FK definitions
+	// for proxy-layer enforcement.
+	if dh.schemaRegistry != nil {
+		dh.extractAndStoreMySQLFKs(cl.RawSQL)
+	}
+
+	// Strip FK constraints before sending to Shadow — Shadow can't validate
+	// foreign keys against Prod rows.
+	ddlPkt := rawPkt
+	if strippedSQL, refTables := stripMySQLFKConstraints(cl.RawSQL); refTables != nil {
+		log.Printf("[conn %d] DDL: stripping FOREIGN KEY constraints (refs: %s) — FK validation deferred to production migration",
+			dh.connID, strings.Join(refTables, ", "))
+		dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("FK constraints stripped (refs: %s)", strings.Join(refTables, ", ")))
+		ddlPkt = buildCOMQuery(0, strippedSQL)
+	}
+
+	// Execute DDL on Shadow, relay response to client, and detect errors.
+	hadError, err := dh.forwardAndRelayDDL(ddlPkt, clientConn)
+	if err != nil {
 		return fmt.Errorf("DDL forward: %w", err)
+	}
+
+	// If DDL failed on Shadow, skip registry update.
+	if hadError {
+		if dh.verbose {
+			log.Printf("[conn %d] DDL failed on Shadow, skipping registry update", dh.connID)
+		}
+		return nil
 	}
 
 	if dh.schemaRegistry == nil {
@@ -60,6 +89,242 @@ func (dh *DDLHandler) HandleDDL(
 	}
 
 	return nil
+}
+
+// forwardAndRelayDDL sends a DDL packet to Shadow, relays the response to the
+// client, and reports whether the backend returned an error.
+func (dh *DDLHandler) forwardAndRelayDDL(pkt []byte, clientConn net.Conn) (hadError bool, err error) {
+	if _, err := dh.shadowConn.Write(pkt); err != nil {
+		return false, fmt.Errorf("sending to shadow: %w", err)
+	}
+
+	resp, err := readMySQLPacket(dh.shadowConn)
+	if err != nil {
+		return false, fmt.Errorf("reading shadow response: %w", err)
+	}
+
+	if isERRPacket(resp.Payload) {
+		hadError = true
+	}
+
+	if _, err := clientConn.Write(resp.Raw); err != nil {
+		return hadError, fmt.Errorf("relaying to client: %w", err)
+	}
+
+	// OK or ERR: response is complete.
+	if isOKPacket(resp.Payload) || isERRPacket(resp.Payload) {
+		return hadError, nil
+	}
+
+	// Unexpected result set — drain it.
+	for {
+		pkt, err := readMySQLPacket(dh.shadowConn)
+		if err != nil {
+			return hadError, fmt.Errorf("draining DDL response: %w", err)
+		}
+		if _, err := clientConn.Write(pkt.Raw); err != nil {
+			return hadError, fmt.Errorf("relaying DDL response: %w", err)
+		}
+		if isEOFPacket(pkt.Payload) || isERRPacket(pkt.Payload) {
+			return hadError, nil
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FK extraction and stripping for runtime DDL
+// ---------------------------------------------------------------------------
+
+// extractAndStoreMySQLFKs parses a DDL statement and extracts FK constraint
+// metadata, storing it in the schema registry for proxy-layer enforcement.
+// Called BEFORE stripMySQLFKConstraints so the original FK definitions are preserved.
+func (dh *DDLHandler) extractAndStoreMySQLFKs(sql string) {
+	parser, err := sqlparser.New(sqlparser.Options{MySQLServerVersion: "8.0.30"})
+	if err != nil {
+		return
+	}
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		return
+	}
+
+	switch s := stmt.(type) {
+	case *sqlparser.CreateTable:
+		childTable := s.Table.Name.String()
+		if childTable == "" {
+			return
+		}
+		for _, col := range s.TableSpec.Columns {
+			// MySQL CREATE TABLE doesn't support inline REFERENCES on columns
+			// at the column level (they're table-level constraints), so we skip.
+			_ = col
+		}
+		// Table-level constraints (FOREIGN KEY ...)
+		for _, idx := range s.TableSpec.Indexes {
+			_ = idx // Indexes aren't FK constraints.
+		}
+		for _, constraint := range s.TableSpec.Constraints {
+			fkDef, ok := constraint.Details.(*sqlparser.ForeignKeyDefinition)
+			if !ok {
+				continue
+			}
+			fk := dh.buildFKFromVitess(childTable, constraint.Name, fkDef)
+			dh.schemaRegistry.RecordForeignKey(childTable, fk)
+			if dh.verbose {
+				log.Printf("[conn %d] schema registry: FK %s(%s) -> %s(%s)",
+					dh.connID, childTable, strings.Join(fk.ChildColumns, ", "),
+					fk.ParentTable, strings.Join(fk.ParentColumns, ", "))
+			}
+			dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("FK %s(%s) -> %s(%s)",
+				childTable, strings.Join(fk.ChildColumns, ", "),
+				fk.ParentTable, strings.Join(fk.ParentColumns, ", ")))
+		}
+
+	case *sqlparser.AlterTable:
+		childTable := s.Table.Name.String()
+		if childTable == "" {
+			return
+		}
+		for _, opt := range s.AlterOptions {
+			addConstraint, ok := opt.(*sqlparser.AddConstraintDefinition)
+			if !ok {
+				continue
+			}
+			fkDef, ok := addConstraint.ConstraintDefinition.Details.(*sqlparser.ForeignKeyDefinition)
+			if !ok {
+				continue
+			}
+			fk := dh.buildFKFromVitess(childTable, addConstraint.ConstraintDefinition.Name, fkDef)
+			dh.schemaRegistry.RecordForeignKey(childTable, fk)
+			if dh.verbose {
+				log.Printf("[conn %d] schema registry: FK %s(%s) -> %s(%s)",
+					dh.connID, childTable, strings.Join(fk.ChildColumns, ", "),
+					fk.ParentTable, strings.Join(fk.ParentColumns, ", "))
+			}
+			dh.logger.Event(dh.connID, "ddl", fmt.Sprintf("FK %s(%s) -> %s(%s)",
+				childTable, strings.Join(fk.ChildColumns, ", "),
+				fk.ParentTable, strings.Join(fk.ParentColumns, ", ")))
+		}
+	}
+}
+
+// buildFKFromVitess builds a coreSchema.ForeignKey from a Vitess ForeignKeyDefinition.
+func (dh *DDLHandler) buildFKFromVitess(childTable string, constraintName sqlparser.IdentifierCI, fkDef *sqlparser.ForeignKeyDefinition) coreSchema.ForeignKey {
+	fk := coreSchema.ForeignKey{
+		ConstraintName: constraintName.String(),
+		ChildTable:     strings.ToLower(childTable),
+		OnDelete:       "NO ACTION",
+		OnUpdate:       "NO ACTION",
+	}
+
+	// Extract child columns from the FK source.
+	for _, col := range fkDef.Source {
+		fk.ChildColumns = append(fk.ChildColumns, col.String())
+	}
+
+	// Extract parent table and columns from the FK reference.
+	if fkDef.ReferenceDefinition != nil {
+		fk.ParentTable = strings.ToLower(fkDef.ReferenceDefinition.ReferencedTable.Name.String())
+		for _, col := range fkDef.ReferenceDefinition.ReferencedColumns {
+			fk.ParentColumns = append(fk.ParentColumns, col.String())
+		}
+		fk.OnDelete = vitessRefActionToString(fkDef.ReferenceDefinition.OnDelete)
+		fk.OnUpdate = vitessRefActionToString(fkDef.ReferenceDefinition.OnUpdate)
+	}
+
+	return fk
+}
+
+// vitessRefActionToString converts a Vitess ReferenceAction to a SQL action string.
+func vitessRefActionToString(action sqlparser.ReferenceAction) string {
+	switch action {
+	case sqlparser.Cascade:
+		return "CASCADE"
+	case sqlparser.Restrict:
+		return "RESTRICT"
+	case sqlparser.SetNull:
+		return "SET NULL"
+	case sqlparser.SetDefault:
+		return "SET DEFAULT"
+	case sqlparser.NoAction:
+		return "NO ACTION"
+	default:
+		return "NO ACTION"
+	}
+}
+
+// stripMySQLFKConstraints parses a DDL statement using Vitess and removes FK
+// constraints. Returns the modified SQL and a list of referenced table names.
+// Returns ("", nil) if no FK constraints were found.
+func stripMySQLFKConstraints(sql string) (string, []string) {
+	parser, err := sqlparser.New(sqlparser.Options{MySQLServerVersion: "8.0.30"})
+	if err != nil {
+		return "", nil
+	}
+	stmt, err := parser.Parse(sql)
+	if err != nil {
+		return "", nil
+	}
+
+	var refTables []string
+	modified := false
+
+	switch s := stmt.(type) {
+	case *sqlparser.CreateTable:
+		if s.TableSpec == nil {
+			return "", nil
+		}
+		// Filter out FK constraints from table-level constraints.
+		var keptConstraints []*sqlparser.ConstraintDefinition
+		for _, constraint := range s.TableSpec.Constraints {
+			fkDef, ok := constraint.Details.(*sqlparser.ForeignKeyDefinition)
+			if !ok {
+				keptConstraints = append(keptConstraints, constraint)
+				continue
+			}
+			// This is a FK — strip it and record the referenced table.
+			modified = true
+			if fkDef.ReferenceDefinition != nil {
+				refTables = append(refTables, fkDef.ReferenceDefinition.ReferencedTable.Name.String())
+			}
+		}
+		if modified {
+			s.TableSpec.Constraints = keptConstraints
+		}
+
+	case *sqlparser.AlterTable:
+		var keptOptions []sqlparser.AlterOption
+		for _, opt := range s.AlterOptions {
+			addConstraint, ok := opt.(*sqlparser.AddConstraintDefinition)
+			if !ok {
+				keptOptions = append(keptOptions, opt)
+				continue
+			}
+			fkDef, ok := addConstraint.ConstraintDefinition.Details.(*sqlparser.ForeignKeyDefinition)
+			if !ok {
+				keptOptions = append(keptOptions, opt)
+				continue
+			}
+			// This is an ADD FOREIGN KEY — strip it.
+			modified = true
+			if fkDef.ReferenceDefinition != nil {
+				refTables = append(refTables, fkDef.ReferenceDefinition.ReferencedTable.Name.String())
+			}
+		}
+		if modified {
+			if len(keptOptions) == 0 {
+				// All ALTER TABLE clauses were FK constraints — return a no-op.
+				return "SELECT 1", refTables
+			}
+			s.AlterOptions = keptOptions
+		}
+	}
+
+	if !modified {
+		return "", nil
+	}
+
+	return sqlparser.String(stmt), refTables
 }
 
 type mysqlDDLChangeKind int

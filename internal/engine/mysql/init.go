@@ -129,6 +129,13 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		// Generated column detection failure shouldn't block init.
 	}
 
+	// Warn about PK-less tables — deduplication uses full-row matching.
+	for name, meta := range tables {
+		if len(meta.PKColumns) == 0 {
+			ui.StepWarn(fmt.Sprintf("Table %q has no primary key — merged reads will use full-row deduplication, which cannot distinguish identical rows", name))
+		}
+	}
+
 	ui.StepDone(fmt.Sprintf("%d tables dumped", len(tables)))
 
 	// 8. Detect auto_increment offsets.

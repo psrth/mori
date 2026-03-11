@@ -119,6 +119,7 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 			verbose:        p.verbose,
 			logger:         p.logger,
 			maxRowsHydrate: p.maxRowsHydrate,
+			useReturning:   p.useReturning,
 		}
 	}
 
@@ -491,30 +492,27 @@ func (p *Proxy) routeLoop(clientConn, prodConn, shadowConn net.Conn, connID int6
 // discarded on ROLLBACK by TxnHandler.
 func handleTxnWrite(
 	wh *WriteHandler,
-	txh *TxnHandler,
+	_ *TxnHandler,
 	clientConn net.Conn,
 	rawPkt []byte,
 	cl *core.Classification,
 	strategy core.RoutingStrategy,
 ) error {
-	// For inserts: forward to shadow, mark inserted (inserts don't need staging).
+	// Set inTxn flag so WriteHandler methods use Stage instead of Add.
+	wh.inTxn = true
+	defer func() { wh.inTxn = false }()
+
+	// For inserts (including REPLACE): delegate to the PK-aware handleInsert/handleReplace.
 	if strategy == core.StrategyShadowWrite {
-		if err := forwardAndRelay(rawPkt, wh.shadowConn, clientConn); err != nil {
-			return err
+		if isReplaceInto(cl.RawSQL) {
+			return wh.handleReplace(clientConn, rawPkt, cl)
 		}
-		for _, table := range cl.Tables {
-			wh.deltaMap.MarkInserted(table)
-		}
-		return nil
+		return wh.handleInsert(clientConn, rawPkt, cl)
 	}
 
 	// For upserts (INSERT ... ON DUPLICATE KEY UPDATE inside a transaction):
-	// delegate to handleUpsert which does its own hydration and delta tracking,
-	// but use Stage instead of Add for transactional safety.
+	// delegate to handleUpsert which does its own hydration and delta tracking.
 	if strategy == core.StrategyHydrateAndWrite && cl.SubType == core.SubInsert && cl.HasOnConflict {
-		// handleUpsert does hydration + forward + delta Add internally.
-		// For txn, we call it directly — it uses deltaMap.Add, but TxnHandler
-		// will snapshot/restore on ROLLBACK.
 		return wh.handleUpsert(clientConn, rawPkt, cl)
 	}
 
