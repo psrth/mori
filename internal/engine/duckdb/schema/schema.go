@@ -234,53 +234,7 @@ type ForeignKeyInfo struct {
 	OnUpdate       string
 }
 
-// DetectSequenceOffsets queries DuckDB for current max auto-increment values
-// and computes shadow offsets.
-func DetectSequenceOffsets(ctx context.Context, db *sql.DB, tables map[string]TableMeta) (map[string]int64, error) {
-	offsets := make(map[string]int64)
-
-	for tableName, meta := range tables {
-		if meta.PKType != "serial" && meta.PKType != "bigserial" {
-			continue
-		}
-		if len(meta.PKColumns) != 1 {
-			continue
-		}
-
-		pkCol := meta.PKColumns[0]
-		var maxVal sql.NullInt64
-		query := fmt.Sprintf(`SELECT MAX("%s") FROM "%s"`, pkCol, tableName)
-		if err := db.QueryRowContext(ctx, query).Scan(&maxVal); err != nil {
-			return nil, fmt.Errorf("failed to get max PK for table %q: %w", tableName, err)
-		}
-
-		prodMax := int64(0)
-		if maxVal.Valid {
-			prodMax = maxVal.Int64
-		}
-
-		offsets[tableName] = computeOffset(prodMax)
-	}
-	return offsets, nil
-}
-
-func computeOffset(prodMax int64) int64 {
-	a := prodMax * 10
-	b := prodMax + 10_000_000
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// ApplySequenceOffsets sets auto-increment offsets in the shadow database.
-// For DuckDB, we create sequences and alter the table defaults.
-func ApplySequenceOffsets(ctx context.Context, db *sql.DB, offsets map[string]int64) error {
-	for tableName, offset := range offsets {
-		// Insert and delete a sentinel row to advance the internal rowid counter.
-		// DuckDB doesn't have sqlite_sequence, so we use this approach.
-		seqName := fmt.Sprintf("mori_seq_%s", tableName)
-		db.ExecContext(ctx, fmt.Sprintf(`CREATE SEQUENCE IF NOT EXISTS "%s" START %d`, seqName, offset))
-	}
-	return nil
-}
+// Note: DuckDB shadow is a full file copy (not schema-only), so the
+// shadow's internal auto-increment sequences already have the correct
+// state from prod. No DetectSequenceOffsets or ApplySequenceOffsets
+// functions are needed — they were removed as dead code.

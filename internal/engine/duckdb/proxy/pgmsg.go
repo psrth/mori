@@ -426,6 +426,24 @@ func duckDBTypeToOID(typeName string) uint32 {
 		return 2950 // uuid
 	case "JSON":
 		return 114 // json
+	case "JSONB":
+		return 3802 // jsonb
+	case "HUGEINT", "UHUGEINT":
+		return 1700 // numeric (closest PG equivalent for 128-bit int)
+	case "UTINYINT":
+		return 21 // int2 (unsigned 8-bit fits in signed 16-bit)
+	case "USMALLINT":
+		return 23 // int4 (unsigned 16-bit fits in signed 32-bit)
+	case "UINTEGER", "UINT":
+		return 20 // int8 (unsigned 32-bit fits in signed 64-bit)
+	case "UBIGINT":
+		return 1700 // numeric (unsigned 64-bit needs numeric)
+	case "BIT":
+		return 1560 // bit
+	case "LIST", "STRUCT", "MAP", "UNION":
+		return 114 // json (structured DuckDB types → json)
+	case "ENUM":
+		return 25 // text
 	default:
 		return 25 // text fallback
 	}

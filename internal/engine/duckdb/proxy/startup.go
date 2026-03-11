@@ -8,7 +8,7 @@ import (
 
 // handleStartup performs the PG startup handshake as a server.
 // The proxy acts as a PostgreSQL server, handling auth locally.
-func handleStartup(clientConn net.Conn) error {
+func (p *Proxy) handleStartup(clientConn net.Conn) error {
 	// Read initial message from client (no type byte).
 	startupRaw, err := readStartupMsg(clientConn)
 	if err != nil {
@@ -45,8 +45,12 @@ func handleStartup(clientConn net.Conn) error {
 	}
 
 	// Send ParameterStatus messages.
+	serverVersion := "14.0 (mori-duckdb)"
+	if p != nil && p.duckdbVersion != "" {
+		serverVersion = fmt.Sprintf("14.0 (mori-duckdb %s)", p.duckdbVersion)
+	}
 	params := []struct{ key, val string }{
-		{"server_version", "14.0 (mori-duckdb)"},
+		{"server_version", serverVersion},
 		{"server_encoding", "UTF8"},
 		{"client_encoding", "UTF8"},
 		{"DateStyle", "ISO, MDY"},

@@ -273,9 +273,9 @@ func (c *DuckDBClassifier) classifyTruncate(upper string, cl *core.Classificatio
 }
 
 func (c *DuckDBClassifier) classifyCTE(_, upper string, cl *core.Classification) {
-	if strings.Contains(upper, "INSERT") ||
-		strings.Contains(upper, "UPDATE") ||
-		strings.Contains(upper, "DELETE") {
+	// Use word-boundary matching to avoid false positives on table/column
+	// names that contain write keywords (e.g. "insert_history").
+	if reCTEWrite.MatchString(upper) {
 		cl.OpType = core.OpWrite
 		cl.SubType = core.SubOther
 	} else {
@@ -400,6 +400,7 @@ var (
 
 	reFromClause = regexp.MustCompile(`(?i)\bFROM\s+(` + tableListPattern + `)`)
 	reJoinTable  = regexp.MustCompile(`(?i)\bJOIN\s+` + tablePattern)
+	reCTEWrite   = regexp.MustCompile(`(?i)\b(INSERT|UPDATE|DELETE)\b`)
 )
 
 const (

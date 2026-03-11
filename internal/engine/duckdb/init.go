@@ -10,9 +10,9 @@ import (
 
 	"github.com/mori-dev/mori/internal/core/config"
 	"github.com/mori-dev/mori/internal/engine/duckdb/connstr"
-	"github.com/mori-dev/mori/internal/ui"
 	"github.com/mori-dev/mori/internal/engine/duckdb/schema"
 	"github.com/mori-dev/mori/internal/engine/duckdb/shadow"
+	"github.com/mori-dev/mori/internal/ui"
 )
 
 // InitOptions holds the options for initializing a DuckDB Mori project.
@@ -90,29 +90,10 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 	// 7b. Detect generated columns.
 	tables, _ = schema.DetectGeneratedColumns(ctx, prodDB, tables)
 
-	// 8. Detect auto-increment offsets.
-	offsets, err := schema.DetectSequenceOffsets(ctx, prodDB, tables)
-	if err != nil {
-		shadow.RemoveShadow(moriDir)
-		return nil, fmt.Errorf("sequence offset detection failed: %w", err)
-	}
-
-	// 9. Apply offsets to shadow.
-	if len(offsets) > 0 {
-		shadowDB, err := sql.Open("duckdb", shadowPath)
-		if err != nil {
-			shadow.RemoveShadow(moriDir)
-			return nil, fmt.Errorf("failed to open shadow database: %w", err)
-		}
-		defer shadowDB.Close()
-
-		if err := schema.ApplySequenceOffsets(ctx, shadowDB, offsets); err != nil {
-			shadow.RemoveShadow(moriDir)
-			return nil, fmt.Errorf("failed to apply sequence offsets: %w", err)
-		}
-	}
-
-	// 10. Persist configuration.
+	// 8. Persist configuration.
+	// Note: DuckDB shadow is a full file copy (not schema-only), so the
+	// shadow's internal auto-increment sequences already have the correct
+	// state from prod. No sequence offset manipulation is needed.
 	cfg := &config.Config{
 		ProdConnection:  info.FilePath,
 		ShadowPort:      0,  // Embedded — no port.

@@ -272,8 +272,14 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 			clientConn.Write(result)
 			return
 		}
+		// Hydrate for INSERT ON CONFLICT (upsert) or UPDATE with known PKs.
 		if len(cl.PKs) > 0 {
-			p.hydrateBeforeUpdate(cl, eh.connID)
+			if cl.SubType == core.SubInsert && cl.HasOnConflict {
+				p.hydrateBeforeUpdate(cl, eh.connID)
+			}
+			if cl.SubType == core.SubUpdate {
+				p.hydrateBeforeUpdate(cl, eh.connID)
+			}
 		}
 		eh.extExecOnShadow(clientConn, fullSQL)
 		if p.deltaMap != nil {
@@ -328,7 +334,21 @@ func (eh *ExtHandler) FlushBatch(clientConn net.Conn) {
 			}
 		}
 
-	case core.StrategyMergedRead, core.StrategyJoinPatch:
+	case core.StrategyJoinPatch:
+		// JOIN Patch via materialization: materialize dirty tables into
+		// temp tables on shadow, rewrite table refs, execute on shadow.
+		resp := p.executeJoinPatch(fullSQL, cl, eh.connID)
+		var result []byte
+		if eh.batchHasParse {
+			result = append(result, buildParseCompleteMsg()...)
+		}
+		if eh.batchHasBind {
+			result = append(result, buildBindCompleteMsg()...)
+		}
+		result = append(result, resp...)
+		clientConn.Write(result)
+
+	case core.StrategyMergedRead:
 		// Dispatch to specialized handlers for complex patterns.
 		var advancedResp []byte
 		switch {

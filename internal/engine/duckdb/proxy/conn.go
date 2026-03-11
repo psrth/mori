@@ -46,7 +46,7 @@ func (p *Proxy) handleConn(clientConn net.Conn, connID int64) {
 	}
 
 	// Perform pgwire startup handshake (we act as the PG server).
-	if err := handleStartup(clientConn); err != nil {
+	if err := p.handleStartup(clientConn); err != nil {
 		log.Printf("[conn %d] startup failed: %v", connID, err)
 		clientConn.Close()
 		return
@@ -160,8 +160,17 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 				continue
 			}
 
+			// Handle JOIN Patch via materialization: materialize dirty tables
+			// into temp tables on shadow, rewrite table refs, execute on shadow.
+			if decision.strategy == core.StrategyJoinPatch {
+				cl := decision.classification
+				resp := p.executeJoinPatch(sqlStr, cl, connID)
+				clientConn.Write(resp)
+				continue
+			}
+
 			// Handle merged reads: query both prod and shadow, merge in-process.
-			if decision.strategy == core.StrategyMergedRead || decision.strategy == core.StrategyJoinPatch {
+			if decision.strategy == core.StrategyMergedRead {
 				cl := decision.classification
 				var resp []byte
 				// Dispatch to specialized handlers for complex read patterns.
@@ -220,7 +229,15 @@ func (p *Proxy) routeLoop(clientConn net.Conn, connID int64) {
 						clientConn.Write(resp)
 						continue
 					}
-					p.hydrateBeforeUpdate(cl, connID)
+					// Hydrate for INSERT ON CONFLICT (upsert): the conflicting row
+					// may only exist in prod (not yet in shadow delta). Hydrate it
+					// so the ON CONFLICT clause can detect and update it.
+					if cl.SubType == core.SubInsert && cl.HasOnConflict && len(cl.PKs) > 0 {
+						p.hydrateBeforeUpdate(cl, connID)
+					}
+					if cl.SubType == core.SubUpdate {
+						p.hydrateBeforeUpdate(cl, connID)
+					}
 				}
 
 				// For ShadowDelete, handle bulk case if no PKs.
@@ -656,58 +673,83 @@ func (p *Proxy) executeMergedRead(sqlStr string, cl *core.Classification, connID
 	return buildMergedResponse(columns, merged, mergedNulls)
 }
 
-// executeAggregateRead handles aggregate queries.
+// executeAggregateRead handles aggregate queries (COUNT, SUM, AVG, MIN, MAX,
+// GROUP BY, HAVING, and complex aggregates) via materialization.
+// It materializes merged base data into a temp table on shadow, then executes
+// the original aggregate query against the temp table, letting DuckDB handle
+// the aggregation natively.
 func (p *Proxy) executeAggregateRead(sqlStr string, cl *core.Classification, connID int64) []byte {
 	if len(cl.Tables) == 0 {
 		return p.executeQuery(p.prodDB, sqlStr, connID)
 	}
 	table := cl.Tables[0]
 
-	baseSQL := p.buildAggregateBaseQuery(sqlStr, table)
+	// If the table has no dirty data, execute on prod directly.
+	if !p.isTableAffected(table) {
+		return p.executeQuery(p.prodDB, sqlStr, connID)
+	}
+
+	// Build a base query that fetches all rows (no aggregation):
+	// SELECT * FROM <table> WHERE <original conditions>
+	baseSQL := buildAggregateBaseSQL(sqlStr, table)
 	if baseSQL == "" {
-		return p.executeQuery(p.prodDB, sqlStr, connID)
+		// Can't decompose — fall back to shadow (has merged data from file copy).
+		return p.executeQuery(p.shadowDB, sqlStr, connID)
 	}
 
-	baseCl := *cl
-	baseCl.HasAggregate = false
-	baseCl.HasLimit = false
-	baseCl.Limit = 0
-	baseCl.OrderBy = ""
+	baseCl := &core.Classification{
+		OpType:  core.OpRead,
+		SubType: core.SubSelect,
+		Tables:  []string{table},
+		RawSQL:  baseSQL,
+	}
 
-	_, baseRows, _, err := p.mergedReadRows(baseSQL, &baseCl, connID)
+	// Materialize merged base data into a temp table.
+	utilName, err := p.materializeToUtilTable(baseSQL, baseCl, connID)
 	if err != nil {
-		return p.executeQuery(p.prodDB, sqlStr, connID)
+		if p.verbose {
+			log.Printf("[conn %d] aggregate materialization failed: %v", connID, err)
+		}
+		return p.executeQuery(p.shadowDB, sqlStr, connID)
+	}
+	defer p.dropUtilTable(utilName)
+
+	// Rewrite the original aggregate query to reference the temp table.
+	rewrittenSQL := rewriteTableRef(sqlStr, table, utilName)
+
+	if p.verbose {
+		log.Printf("[conn %d] aggregate read: materialized %s, executing on shadow", connID, table)
 	}
 
-	count := len(baseRows)
-	countStr := fmt.Sprintf("%d", count)
-
-	columns := []string{"count"}
-	rows := [][]sql.NullString{{sql.NullString{String: countStr, Valid: true}}}
-	nulls := [][]bool{{false}}
-	return buildMergedResponse(columns, rows, nulls)
+	// Execute the full aggregate query on shadow with DuckDB handling all
+	// aggregation (COUNT, SUM, AVG, MIN, MAX, GROUP BY, HAVING, etc.) natively.
+	return p.executeQuery(p.shadowDB, rewrittenSQL, connID)
 }
 
-func (p *Proxy) buildAggregateBaseQuery(sqlStr, table string) string {
+// buildAggregateBaseSQL builds a SELECT * FROM <table> WHERE ... query from an
+// aggregate query. Strips SELECT list, GROUP BY, HAVING, ORDER BY, LIMIT —
+// keeps only FROM and WHERE to get the base row set.
+func buildAggregateBaseSQL(sqlStr, table string) string {
 	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
 
-	if strings.Contains(upper, "GROUP BY") {
-		return ""
-	}
-
-	meta, ok := p.tables[table]
-	if !ok || len(meta.PKColumns) == 0 {
-		return ""
-	}
-	pkCol := meta.PKColumns[0]
-
-	selectIdx := strings.Index(upper, "SELECT")
 	fromIdx := strings.Index(upper, " FROM ")
-	if selectIdx < 0 || fromIdx < 0 {
+	if fromIdx < 0 {
 		return ""
 	}
 
-	return "SELECT " + `"` + pkCol + `"` + sqlStr[fromIdx:]
+	// Take everything from FROM onwards.
+	rest := sqlStr[fromIdx:]
+
+	// Strip GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET, FETCH.
+	restUpper := strings.ToUpper(rest)
+	for _, kw := range []string{"GROUP BY", "HAVING", "ORDER BY", "LIMIT", "OFFSET", "FETCH"} {
+		if idx := strings.Index(restUpper, " "+kw); idx >= 0 {
+			rest = rest[:idx]
+			restUpper = restUpper[:idx]
+		}
+	}
+
+	return fmt.Sprintf("SELECT * %s", strings.TrimSpace(rest))
 }
 
 // mergedReadRows is an internal version that returns merged columns, rows, and nulls.

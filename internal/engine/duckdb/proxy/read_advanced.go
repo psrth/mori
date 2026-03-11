@@ -111,6 +111,79 @@ func (p *Proxy) executeSetOpRead(sqlStr string, cl *core.Classification, connID 
 	return buildMergedResponse(allCols, allRows, allNulls)
 }
 
+// executeJoinPatch handles JOIN queries on dirty tables by materializing each
+// dirty table's merged data into a temp table on shadow, rewriting table
+// references, and executing the full JOIN on shadow. This lets DuckDB handle
+// the JOIN natively with correct merged data.
+func (p *Proxy) executeJoinPatch(sqlStr string, cl *core.Classification, connID int64) []byte {
+	if cl == nil || len(cl.Tables) == 0 {
+		return p.executeQuery(p.prodDB, sqlStr, connID)
+	}
+
+	// Check if any joined table is dirty.
+	anyDirty := false
+	for _, table := range cl.Tables {
+		if p.isTableAffected(table) {
+			anyDirty = true
+			break
+		}
+	}
+	if !anyDirty {
+		// No dirty tables — execute directly on prod.
+		return p.executeQuery(p.prodDB, sqlStr, connID)
+	}
+
+	// Materialize each dirty table into a temp table on shadow.
+	tableMap := make(map[string]string) // original table -> temp table
+	for _, table := range cl.Tables {
+		if !p.isTableAffected(table) {
+			continue
+		}
+
+		baseSQL := fmt.Sprintf(`SELECT * FROM "%s"`, table)
+		baseCl := &core.Classification{
+			OpType:  core.OpRead,
+			SubType: core.SubSelect,
+			Tables:  []string{table},
+			RawSQL:  baseSQL,
+		}
+
+		utilName, err := p.materializeToUtilTable(baseSQL, baseCl, connID)
+		if err != nil {
+			if p.verbose {
+				log.Printf("[conn %d] join patch materialization failed for %s: %v", connID, table, err)
+			}
+			continue
+		}
+		tableMap[table] = utilName
+	}
+
+	// Clean up temp tables on return.
+	defer func() {
+		for _, utilName := range tableMap {
+			p.dropUtilTable(utilName)
+		}
+	}()
+
+	if len(tableMap) == 0 {
+		// Materialization failed for all tables — fall back to prod.
+		return p.executeQuery(p.prodDB, sqlStr, connID)
+	}
+
+	// Rewrite query to use temp tables.
+	rewrittenSQL := sqlStr
+	for origTable, utilName := range tableMap {
+		rewrittenSQL = rewriteTableRef(rewrittenSQL, origTable, utilName)
+	}
+
+	if p.verbose {
+		log.Printf("[conn %d] join patch: materialized %d tables, executing on shadow", connID, len(tableMap))
+	}
+
+	// Execute rewritten JOIN on shadow.
+	return p.executeQuery(p.shadowDB, rewrittenSQL, connID)
+}
+
 // executeComplexRead handles CTEs, derived tables, and other complex queries
 // by materializing base data into temp tables and re-executing on Shadow.
 func (p *Proxy) executeComplexRead(sqlStr string, cl *core.Classification, connID int64) []byte {

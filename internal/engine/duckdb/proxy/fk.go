@@ -310,6 +310,103 @@ func extractFKFromDDL(sqlStr string) []coreSchema.ForeignKey {
 	return fks
 }
 
+// EnforceDeleteCascade handles CASCADE referential actions: when a parent row
+// is deleted, child rows are automatically tombstoned/deleted recursively.
+func (fke *FKEnforcer) EnforceDeleteCascade(table string, deletedPKs []string) {
+	if len(deletedPKs) == 0 {
+		return
+	}
+	refFKs := fke.schemaRegistry.GetReferencingFKs(table)
+	for _, fk := range refFKs {
+		if fk.OnDelete != "CASCADE" {
+			continue
+		}
+		if len(fk.ChildColumns) == 0 || len(fk.ParentColumns) == 0 {
+			continue
+		}
+		childCol := fk.ChildColumns[0]
+		childTable := fk.ChildTable
+
+		// Find child rows referencing the deleted parent PKs.
+		var quoted []string
+		for _, pk := range deletedPKs {
+			quoted = append(quoted, "'"+strings.ReplaceAll(pk, "'", "''")+"'")
+		}
+		inClause := strings.Join(quoted, ", ")
+
+		// Check shadow for child rows.
+		childPKCol := ""
+		if meta, ok := fke.tables[childTable]; ok && len(meta.PKColumns) > 0 {
+			childPKCol = meta.PKColumns[0]
+		}
+		if childPKCol == "" {
+			continue
+		}
+
+		query := fmt.Sprintf(`SELECT "%s" FROM "%s" WHERE "%s" IN (%s)`,
+			childPKCol, childTable, childCol, inClause)
+
+		var childPKs []string
+		// Check shadow.
+		rows, err := fke.shadowDB.Query(query)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var pk string
+				if err := rows.Scan(&pk); err == nil {
+					childPKs = append(childPKs, pk)
+				}
+			}
+		}
+		// Also check prod for child rows not yet in shadow delta.
+		prodRows, err := fke.prodDB.Query(query)
+		if err == nil {
+			defer prodRows.Close()
+			for prodRows.Next() {
+				var pk string
+				if err := prodRows.Scan(&pk); err == nil {
+					childPKs = append(childPKs, pk)
+				}
+			}
+		}
+
+		// Deduplicate child PKs.
+		seen := make(map[string]bool)
+		var uniqueChildPKs []string
+		for _, pk := range childPKs {
+			if !seen[pk] {
+				seen[pk] = true
+				uniqueChildPKs = append(uniqueChildPKs, pk)
+			}
+		}
+
+		// Tombstone/delete child rows.
+		for _, childPK := range uniqueChildPKs {
+			fke.tombstones.Add(childTable, childPK)
+			fke.deltaMap.Remove(childTable, childPK)
+		}
+
+		// Delete from shadow.
+		if len(uniqueChildPKs) > 0 {
+			var childQuoted []string
+			for _, pk := range uniqueChildPKs {
+				childQuoted = append(childQuoted, "'"+strings.ReplaceAll(pk, "'", "''")+"'")
+			}
+			deleteSQL := fmt.Sprintf(`DELETE FROM "%s" WHERE "%s" IN (%s)`,
+				childTable, childPKCol, strings.Join(childQuoted, ", "))
+			fke.shadowDB.Exec(deleteSQL)
+
+			if fke.verbose {
+				log.Printf("[conn %d] FK CASCADE: deleted %d child rows from %s",
+					fke.connID, len(uniqueChildPKs), childTable)
+			}
+
+			// Recurse for transitive cascades.
+			fke.EnforceDeleteCascade(childTable, uniqueChildPKs)
+		}
+	}
+}
+
 // CheckWriteFK enforces FK constraints before a write operation.
 // Returns an error message if the FK constraint would be violated, or "" if OK.
 func (fke *FKEnforcer) CheckWriteFK(cl *core.Classification, sqlStr string) string {
@@ -327,9 +424,12 @@ func (fke *FKEnforcer) CheckWriteFK(cl *core.Classification, sqlStr string) stri
 			pkValues = append(pkValues, pk.PK)
 		}
 		if len(pkValues) > 0 {
+			// Enforce RESTRICT/NO ACTION constraints.
 			if err := fke.EnforceDeleteRestrict(cl.Tables[0], pkValues); err != nil {
 				return err.Error()
 			}
+			// Enforce CASCADE: tombstone/delete child rows.
+			fke.EnforceDeleteCascade(cl.Tables[0], pkValues)
 		}
 	}
 	return ""

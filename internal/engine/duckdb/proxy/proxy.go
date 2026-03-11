@@ -37,6 +37,7 @@ type Proxy struct {
 	moriDir         string
 	logger          *logging.Logger
 	maxRowsHydrate  int
+	duckdbVersion   string
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -138,6 +139,14 @@ func (p *Proxy) ListenAndServe(ctx context.Context) error {
 		}
 		if err := p.shadowDB.Ping(); err != nil {
 			return fmt.Errorf("failed to connect to shadow DuckDB: %w", err)
+		}
+	}
+
+	// Query DuckDB version for pgwire startup handshake.
+	if p.prodDB != nil {
+		var ver string
+		if err := p.prodDB.QueryRow("SELECT version()").Scan(&ver); err == nil {
+			p.duckdbVersion = ver
 		}
 	}
 
