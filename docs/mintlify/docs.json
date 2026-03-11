@@ -108,5 +108,10 @@
     "socials": {
       "github": "https://github.com/psrth/mori"
     }
+  },
+  "integrations": {
+    "posthog": {
+      "apiKey": "phc_BEvkMQlhIKXx8UK6plH9DVz0kLOEZZ7vm5ppqv0nis8"
+    }
   }
 }
