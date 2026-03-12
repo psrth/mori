@@ -14,7 +14,7 @@ sidebarTitle: "MySQL"
 | Shadow | Docker `mysql:<version>` (version-matched) |
 | Extended Protocol | COM_STMT_PREPARE/EXECUTE/CLOSE |
 
-MySQL uses the Vitess SQL parser for AST-based classification with a regex fallback for edge cases. All 12 routing strategies are implemented. The full merged read pipeline, write hydration, DDL tracking with FK stripping, transaction management with savepoints, and three-layer write guard are fully functional.
+MySQL uses the Vitess SQL parser for AST-based classification with a regex fallback for edge cases. All 12 routing strategies are implemented. The full merged read pipeline, write hydration, DDL tracking with FK stripping, transaction management with savepoints, and four-layer write guard are fully functional.
 
 **Connection Parameters:**
 
@@ -47,7 +47,7 @@ mori init --from "mysql://user:pass@host:3306/mydb"
 
 - `only_full_group_by` mode conflicts with aggregate re-aggregation. Workaround: `SET sql_mode = ''`.
 - Multi-column ORDER BY not re-applied after merge (single-column sort only).
-
-<Info>
-**Unsupported operations:** CALL, EXPLAIN ANALYZE.
-</Info>
+- Unsupported operations: CALL, EXPLAIN ANALYZE.
+- Functions aren't supported yet because it's really hard to determine if the function is non-mutating or not.
+- CTE updates/deletes/upserts might produce incorrect subsequent merged read results.
+- Performance: Rare, but some _extremely_ complex JOINs over large tables might be slow either because (a) the prod data needed is too large or (b) the query is too complex and the safety mechanism decides to materialize the result into a temporary table locally. If this happens, try passing in `--max-rows` during `mori start`, which will cap the number of rows pulled from prod.

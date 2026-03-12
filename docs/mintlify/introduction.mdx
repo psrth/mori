@@ -6,18 +6,22 @@ sidebarTitle: "Introduction"
 
 Mori is a transparent proxy that sits between your application and a production database. Your application connects to Mori using a standard database driver -- same wire protocol, no code changes beyond swapping a connection string.
 
-**Reads** are served from the real production database. **Writes** are captured in a local database instance (the **Shadow**) that starts as a clone of production (schema-only for SQL engines, full file copy for embedded engines, seeded with data for Firestore).
+**Writes** are captured in a local database instance (the **Shadow**) that starts as a clone of production (schema-only for SQL engines, full file copy for embedded engines, seeded with data for Firestore). **Reads** are served from the real production database, merging with any changes made in the shadow in-flight.
 
-The result: developers and AI agents test against real production data, mutate freely, and never risk the production database. Break something, reset, start over.
+The result? Developers and AI agents can test against real production data, mutate freely, and never risk modifying the production database. Break something, reset, start over.
 
 ## Why Mori
 
 - **Real data, zero risk** -- Query live production data. All writes are isolated in a local shadow database.
 - **No code changes** -- Same wire protocol, same driver. Swap one connection string.
-- **9 engines** -- PostgreSQL, CockroachDB, MySQL, MariaDB, MSSQL, SQLite, DuckDB, Redis, Firestore.
-- **14 auth providers** -- AWS RDS, GCP Cloud SQL, Neon, Supabase, Azure, PlanetScale, and more.
+- **Multi-engine support:** -- PostgreSQL, CockroachDB, MySQL, MariaDB, MSSQL, SQLite, DuckDB, Redis, Firestore (more coming soon!)
+- **Multi-auth provider support:** -- AWS RDS, GCP Cloud SQL, Neon, Supabase, Azure, PlanetScale, and more.
 - **MCP server** -- Built-in Model Context Protocol server for AI agent integration.
 - **Instant reset** -- Wipe shadow state and get a clean view of production in seconds.
+
+## Quick Evaluation
+
+Go to the [compatability assessment](/resources/compatability) page to get a quick prompt for your AI agent to evaluate whether Mori is a good fit for your development workflow.
 
 ## Quick Links
 
@@ -55,7 +59,7 @@ These hold at all times, without exception.
 </Note>
 
 <Note>
-**The application sees one unified database.** When the app issues a SELECT, Mori transparently merges results from prod and shadow. Locally-modified rows come from shadow. Untouched rows come from prod. The app never knows the difference.
+**The application sees one unified database.** When the app issues a SELECT, Mori transparently merges results from prod and shadow. Locally-modified rows come from shadow. Untouched rows come from prod. Complex queries merge prod rows with shadow changes in memory. The app never knows the difference.
 </Note>
 
 <Note>

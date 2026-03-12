@@ -58,7 +58,7 @@ For .NET applications: use `CommandType.Text` with inline parameters instead of 
 - MARS disabled — applications must not rely on Multiple Active Result Sets.
 - Aggregate re-aggregation limited to COUNT (SUM/AVG/MIN/MAX use materialization).
 - JOIN patching uses materialization (no per-row patching).
-
-<Info>
-**Unsupported operations:** BULK INSERT, EXEC/EXECUTE (stored procedures).
-</Info>
+- Unsupported operations: BULK INSERT, EXEC/EXECUTE (stored procedures).
+- Functions aren't supported yet because it's really hard to determine if the function is non-mutating or not.
+- CTE updates/deletes/upserts might produce incorrect subsequent merged read results.
+- Performance: Rare, but some _extremely_ complex JOINs over large tables might be slow either because (a) the prod data needed is too large or (b) the query is too complex and the safety mechanism decides to materialize the result into a temporary table locally. If this happens, try passing in `--max-rows` during `mori start`, which will cap the number of rows pulled from prod.

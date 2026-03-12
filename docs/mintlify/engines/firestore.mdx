@@ -52,7 +52,4 @@ Firestore is a document database — fundamentally different from SQL. The copy-
 - `PartitionQuery` returns prod-only cursor boundaries (not a correctness issue — cursors are metadata, not documents).
 - `Listen` (real-time listeners) only reflects prod state, not shadow mutations.
 - Firestore SDK-specific features (offline persistence, local cache) are not intercepted by the proxy.
-
-<Info>
-If `GOOGLE_APPLICATION_CREDENTIALS` is set, you can omit the credentials file in the connection string.
-</Info>
+- If `GOOGLE_APPLICATION_CREDENTIALS` is set, you can omit the credentials file in the connection string.

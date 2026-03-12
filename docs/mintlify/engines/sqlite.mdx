@@ -53,7 +53,7 @@ mori init --from "sqlite:///path/to/db"
 - No cursor operations (DECLARE/FETCH/CLOSE).
 - No ALTER TYPE tracking (SQLite doesn't support `ALTER TABLE ... ALTER COLUMN`).
 - Multi-column ORDER BY not re-applied after merge.
-
-<Info>
-**Unsupported operations:** EXPLAIN ANALYZE.
-</Info>
+- Unsupported operations: EXPLAIN ANALYZE.
+- Functions aren't supported yet because it's really hard to determine if the function is non-mutating or not.
+- CTE updates/deletes/upserts might produce incorrect subsequent merged read results.
+- Performance: Rare, but some _extremely_ complex JOINs over large tables might be slow either because (a) the prod data needed is too large or (b) the query is too complex and the safety mechanism decides to materialize the result into a temporary table locally. If this happens, try passing in `--max-rows` during `mori start`, which will cap the number of rows pulled from prod.

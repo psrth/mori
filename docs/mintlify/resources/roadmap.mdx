@@ -1,63 +1,19 @@
 ---
 title: "Roadmap"
-description: "Current state and planned features for Mori."
+description: "Planned features for Mori."
 sidebarTitle: "Roadmap"
 ---
 
-## Current State (v1)
+## P1
+- Expanding the test coverage for existing engines
+- Adding support for more auth providers, simplifying the init cli
+- Working through some of the known limitations
+- Add support for connection pooling
+- Figuring out a way to make this repository more amenable to OSS contributions in a secure way
 
-<CardGroup cols={2}>
-  <Card title="Full Engine Parity">
-    All SQL engines support merged reads, write hydration, transactions, DDL tracking, and extended query protocol. Redis supports Pub/Sub fan-in, EVAL/EVALSHA, and merged SCAN. Firestore supports SDK-based merged reads and delta/tombstone tracking. 202+ E2E tests.
-  </Card>
-  <Card title="9 Engines">
-    PostgreSQL, CockroachDB, MySQL, MariaDB, MS SQL Server, SQLite, DuckDB, Redis, Firestore.
-  </Card>
-  <Card title="14 Auth Providers">
-    AWS RDS, GCP Cloud SQL, Neon, Supabase, Azure, PlanetScale, Vercel, DigitalOcean, Railway, Upstash, Cloudflare, Firebase, MongoDB Atlas, and self-hosted.
-  </Card>
-  <Card title="Developer Tools">
-    TUI dashboard, multi-engine MCP server for AI agents (SQL, Redis, Firestore tools), structured logging, full CLI with `--image` flag for custom Docker images.
-  </Card>
-</CardGroup>
 
-## v1.1 — Fast Follows
+## P2
+- Making this a more autonomous workflow that AI agents can run in the cloud on their own
 
-- **Mutating CTE splitting** — Split `WITH updated AS (UPDATE ... RETURNING *) SELECT ...` into separate write and read operations for correct clean-table reads
-- **Hydrate command** — `mori hydrate <table> [--where <condition>]` to explicitly pull rows from Prod into Shadow
-- **Improved diagnostics** — Query timing, delta map diffs, warning aggregation
-- **Better error messages** — Clear guidance for PK-less tables, schema divergence, Shadow container failures
-- **Config validation** — `mori doctor` command to validate config, test connectivity, verify Shadow health
-
-## v2 — Platform
-
-- **Snapshots** — Save/restore complete Shadow state as named snapshots (`mori snapshot save/restore/list/delete`)
-- **Team sharing** — Push/pull snapshots to shared store (S3, GCS)
-- **Stored procedure support** — Config allowlist for mutating functions, later function introspection
-- **Snapshot pinning** — `mori start --snapshot` to pin Prod reads to a point-in-time
-- **AI agent HTTP API** — REST API for programmatic control beyond MCP
-- **Partial schema sync** — `mori init --tables users,orders` to shadow a subset of tables
-- **Read replica support** — Point reads at a replica instead of primary
-
-## Future Engines
-
-<CardGroup cols={3}>
-  <Card title="MongoDB">
-    NoSQL document database. Port 27017.
-  </Card>
-  <Card title="Elasticsearch">
-    Search and analytics engine. Port 9200.
-  </Card>
-  <Card title="DynamoDB">
-    AWS key-value and document database.
-  </Card>
-  <Card title="Cassandra / ScyllaDB">
-    Wide-column store. Port 9042.
-  </Card>
-  <Card title="ClickHouse">
-    Column-oriented OLAP database. Port 9000.
-  </Card>
-  <Card title="Neo4j">
-    Graph database. Port 7687.
-  </Card>
-</CardGroup>
+## P3
+- Adding support for more engines

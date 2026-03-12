@@ -4,6 +4,10 @@ description: "Supported cloud providers and managed database platforms."
 sidebarTitle: "Providers"
 ---
 
+<Note>
+Most of these integrations were built using the available online documentation for these providers. If you notice any issues with a provider or have an idea for a more optimal flow, please [open an issue](https://github.com/psrth/mori/issues/new) and we'll investigate it as soon as possible.
+</Note>
+
 Providers handle authentication and connection configuration for managed database platforms. Each provider knows how to construct connection strings, manage SSL, and — where supported — obtain IAM tokens automatically.
 
 ## Provider Matrix
@@ -87,6 +91,8 @@ Providers handle authentication and connection configuration for managed databas
     Managed PostgreSQL. SSL enforced. Default database `postgres`.
 
     <Tip>Use the "Direct" connection string from Supabase Settings > Database (not the pooled PgBouncer one).</Tip>
+
+     <Tip>If the Supabase connection string throws you an error, you might be using an IPV6 address. Try using the IPV4 address instead.</Tip>
 
     ```bash
     mori init --from "postgres://postgres:pass@db.abcdefghijklmnop.supabase.co:5432/postgres?sslmode=require"

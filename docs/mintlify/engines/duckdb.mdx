@@ -51,7 +51,5 @@ mori init --from "duckdb:///path/to/analytics.duckdb"
 - No cursor operations.
 - DuckDB-specific SQL syntax not parseable by `pg_query_go` — but DuckDB uses its own regex classifier, so this is handled.
 - `LIST()` / `ARRAY_AGG()` results serialize as JSON through pgwire (nested types).
+- Unsupported operations: COPY/EXPORT/IMPORT, EXPLAIN ANALYZE.
 
-<Info>
-**Unsupported operations:** COPY/EXPORT/IMPORT, EXPLAIN ANALYZE.
-</Info>

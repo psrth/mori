@@ -48,7 +48,7 @@ mori init --from "sqlserver://sa:password@host:1433?database=mydb"
 mori init --from "postgres://user:pass@host:26257/mydb?sslmode=require"
 ```
 
-This connects to production, discovers the schema/structure, spins up a local shadow database, and offsets sequences to prevent PK collisions (SQL engines).
+This saves the connection config to `mori.yaml`. No containers or connections are created yet.
 
 ## Start the Proxy
 
@@ -56,7 +56,7 @@ This connects to production, discovers the schema/structure, spins up a local sh
 mori start
 ```
 
-The proxy listens on a local port (auto-assigned from 9002, or use `--port <N>`).
+On first run, Mori connects to prod, discovers schema, spins up the shadow database, replicates structure, and offsets sequences. Subsequent starts are faster. The proxy listens on a local port (auto-assigned, or use `--port <N>`).
 
 ### With MCP Server (recommended for AI agents)
 

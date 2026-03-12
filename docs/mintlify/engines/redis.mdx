@@ -52,7 +52,4 @@ Redis is fundamentally different from SQL databases. The copy-on-write model is 
 - Blocking commands (BLPOP, BRPOP, etc.) only see shadow state — pushes from non-Mori clients to prod are not visible.
 - PUBLISH is blocked (returns error — would affect production subscribers).
 - No savepoint support (Redis MULTI/EXEC is atomic, no partial rollback).
-
-<Info>
-**Blocked operations:** PUBLISH (returns error — would affect production subscribers).
-</Info>
+- Functions aren't supported yet because it's really hard to determine if the function is non-mutating or not.

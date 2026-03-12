@@ -35,7 +35,7 @@ mori init --from "postgres://user:pass@crdb-host:26257/mydb?sslmode=require"
 
 - CockroachDB-specific SQL syntax (`SHOW RANGES`, `ALTER TABLE ... CONFIGURE ZONE`, etc.) is not parseable by `pg_query_go` and will fail if sent through the proxy.
 - Under contention, CockroachDB may return serialization retry errors (SQLSTATE 40001) that would not occur with PostgreSQL.
-
-<Info>
-**Unsupported operations:** Same as PostgreSQL — NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE.
-</Info>
+- Unsupported operations: NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE.
+- Functions aren't supported yet because it's really hard to determine if the function is non-mutating or not.
+- CTE updates/deletes/upserts might produce incorrect subsequent merged read results.
+- Performance: Rare, but some _extremely_ complex JOINs over large tables might be slow either because (a) the prod data needed is too large or (b) the query is too complex and the safety mechanism decides to materialize the result into a temporary table locally. If this happens, try passing in `--max-rows` during `mori start`, which will cap the number of rows pulled from prod.

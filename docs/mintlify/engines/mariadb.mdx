@@ -36,9 +36,5 @@ Inherits all MySQL differences from PostgreSQL (no `ctid`, no cursors, no LISTEN
 
 ## Known Limitations
 
-- Inherits all MySQL limitations (multi-column ORDER BY, PK-less table dedup).
-- Vitess parser is hardcoded to MySQL 8.0.30 — MariaDB-specific syntax falls through to regex fallback.
-
-<Info>
-**Unsupported operations:** Same as MySQL — CALL, EXPLAIN ANALYZE.
-</Info>
+- Inherits all MySQL limitations
+- Vitess parser is hardcoded to MySQL 8.0.30 — MariaDB-specific syntax falls through to regex fallback which may be a little less accurate.

@@ -45,5 +45,5 @@ SQLite and DuckDB are embedded databases (no server process). Mori exposes them 
 Redis uses the RESP protocol with a command-based classifier (~155 Redis commands mapped). Firestore uses gRPC with a method-name classifier. Both support full copy-on-write semantics with delta tracking at the key/document level.
 
 <Info>
-All 9 engines share the same copy-on-write model: reads from prod, writes to shadow, transparent merging. The wire protocol and classification strategy differ per engine, but the [core invariants](/concepts/safety) are identical.
+All engines share the same copy-on-write model: reads from prod, writes to shadow, transparent merging. The wire protocol and classification strategy differ per engine, but the [core invariants](/concepts/safety) are identical.
 </Info>

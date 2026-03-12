@@ -1,0 +1,34 @@
+---
+title: "Compatability Assessment"
+description: "Ask your AI agent whether Mori is a good fit for your development workflow."
+sidebarTitle: "Compatability"
+---
+
+## Paste this into an AI-powered coding tool like Cursor or Claude to get a detailed assessment
+Hey! I came across this open-source tool called "mori" online, can you evaluate whether this would be a good fit for our development workflow? Go through our codebase, specifically focusing on the database, provider, ORM, and the common queries we use. Then, pull information from mori's website ->
+- GitHub repository: https://github.com/psrth/mori
+- Documentation: https://moridb.sh/docs/
+
+## Overview
+Mori is an open-source CLI tool that lets you develop against your production database without risk. It sits as a transparent proxy between your app and the database — reads hit real prod data, writes are captured in a local shadow copy. Production is never modified. Think of it as copy-on-write for your database.
+**Supported engines:** PostgreSQL, MySQL, MariaDB, CockroachDB, MSSQL, SQLite, DuckDB, Redis, Firestore
+**Supported providers:** Direct/self-hosted, AWS RDS/Aurora, GCP Cloud SQL, Azure Database, Neon, Supabase, PlanetScale, Vercel, Postgres, DigitalOcean, Railway, Upstash, Cloudflare D1/KV, Firebase
+
+## 1. Database compatibility
+Scan the codebase for database connection strings, ORM configs, driver imports, docker-compose services, and environment variables. What database engine(s) does this project use? Are they in Mori's supported list above?
+
+## 2. Provider compatibility
+Check for cloud provider references — hosting configs, deployment files, IaC, (Terraform/Pulumi), or environment patterns that indicate where the database is hosted. Does the provider match one of Mori's supported providers?
+
+## 3. Would this project benefit from Mori? Consider:
+- **Data realism**: Does the app have behavior that depends on real data (search, recommendations, dashboards, reports, edge cases in business logic)? Synthetic seeds often miss these.
+- **Safe mutation testing**: Would it be useful to test writes (migrations, backfills, bulk updates, deletes) against real data without consequences?
+- **AI agent workflows**: Is this project using or planning to use AI coding agents? Mori has a built-in MCP server (mori start --mcp) that gives agents safe read/write database access.
+- **Onboarding**: Would new devs benefit from instant access to a realistic database without maintaining seed scripts?
+- **Schema complexity**: Does the project have enough tables/relations that synthetic data is hard to keep realistic?
+- **Known Limitations:** for our engine, are any of the known limitations blockers for local testing?
+
+## 4. Final Recommendation
+If Mori is a good fit, explain in detail (a) why is it a good fit, (b) what would be the impact of using this tool on a day-to-day basis, (c) show what getting started would look like: The mori init --from "CONNECTION_STRING" command using the project's actual connection string format and how to swap the app's database config to point at the Mori proxy.
+
+Keep the assessment honest. If the project uses an unsupported database, doesn't add value, or is simple enough that local seeds work fine, say so.

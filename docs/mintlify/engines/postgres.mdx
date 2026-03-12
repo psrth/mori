@@ -14,7 +14,7 @@ sidebarTitle: "PostgreSQL"
 | Shadow | Docker `postgres:<version>` (version-matched) |
 | Extended Protocol | Full Parse/Bind/Describe/Execute/Close/Sync support |
 
-PostgreSQL is the reference implementation. All 12 routing strategies, the complete merged read pipeline, full write hydration, DDL tracking with schema registry, transaction management with savepoints, proxy-layer FK enforcement, and the three-layer write guard are fully implemented.
+PostgreSQL is the reference implementation. All 12 routing strategies, the complete merged read pipeline, full write hydration, DDL tracking with schema registry, transaction management with savepoints, proxy-layer FK enforcement, and the four-layer write guard are fully implemented.
 
 **Connection Parameters:**
 
@@ -43,8 +43,8 @@ mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
 
 ## Known Limitations
 
-None. All E2E tests pass without skips. PostgreSQL is the gold standard implementation.
-
-<Info>
-**Unsupported operations (by design):** NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE. These return a descriptive error to the client.
-</Info>
+- Unsupported operations: NOTIFY, COPY, LOCK TABLE, DO $$, CALL, EXPLAIN ANALYZE.
+- Most extensions should work (tries to install on start) but there are some that might not work if the extension name isn't standard (anything not in the official PostgreSQL apt repo). Special support is provided out-of-the-box for pgvector and postgis. If your extension doesn't fall into either of those categories, then you can use the `--image` flag to specify a custom Docker image that has the extension installed.
+- Functions aren't supported yet because it's really hard to determine if the function is non-mutating or not.
+- CTE updates/deletes/upserts might produce incorrect subsequent merged read results.
+- Performance: Rare, but some _extremely_ complex JOINs over large tables might be slow either because (a) the prod data needed is too large or (b) the query is too complex and the safety mechanism decides to materialize the result into a temporary table locally. If this happens, try passing in `--max-rows` during `mori start`, which will cap the number of rows pulled from prod.

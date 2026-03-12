@@ -4,18 +4,6 @@ description: "Get Mori running in under 5 minutes."
 sidebarTitle: "Quick Start"
 ---
 
-## For AI Agents
-
-If you're setting up Mori with an AI coding agent, download the [`skill.md`](https://moridb.sh/skill.md) file and add it to your project root. Point your agent at it -- it contains everything needed to install, initialize, and start Mori.
-
-```bash
-curl -fsSL https://moridb.sh/skill.md -o skill.md
-```
-
-Your agent can read `skill.md` and handle the rest autonomously.
-
----
-
 ## Manual Setup
 
 ### Prerequisites
@@ -47,8 +35,8 @@ go build -o mori ./cmd/mori
     mori init
     ```
 
-    <Tip>
-    For non-interactive setup, pass a connection string directly:
+    
+    For a non-interactive setup, you can pass a connection string directly:
 
     <CodeGroup>
     ```bash PostgreSQL
@@ -76,20 +64,29 @@ go build -o mori ./cmd/mori
     mori init --from "postgres://user:pass@host:26257/mydb?sslmode=require"
     ```
     </CodeGroup>
-    </Tip>
 
-    On init, Mori:
-    1. Connects to your production database
-    2. Discovers schema and structure (SQL engines dump tables/types/sequences; Firestore discovers collections; Redis scans key prefixes)
-    3. Spins up a shadow database (Docker container, local file copy, or emulator)
-    4. Replicates structure to shadow (SQL engines replay schema; Firestore seeds documents; Redis starts empty)
-    5. Offsets auto-increment sequences to prevent PK collisions (SQL engines only)
+
+    This saves the connection config to `mori.yaml`. No containers or connections are created yet.
   </Step>
   <Step title="Start the proxy">
     ```bash
     mori start
     ```
-    Mori listens on a local port. Use `--port` to pick a specific one, or let Mori auto-assign.
+    On first run, Mori:
+    1. Connects to your production database
+    2. Discovers schema and structure (SQL engines dump tables/types/sequences; Firestore discovers collections; Redis scans key prefixes)
+    3. Spins up a shadow database (Docker container, local file copy, or emulator)
+    4. Replicates structure to shadow (SQL engines replay schema; Firestore seeds documents; Redis starts empty)
+    5. Detects and replicates extensions to shadow (PostgreSQL — auto-installs via `apt-get` if needed; use `--image` on `mori init` for custom images)
+    6. Offsets auto-increment sequences to prevent PK collisions (SQL engines only)
+    7. Starts the proxy and listens on a local port
+
+    Use `--port` to pick a specific port, or let Mori auto-assign. Subsequent starts are faster since the shadow already exists.
+
+    If complex queries over large tables are slow, you can limit how many rows Mori hydrates from prod per query:
+    ```bash
+    mori start --max-rows 10000
+    ```
   </Step>
   <Step title="Point your app at Mori">
     Swap your application's connection string to point at `127.0.0.1` on the proxy port. Same driver, same protocol -- your app won't know the difference.
@@ -115,13 +112,37 @@ go build -o mori ./cmd/mori
     ```
     </CodeGroup>
   </Step>
-  <Step title="Reset when done">
-    Wipe all local state and start fresh:
+  <Step title="Stop Mori">
+    Closes the connection to prod and spins down the shadow container. State is persisted for future runs.
+    ```bash
+    mori stop
+    ```
+  </Step>
+  <Step title="Soft reset between runs">
+    Wipe all local state to quickly start fresh on the next run.
     ```bash
     mori reset
     ```
   </Step>
+  <Step title="Hard reset when schema changes">
+    Wipes all local state and deletes the shadow container. Use this when the production schema has changed since the last init. This takes longer than a soft reset.
+    ```bash
+    mori reinit
+    ```
+  </Step>
 </Steps>
+
+
+## Enabling the MCP Server
+
+Start Mori with the MCP server for AI agent integration:
+
+```bash
+mori start --mcp --mcp-port 9000
+```
+
+AI agents connect to `http://127.0.0.1:9000/mcp` and get engine-specific tools (SQL queries, Redis commands, or Firestore operations) -- all safely routed through the proxy.
+
 
 ## Lifecycle
 
@@ -137,12 +158,13 @@ mori stop         Persist state, shut down proxy
 mori reset        Wipe shadow data + metadata, clean slate
 ```
 
-## With AI Agents
 
-Start Mori with the MCP server for AI agent integration:
+## For AI Agents
+
+If you're setting up Mori with an AI coding agent, download the [`skill.md`](https://moridb.sh/skill.md) file and add it to your project root. Point your agent at it -- it contains everything needed to install, initialize, and start Mori.
 
 ```bash
-mori start --mcp --mcp-port 9000
+curl -fsSL https://moridb.sh/skill.md -o skill.md
 ```
 
-AI agents connect to `http://127.0.0.1:9000/mcp` and get engine-specific tools (SQL queries, Redis commands, or Firestore operations) -- all safely routed through the proxy.
+Your agent can read `skill.md` and handle the rest autonomously.

@@ -6,51 +6,23 @@ A transparent database proxy with copy-on-write semantics. Reads from production
 
 ## What is mori?
 
-Mori sits between your application and a production database. It intercepts every query, classifies it, and routes it: reads go to production, writes go to a local Shadow database (a schema-only clone). Your application sees one unified database. Production is write-protected at all times.
+Mori sits between your application and a production database. It intercepts every query, classifies it, and routes it: writes go to a local Shadow database, while reads pull data from production and merge it with your local changes. Your application sees one unified database. Production is write-protected at all times.
 
 Break something, reset, start over. Production never knows.
 
-```
-                         ┌──────────────────────────────────────────┐
-                         │                  mori                    │
-                         │                                          │
-                         │   ┌────────────┐    ┌─────────────────┐  │
-               SQL       │   │            │    │     Router      │  │
- Application ──────────> │   │ Classifier │───>│                 │  │
-                         │   │            │    │  PROD_DIRECT    │  │
-                         │   └────────────┘    │  MERGED_READ    │  │
-                         │                     │  JOIN_PATCH     │  │
-                         │                     │  SHADOW_WRITE   │  │
-                         │                     │  HYDRATE+WRITE  │  │
-                         │                     │  SHADOW_DDL     │  │
-                         │                     └────────┬────────┘  │
-                         │                 ┌────────────┼────────┐  │
-                         │                 │            │        │  │
-                         │          ┌──────▼──────┐ ┌───▼──────┐ │  │
-                         │          │ Production  │ │  Shadow  │ │  │
-                         │          │ (read-only) │ │ (writes) │ │  │
-                         │          └──────┬──────┘ └───┬──────┘ │  │
-                         │                 │            │        │  │
-                         │                 └─────┬──────┘        │  │
-                         │               ┌───────▼────────┐      │  │
-                         │               │  Merge Engine  │      │  │
-              Result     │               └───────┬────────┘      │  │
- Application <───────────│───────────────────────┘               │  │
-                         │                                       │  │
-                         └───────────────────────────────────────┘
-```
+![mori-arch](./docs/mintlify/logo/mori-arch.png)
 
 ## Supported Engines
 
 | Engine        | Protocol   | Shadow Backend     |
 | ------------- | ---------- | ------------------ |
 | PostgreSQL    | pgwire     | Docker (postgres)  |
-| CockroachDB   | pgwire     | Docker (cockroach) |
+| CockroachDB   | pgwire     | Docker (postgres)  |
 | MySQL         | MySQL wire | Docker (mysql)     |
 | MariaDB       | MySQL wire | Docker (mariadb)   |
 | MS SQL Server | TDS        | Docker (mssql)     |
-| SQLite        | pgwire     | Local file         |
-| DuckDB        | pgwire     | Local file         |
+| SQLite        | pgwire     | Local file copy    |
+| DuckDB        | pgwire     | Local file copy    |
 | Redis         | RESP       | Docker (redis)     |
 | Firestore     | gRPC       | Firestore emulator |
 
@@ -63,20 +35,20 @@ Mori resolves credentials at connection time. IAM-based providers (GCP, AWS, Azu
 ## Quick Start
 
 ```bash
-# Build
-go build -o mori ./cmd/mori
+# Install
+curl -fsSL https://moridb.sh/install.sh | sh
 
 # Initialize a connection (interactive)
 mori init
 
 # Or non-interactive
-mori init --engine postgres --conn "postgres://user:pass@host:5432/mydb"
+mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require" --name my-db
 
-# Start the proxy
+# Start the proxy (first run sets up shadow)
 mori start
 
-# Point your app at the proxy (default: localhost:5433)
-DATABASE_URL=postgres://localhost:5433/mydb ./your-app
+# Point your app at the proxy
+DATABASE_URL=postgres://user:pass@127.0.0.1:5432/mydb ./your-app
 
 # See what changed
 mori inspect
@@ -85,42 +57,56 @@ mori inspect
 mori reset
 ```
 
+## For AI Agents
+
+Download the [skill.md](https://moridb.sh/skill.md) and point your agent at it:
+
+```bash
+curl -fsSL https://moridb.sh/skill.md -o skill.md
+```
+
 ## CLI Reference
 
-| Command        | Description                                                  |
-| -------------- | ------------------------------------------------------------ |
-| `mori init`    | Initialize a new connection. Clones schema to Shadow.        |
-| `mori start`   | Start the proxy. Listens for connections and routes queries. |
-| `mori stop`    | Stop the proxy and background processes.                     |
-| `mori reset`   | Wipe Shadow state. Deltas, tombstones, schema diffs -- gone. |
-| `mori status`  | Show proxy status, connection info, and delta summary.       |
-| `mori inspect` | Show current deltas, tombstones, and schema modifications.   |
-| `mori ls`      | List all configured connections.                             |
-| `mori rm`      | Remove a connection and its Shadow database.                 |
-| `mori dash`    | Open the real-time TUI dashboard.                            |
-| `mori log`     | Tail proxy logs.                                             |
-| `mori config`  | View or edit connection configuration.                       |
+| Command        | Description                                               |
+| -------------- | --------------------------------------------------------- |
+| `mori init`    | Add a database connection. Saves config to `mori.yaml`.   |
+| `mori start`   | Start the proxy. On first run, sets up shadow.            |
+| `mori stop`    | Stop the proxy. Persists state.                           |
+| `mori reset`   | Reset all local state (deltas, tombstones, schema diffs). |
+| `mori reinit`  | Drop all state, delete shadow container, re-initialize.   |
+| `mori status`  | Display current Mori state.                               |
+| `mori inspect` | Show detailed state for a table.                          |
+| `mori ls`      | List all configured connections.                          |
+| `mori rm`      | Remove a connection from mori.yaml.                       |
+| `mori dash`    | Launch the interactive dashboard.                         |
+| `mori log`     | Show proxy activity log.                                  |
+| `mori config`  | View project configuration.                               |
 
 ## How It Works
 
 ![How It Works](./assets/how-it-works.png)
 
-**Classification.** Every query is parsed into a `Classification`: operation type (READ, WRITE, DDL, TRANSACTION), referenced tables, extractable primary keys, and structural properties (JOINs, aggregates, LIMIT/ORDER BY). Each engine has its own classifier -- PostgreSQL uses `pg_query_go` (actual Postgres parser internals), MySQL uses Vitess, MSSQL parses TDS RPC commands, Redis classifies by command arity.
+**Classification.** Every query is parsed into a `Classification`: operation type (READ, WRITE, DDL, TRANSACTION, OTHER), referenced tables, extractable primary keys, and structural properties (JOINs, aggregates, LIMIT/ORDER BY, window functions, CTEs, set operations). Each engine has its own classifier -- PostgreSQL uses `pg_query_go` (actual Postgres parser internals), MySQL uses Vitess, MSSQL parses TDS RPC commands, Redis classifies by command arity.
 
-**Routing.** The router checks the classification against current delta state (which tables have local modifications) and picks a strategy:
+**Routing.** The router checks the classification against current delta state (which tables have local modifications, tombstones, or schema diffs) and picks a strategy:
 
 - **PROD_DIRECT** -- No local changes to referenced tables. Pass through to production.
-- **MERGED_READ** -- Tables have deltas. Query both backends, filter tombstoned/delta rows from production, adapt schema differences, merge results.
-- **JOIN_PATCH** -- Multi-table read. Execute JOIN on production, identify delta rows by PK, patch from Shadow, deduplicate.
+- **MERGED_READ** -- Tables have deltas. Query both backends, filter tombstoned/delta rows from production, adapt schema differences, merge results. Also handles aggregates, set operations, CTEs, and cursors on affected tables.
+- **JOIN_PATCH** -- Multi-table read on affected tables. Execute JOIN on production, identify delta rows by PK, patch from Shadow, deduplicate.
 - **SHADOW_WRITE** -- INSERTs go directly to Shadow.
-- **HYDRATE_AND_WRITE** -- UPDATEs copy the production row to Shadow first, then mutate.
+- **HYDRATE_AND_WRITE** -- UPDATEs (and INSERT ... ON CONFLICT) copy the production row to Shadow first, then mutate.
+- **SHADOW_DELETE** -- DELETEs execute on Shadow. Affected PKs are added to the Tombstone Set and filtered from future production reads.
+- **TRUNCATE** -- Forwards to Shadow and marks the table as fully shadowed. All subsequent reads skip production entirely.
 - **SHADOW_DDL** -- DDL executes on Shadow only. Schema Registry tracks the divergence.
+- **TRANSACTION** -- Coordinates BEGIN/COMMIT/ROLLBACK across both backends. Production gets REPEATABLE READ; Shadow gets read-write. Deltas are staged per-transaction.
+- **FORWARD_BOTH** -- SET commands forwarded to both backends. DEALLOCATE also uses this path.
+- **LISTEN_ONLY** -- PostgreSQL LISTEN forwarded to production only.
 
 **State.** Four structures track local modifications:
 
 - **Delta Map** -- `(table, pk)` pairs that have been modified locally.
 - **Tombstone Set** -- `(table, pk)` pairs that have been deleted locally.
-- **Schema Registry** -- Column additions, drops, renames, type changes applied to Shadow but not production.
+- **Schema Registry** -- Column additions, drops, renames, type changes applied to Shadow but not production. Also tracks new tables and fully-shadowed tables.
 - **Sequence Offsets** -- Shifted auto-increment ranges to prevent PK collisions.
 
 **Merging.** For merged reads, Mori queries both backends, strips delta/tombstoned rows from the production result, injects NULLs for added columns (or strips dropped columns), and concatenates. ORDER BY and LIMIT are re-applied after merge. Over-fetching handles the case where filtering production rows pushes the result count below LIMIT -- capped at 3 iterations.
@@ -143,6 +129,7 @@ mori start --mcp
 - Delta and tombstone counts per table
 - Schema divergence
 - Query logs with classification and timing
+- Latency metrics (P50, P95, P99) and QPS
 
 ## Network Tunneling
 
@@ -150,14 +137,7 @@ Mori supports SSH tunnels, GCP Cloud SQL Proxy, and AWS SSM for reaching databas
 
 ## Contributing
 
-Contributions welcome. Mori uses standard Go tooling:
-
-```bash
-go test ./...
-go build ./cmd/mori
-```
-
-File issues and pull requests on GitHub.
+Please read the [contributing guide](./CONTRIBUTING.md).
 
 ## License
 

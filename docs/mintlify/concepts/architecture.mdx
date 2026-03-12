@@ -8,53 +8,7 @@ sidebarTitle: "Architecture"
 
 Mori sits between your application and two databases: the production database (read-only) and the Shadow database (read-write). Every query is intercepted, classified, routed, and — when needed — results from both databases are merged transparently.
 
-```
-+--------------+
-| Application  |
-+------+-------+
-       | DB wire protocol (PG v3, MySQL, TDS, RESP, gRPC, etc.)
-       v
-+----------------------------------------------------------+
-|                       MORI PROXY                          |
-|                                                           |
-|  +-------------+  +-------------+  +------------------+  |
-|  |  Protocol   |  | Classifier  |  |      Router      |  |
-|  |  Handler    |--|             |--|                  |  |
-|  |             |  | op_type     |  | Prod Direct      |  |
-|  | accept      |  | tables      |  | Merged Read      |  |
-|  | parse       |  | pks         |  | Shadow Write     |  |
-|  | serialize   |  | join?       |  | Hydrate+Write    |  |
-|  +-------------+  +-------------+  | Shadow Delete    |  |
-|                                     | Shadow DDL       |  |
-|  +-------------+  +-------------+  | Transaction Ctrl |  |
-|  |   Delta     |  |  Schema     |  +------------------+  |
-|  |  Manager    |  | Registry    |                         |
-|  |             |  |             |  +------------------+  |
-|  | delta_map   |  | added_cols  |  |   Merge Engine   |  |
-|  | tombstones  |  | dropped     |  |                  |  |
-|  | staging     |  | renamed     |  | single_table     |  |
-|  +-------------+  | type_casts  |  | join_patch       |  |
-|                    +-------------+  | over_fetch       |  |
-|  +-------------+                    | adapt + filter   |  |
-|  | Transaction |                    +------------------+  |
-|  |  Manager    |                                          |
-|  |             |  +-------------+  +------------------+  |
-|  | per-conn    |  |  Engine     |  |   Write Engine   |  |
-|  | staging     |  |  Manager    |  |                  |  |
-|  | commit      |  |             |  | insert           |  |
-|  | rollback    |  | prod_pool   |  | update+hydrate   |  |
-|  +-------------+  | shadow_pool |  | delete+tombstone |  |
-|                    +-------------+  | ddl+registry     |  |
-|                                     +------------------+  |
-+---------------+-----------------------------+-------------+
-                | read-only                   | read-write
-                v                             v
-         +-------------+             +-------------+
-         |    Prod      |             |   Shadow    |
-         |  Database    |             |  Database   |
-         |  (upstream)  |             |  (local)    |
-         +-------------+             +-------------+
-```
+![mori architecture](/logo/mori-arch.png)
 
 ## Components
 

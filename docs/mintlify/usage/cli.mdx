@@ -8,17 +8,27 @@ sidebarTitle: "CLI"
 
 ### `mori init`
 
-Interactive setup. Walks you through engine selection, provider, and credentials.
+Interactive setup. Walks you through engine selection, provider, and credentials. 
+
+
 
 ```bash
 mori init
 ```
+
+<Info>
+Some of these flows might not be optimal since there's so many combinations. If the interactive flow isn't working for you, try using the direct connection string method.
+
+In the meantime, you can open an issue for the way you were trying to connect.
+</Info>
 
 Non-interactive init with a connection string:
 
 ```bash
 mori init --from "postgres://user:pass@host:5432/mydb?sslmode=require"
 ```
+
+> More information at [Configuration > Providers](/configuration/providers)
 
 Use a custom Docker image for the Shadow container (e.g., for PostgreSQL with pre-installed extensions):
 
@@ -56,6 +66,7 @@ mori start --mcp-port 9000    # Set MCP server port
 | `--verbose` | Log all queries and routing decisions | `false` |
 | `--mcp` | Enable MCP server | `false` |
 | `--mcp-port` | MCP HTTP server port | `9000` |
+| `--max-rows` | Max rows to hydrate from prod per query | `0` (unlimited) |
 
 ### `mori stop`
 
@@ -69,16 +80,26 @@ mori stop
 
 ### `mori reset`
 
-Wipe all local state — Shadow data, Delta Map, Tombstone Set, Schema Registry.
+Wipe all local state — Shadow data, Delta Map, Tombstone Set, Schema Registry. Use this for quick resets between runs.
 
 ```bash
 mori reset            # Wipe local state
-mori reset --hard     # Wipe + re-sync schema from Prod
 ```
 
 <Warning>
-`mori reset` is irreversible. All local mutations are permanently deleted.
+`mori reset` is irreversible. The local shadow persists, but all local mutations are permanently deleted.
 </Warning>
+
+### `mori reinit`
+
+Wipe all local state and delete the shadow container. Use this when the production schema has changed since the last init.
+```bash
+mori reinit            # Wipe local state and delete the shadow container
+```
+<Warning>
+`mori reinit` is irreversible. The local shadow and all local mutations are permanently deleted.
+</Warning>
+
 
 ### `mori status`
 
