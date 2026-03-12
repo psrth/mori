@@ -46,14 +46,14 @@ export function UnderTheHood() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {steps.map((item, i) => (
             <FadeIn key={item.step} delay={i * 0.1}>
-              <div className="bg-[#191816] rounded-xl p-8 h-full flex flex-col min-h-[320px] md:min-h-[420px] hover:-translate-y-0.5 transition-transform duration-200">
+              <div className="bg-[#191816] rounded-xl p-6 md:p-8 h-full flex flex-col min-h-[280px] md:min-h-[420px] hover:-translate-y-0.5 transition-transform duration-200">
                 <span className="font-(family-name:--font-dm-mono) text-header-white text-[14px] uppercase">
                   STEP&nbsp;{item.step}
                 </span>
 
-                <div className="flex-1 flex items-center justify-center py-10">
+                <div className="flex-1 flex items-center justify-center py-6 md:py-10">
                   <item.icon
-                    className="w-[250px] h-[250px] text-[#454545]"
+                    className="w-[150px] h-[150px] md:w-[250px] md:h-[250px] text-[#454545]"
                     strokeWidth={0.9}
                   />
                 </div>

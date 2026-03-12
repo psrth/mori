@@ -62,7 +62,8 @@ export function CliDemo() {
   return (
     <section>
       <FadeIn>
-        <div className="flex items-center justify-center gap-4 font-(family-name:--font-dm-mono) text-lg md:text-xl tracking-[-0.02em]">
+        {/* Desktop: single row */}
+        <div className="hidden md:flex items-center justify-center gap-4 font-(family-name:--font-dm-mono) text-lg md:text-xl tracking-[-0.02em]">
           <span className="text-card-white/30">&gt;</span>
           <span className="text-brand-purple-light/80 font-medium">mori</span>
           <span className="text-card-white/55">init</span>
@@ -111,6 +112,65 @@ export function CliDemo() {
               </motion.span>
             </AnimatePresence>
           </span>
+        </div>
+
+        {/* Mobile: stacked layout */}
+        <div className="flex md:hidden flex-col items-center gap-2 font-(family-name:--font-dm-mono) text-base tracking-[-0.02em]">
+          <div className="flex items-center gap-3">
+            <span className="text-card-white/30">&gt;</span>
+            <span className="text-brand-purple-light/80 font-medium">mori</span>
+            <span className="text-card-white/55">init</span>
+          </div>
+
+          <div className="flex items-center gap-4">
+            <div className="flex flex-col items-center gap-1">
+              <span className="text-card-white/30 text-sm">--db</span>
+              <span className="relative inline-flex items-center justify-center w-[100px] h-[100px]">
+                <AnimatePresence mode="popLayout">
+                  <motion.span
+                    key={engineIndex}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -8 }}
+                    transition={{ duration: 0.3, ease: [0.23, 1, 0.32, 1] }}
+                    className="absolute inset-0 flex items-center justify-center"
+                  >
+                    <Image
+                      src={engines[engineIndex].src}
+                      alt={engines[engineIndex].name}
+                      width={100}
+                      height={100}
+                      className="object-contain"
+                    />
+                  </motion.span>
+                </AnimatePresence>
+              </span>
+            </div>
+
+            <div className="flex flex-col items-center gap-1">
+              <span className="text-card-white/30 text-sm">--provider</span>
+              <span className="relative inline-flex items-center justify-center w-[100px] h-[100px]">
+                <AnimatePresence mode="popLayout">
+                  <motion.span
+                    key={providerIndex}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -8 }}
+                    transition={{ duration: 0.3, ease: [0.23, 1, 0.32, 1] }}
+                    className="absolute inset-0 flex items-center justify-center"
+                  >
+                    <Image
+                      src={providers[providerIndex].src}
+                      alt={providers[providerIndex].name}
+                      width={100}
+                      height={100}
+                      className="object-contain"
+                    />
+                  </motion.span>
+                </AnimatePresence>
+              </span>
+            </div>
+          </div>
         </div>
       </FadeIn>
     </section>

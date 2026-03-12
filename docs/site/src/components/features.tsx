@@ -111,14 +111,14 @@ export function Features() {
             </div>
 
             {/* Right: Image — 55% */}
-            <div className="lg:w-[55%] relative rounded-xl overflow-hidden min-h-[400px]">
+            <div className="lg:w-[55%] relative rounded-xl overflow-hidden aspect-[3/2]">
               <Image
                 src="/features/features-bg.png"
                 alt=""
                 fill
                 className="object-cover"
               />
-              <div className="absolute inset-0 flex items-center justify-center p-8">
+              <div className="absolute inset-0 flex items-center justify-center p-4 md:p-8">
                 <AnimatePresence mode="wait">
                   <motion.div
                     key={activeIndex}

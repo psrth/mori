@@ -10,8 +10,6 @@ Mori sits between your application and a production database. It intercepts ever
 
 Break something, reset, start over. Production never knows.
 
-![mori-arch](./docs/mintlify/logo/mori-arch.png)
-
 ## Supported Engines
 
 | Engine        | Protocol   | Shadow Backend     |

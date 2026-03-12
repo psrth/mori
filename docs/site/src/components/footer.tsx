@@ -42,14 +42,14 @@ export function Footer() {
       <div className="max-w-[1200px] mx-auto px-6 relative z-10">
         <FadeIn>
           <div className="flex flex-col items-start text-left">
-            <h3 className="font-(family-name:--font-manrope) font-bold text-[22px] tracking-tight text-header-white ml-2">
+            <h3 className="font-(family-name:--font-manrope) font-bold text-[18px] md:text-[22px] tracking-tight text-header-white ml-2">
               moridb.sh
             </h3>
-            <p className="font-(family-name:--font-inter) text-card-white/40 text-[22px] ml-2 tracking-tight">
+            <p className="font-(family-name:--font-inter) text-card-white/40 text-[16px] md:text-[22px] ml-2 tracking-tight">
               built with love in los angeles, california
             </p>
 
-            <div className="flex items-center gap-3 mt-5 ">
+            <div className="flex flex-wrap items-center gap-3 mt-5">
               {links.map((link) => (
                 <a
                   key={link.label}

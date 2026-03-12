@@ -57,13 +57,13 @@ export function Hero() {
     <section className="pt-46 pb-0">
       <div className="max-w-[1200px] mx-auto px-6 text-left">
         <FadeIn delay={0}>
-          <h1 className="font-(family-name:--font-manrope) font-bold text-[36px] text-header-white tracking-[-0.05em] leading-[1.1]">
+          <h1 className="font-(family-name:--font-manrope) font-bold text-[28px] md:text-[36px] text-header-white tracking-[-0.05em] leading-[1.1]">
             test on prod. break nothing.
           </h1>
         </FadeIn>
 
         <FadeIn delay={0.1}>
-          <p className="mt-3 text-[18px] text-card-white/70 max-w-3xl font-(family-name:--font-inter) leading-[1.6] tracking-[-0.01em]">
+          <p className="mt-3 text-[16px] md:text-[18px] text-card-white/70 max-w-3xl font-(family-name:--font-inter) leading-[1.6] tracking-[-0.01em]">
             mori is an ephemeral proxy to your production database. writes are
             sandboxed locally. reads get live data from prod, resolved with all
             your local changes in-flight.
@@ -72,8 +72,8 @@ export function Hero() {
 
         <FadeIn delay={0.2}>
           <div className="mt-12 flex flex-col items-start gap-3">
-            <div className="-ml-2 flex items-center bg-card-gray border border-card-white/10 hover:border-card-white/20 rounded-full px-6 py-3 max-w-xl w-full transition-colors duration-150">
-              <code className="font-mono text-[16px] flex-1 truncate">
+            <div className="-ml-2 flex items-center bg-card-gray border border-card-white/10 hover:border-card-white/20 rounded-full px-4 md:px-6 py-3 max-w-xl w-full transition-colors duration-150 overflow-hidden">
+              <code className="font-mono text-[13px] md:text-[16px] flex-1 truncate">
                 <span className="text-[#b56cce]">curl</span>
                 <span className="text-card-white/80">
                   {" "}
