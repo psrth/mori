@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
@@ -1061,6 +1062,161 @@ func TestRewriteLimit(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("rewriteLimit(%q, %d) = %q, want %q", tt.sql, tt.newLimit, got, tt.want)
 		}
+	}
+}
+
+// --- Bug fix tests: findOuterFromIndex ---
+
+func TestFindOuterFromIndex(t *testing.T) {
+	tests := []struct {
+		name  string
+		sql   string
+		want  int // expected index, or -1 for not found
+		found bool
+	}{
+		{
+			name:  "simple query",
+			sql:   "SELECT id, name FROM users",
+			found: true,
+		},
+		{
+			name:  "subquery in SELECT list",
+			sql:   "SELECT c.id, (SELECT COUNT(*) FROM messages m WHERE m.cid = c.id) AS cnt FROM conversations c",
+			found: true,
+		},
+		{
+			name:  "no FROM",
+			sql:   "SELECT 1",
+			found: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upper := strings.ToUpper(tt.sql)
+			idx := findOuterFromIndex(upper)
+			if tt.found {
+				if idx < 0 {
+					t.Fatalf("expected to find outer FROM, got -1")
+				}
+				// Verify the found FROM is the outer one (not inside parens).
+				after := strings.TrimSpace(upper[idx+6:])
+				// The outer FROM should NOT start with a function or subquery keyword.
+				if strings.HasPrefix(after, "MESSAGES") || strings.HasPrefix(after, "ORDERS") {
+					// This means we found the subquery's FROM, not the outer one.
+					t.Errorf("found subquery FROM instead of outer FROM at idx %d", idx)
+				}
+			} else if idx >= 0 {
+				t.Errorf("expected -1, got %d", idx)
+			}
+		})
+	}
+}
+
+func TestFindOuterFromIndex_SubquerySkipped(t *testing.T) {
+	// Key regression test: the first " FROM " is inside a subquery.
+	sql := "SELECT c.id, (SELECT COUNT(*) FROM messages m WHERE m.cid = c.id) AS cnt FROM conversations c LEFT JOIN users u ON c.uid = u.id"
+	upper := strings.ToUpper(sql)
+	idx := findOuterFromIndex(upper)
+	if idx < 0 {
+		t.Fatal("expected to find outer FROM")
+	}
+	// The outer FROM should be before "CONVERSATIONS", not before "MESSAGES".
+	after := strings.TrimSpace(upper[idx+6:])
+	if !strings.HasPrefix(after, "CONVERSATIONS") {
+		t.Errorf("expected outer FROM before CONVERSATIONS, got: %s", after[:min(40, len(after))])
+	}
+}
+
+// --- Bug fix tests: containsColumnForTable ---
+
+func TestContainsColumnForTable(t *testing.T) {
+	tests := []struct {
+		name       string
+		selectList string
+		col        string
+		alias      string
+		want       bool
+	}{
+		{
+			name:       "qualified match",
+			selectList: "u.id, u.name, o.total",
+			col:        "id",
+			alias:      "u",
+			want:       true,
+		},
+		{
+			name:       "qualified mismatch - different alias",
+			selectList: "c.id, u.name",
+			col:        "id",
+			alias:      "u",
+			want:       false,
+		},
+		{
+			name:       "unqualified match",
+			selectList: "id, name",
+			col:        "id",
+			alias:      "u",
+			want:       true,
+		},
+		{
+			name:       "no match",
+			selectList: "c.id, u.name, o.total",
+			col:        "email",
+			alias:      "u",
+			want:       false,
+		},
+		{
+			name:       "with AS alias",
+			selectList: "u.name AS user_name, c.id",
+			col:        "name",
+			alias:      "u",
+			want:       true,
+		},
+		{
+			name:       "subquery in list - qualified column not matching",
+			selectList: "c.id, c.user_id, (select count(*)",
+			col:        "id",
+			alias:      "u",
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := containsColumnForTable(tt.selectList, tt.col, tt.alias)
+			if got != tt.want {
+				t.Errorf("containsColumnForTable(%q, %q, %q) = %v, want %v",
+					tt.selectList, tt.col, tt.alias, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- Bug fix tests: collectSubLinkTablesFromSQL ---
+
+func TestCollectSubLinkTables(t *testing.T) {
+	sql := `SELECT c.id, u.name,
+		(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count
+		FROM conversations c LEFT JOIN users u ON c.user_id = u.id`
+
+	tables := collectSubLinkTablesFromSQL(sql)
+	found := false
+	for _, t2 := range tables {
+		if t2 == "messages" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected 'messages' in SubLink tables, got: %v", tables)
+	}
+}
+
+func TestCollectSubLinkTables_NoSubLink(t *testing.T) {
+	sql := "SELECT c.id, u.name FROM conversations c LEFT JOIN users u ON c.user_id = u.id"
+	tables := collectSubLinkTablesFromSQL(sql)
+	if len(tables) != 0 {
+		t.Errorf("expected no SubLink tables, got: %v", tables)
 	}
 }
 

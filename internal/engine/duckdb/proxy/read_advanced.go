@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 
+	pg_query "github.com/pganalyze/pg_query_go/v6"
+
 	"github.com/psrth/mori/internal/core"
 )
 
@@ -111,10 +113,11 @@ func (p *Proxy) executeSetOpRead(sqlStr string, cl *core.Classification, connID 
 	return buildMergedResponse(allCols, allRows, allNulls)
 }
 
-// executeJoinPatch handles JOIN queries on dirty tables by materializing each
-// dirty table's merged data into a temp table on shadow, rewriting table
-// references, and executing the full JOIN on shadow. This lets DuckDB handle
-// the JOIN natively with correct merged data.
+// executeJoinPatch handles JOIN queries by materializing each table's merged
+// data into a temp table on shadow, rewriting table references, and executing
+// the full JOIN on shadow. This lets DuckDB handle the JOIN natively with
+// correct merged data. ALL tables are materialized (not just dirty ones)
+// because the rewritten query runs on shadow, where clean tables have no data.
 func (p *Proxy) executeJoinPatch(sqlStr string, cl *core.Classification, connID int64) []byte {
 	if cl == nil || len(cl.Tables) == 0 {
 		return p.executeQuery(p.prodDB, sqlStr, connID)
@@ -133,13 +136,31 @@ func (p *Proxy) executeJoinPatch(sqlStr string, cl *core.Classification, connID 
 		return p.executeQuery(p.prodDB, sqlStr, connID)
 	}
 
-	// Materialize each dirty table into a temp table on shadow.
-	tableMap := make(map[string]string) // original table -> temp table
-	for _, table := range cl.Tables {
-		if !p.isTableAffected(table) {
-			continue
+	// Collect ALL tables referenced in the query, including SubLink tables
+	// (correlated subqueries in the SELECT list). These need materialization too
+	// because the rewritten query runs on shadow, where clean tables are empty.
+	allTables := make([]string, len(cl.Tables))
+	copy(allTables, cl.Tables)
+	subLinkTables := collectSubLinkTablesFromSQL(sqlStr)
+	for _, t := range subLinkTables {
+		found := false
+		for _, existing := range allTables {
+			if existing == t {
+				found = true
+				break
+			}
 		}
+		if !found {
+			allTables = append(allTables, t)
+		}
+	}
 
+	// Materialize ALL tables into temp tables on shadow. Even clean tables
+	// must be materialized because the rewritten query runs on shadow, where
+	// clean tables have no data. The merged read for clean tables efficiently
+	// copies prod data (shadow is empty, no filtering needed).
+	tableMap := make(map[string]string) // original table -> temp table
+	for _, table := range allTables {
 		baseSQL := fmt.Sprintf(`SELECT * FROM "%s"`, table)
 		baseCl := &core.Classification{
 			OpType:  core.OpRead,
@@ -186,18 +207,46 @@ func (p *Proxy) executeJoinPatch(sqlStr string, cl *core.Classification, connID 
 
 // executeComplexRead handles CTEs, derived tables, and other complex queries
 // by materializing base data into temp tables and re-executing on Shadow.
+// ALL referenced tables are materialized (not just dirty ones) because the
+// rewritten query runs on shadow, where clean tables have no data.
 func (p *Proxy) executeComplexRead(sqlStr string, cl *core.Classification, connID int64) []byte {
 	if len(cl.Tables) == 0 {
 		return p.executeQuery(p.prodDB, sqlStr, connID)
 	}
 
-	// For each affected table, materialize into a temp table.
-	tableMap := make(map[string]string) // original table -> temp table
-	for _, table := range cl.Tables {
-		if !p.isTableAffected(table) {
-			continue
+	// Collect ALL tables, including those from subqueries in the SELECT list.
+	allTables := make([]string, len(cl.Tables))
+	copy(allTables, cl.Tables)
+	subLinkTables := collectSubLinkTablesFromSQL(sqlStr)
+	for _, t := range subLinkTables {
+		found := false
+		for _, existing := range allTables {
+			if existing == t {
+				found = true
+				break
+			}
 		}
+		if !found {
+			allTables = append(allTables, t)
+		}
+	}
 
+	// Check if any table is affected — if none, run on prod directly.
+	anyAffected := false
+	for _, table := range allTables {
+		if p.isTableAffected(table) {
+			anyAffected = true
+			break
+		}
+	}
+	if !anyAffected {
+		return p.executeQuery(p.prodDB, sqlStr, connID)
+	}
+
+	// Materialize ALL tables into temp tables. Even clean tables must be
+	// materialized because the rewritten query runs on shadow.
+	tableMap := make(map[string]string) // original table -> temp table
+	for _, table := range allTables {
 		baseSQL := fmt.Sprintf(`SELECT * FROM "%s"`, table)
 		baseCl := &core.Classification{
 			OpType:  core.OpRead,
@@ -251,7 +300,7 @@ func (p *Proxy) isTableAffected(table string) bool {
 // stripping window functions, to get base rows for materialization.
 func buildWindowBaseQuery(sqlStr, _ string) string {
 	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return ""
 	}
@@ -428,4 +477,92 @@ func exceptRows(a [][]sql.NullString, aNulls [][]bool, b [][]sql.NullString, _ [
 		}
 	}
 	return result, resultNulls
+}
+
+// collectSubLinkTablesFromSQL parses a SQL query and extracts table names
+// from SubLink nodes (correlated subqueries in SELECT list, WHERE, etc.).
+// These tables are not in the FROM clause and would be missed by the classifier.
+func collectSubLinkTablesFromSQL(querySQL string) []string {
+	result, err := pg_query.Parse(querySQL)
+	if err != nil {
+		return nil
+	}
+	stmts := result.GetStmts()
+	if len(stmts) == 0 {
+		return nil
+	}
+
+	var tables []string
+	seen := make(map[string]bool)
+	collectSubLinkTablesFromNode(stmts[0].GetStmt(), &tables, seen)
+	return tables
+}
+
+// collectSubLinkTablesFromNode recursively walks an AST node and extracts
+// table names from SubLink nodes (correlated subqueries).
+func collectSubLinkTablesFromNode(node *pg_query.Node, tables *[]string, seen map[string]bool) {
+	if node == nil {
+		return
+	}
+	if sl := node.GetSubLink(); sl != nil {
+		if subSel := sl.GetSubselect(); subSel != nil {
+			// Extract tables from the subquery's FROM clause.
+			if sel := subSel.GetSelectStmt(); sel != nil {
+				for _, from := range sel.GetFromClause() {
+					collectTablesFromNode(from, tables, seen)
+				}
+				// Recurse into subquery's target list for nested SubLinks.
+				for _, target := range sel.GetTargetList() {
+					collectSubLinkTablesFromNode(target, tables, seen)
+				}
+			}
+		}
+		return
+	}
+	if sel := node.GetSelectStmt(); sel != nil {
+		// Walk target list (SELECT list) for SubLinks.
+		for _, target := range sel.GetTargetList() {
+			collectSubLinkTablesFromNode(target, tables, seen)
+		}
+		// Walk WHERE clause for SubLinks.
+		collectSubLinkTablesFromNode(sel.GetWhereClause(), tables, seen)
+		return
+	}
+	if rt := node.GetResTarget(); rt != nil {
+		collectSubLinkTablesFromNode(rt.GetVal(), tables, seen)
+		return
+	}
+	if be := node.GetBoolExpr(); be != nil {
+		for _, arg := range be.GetArgs() {
+			collectSubLinkTablesFromNode(arg, tables, seen)
+		}
+		return
+	}
+	if ae := node.GetAExpr(); ae != nil {
+		collectSubLinkTablesFromNode(ae.GetLexpr(), tables, seen)
+		collectSubLinkTablesFromNode(ae.GetRexpr(), tables, seen)
+		return
+	}
+}
+
+// collectTablesFromNode extracts table names from AST nodes (RangeVar, JoinExpr).
+func collectTablesFromNode(node *pg_query.Node, tables *[]string, seen map[string]bool) {
+	if node == nil {
+		return
+	}
+	if rv := node.GetRangeVar(); rv != nil {
+		tableName := rv.GetRelname()
+		if s := rv.GetSchemaname(); s != "" {
+			tableName = s + "." + tableName
+		}
+		if tableName != "" && !seen[tableName] {
+			seen[tableName] = true
+			*tables = append(*tables, tableName)
+		}
+		return
+	}
+	if je := node.GetJoinExpr(); je != nil {
+		collectTablesFromNode(je.GetLarg(), tables, seen)
+		collectTablesFromNode(je.GetRarg(), tables, seen)
+	}
 }

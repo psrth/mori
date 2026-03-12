@@ -241,13 +241,30 @@ func (rh *ReadHandler) handleJoinWithMaterialization(cl *core.Classification, qu
 	// Extract single-table predicates from the query's WHERE clause for pushdown.
 	tablePredicates, tableToAlias := extractSingleTablePredicates(querySQL)
 
-	// Materialize each dirty table into a temp table, scoped by pushed-down predicates.
-	tableMap := make(map[string]string)
-	for _, table := range cl.Tables {
-		if !rh.isTableDirty(table) {
-			continue
+	// Collect ALL tables referenced in the query, including SubLink tables
+	// (correlated subqueries in the SELECT list). These need materialization too
+	// because the rewritten query runs on shadow, where clean tables are empty.
+	allTables := cl.Tables
+	subLinkTables := collectSubLinkTablesFromSQL(querySQL)
+	for _, t := range subLinkTables {
+		found := false
+		for _, existing := range allTables {
+			if existing == t {
+				found = true
+				break
+			}
 		}
+		if !found {
+			allTables = append(allTables, t)
+		}
+	}
 
+	// Materialize ALL tables into temp tables. Even clean tables must be
+	// materialized because the rewritten query runs on shadow, where clean
+	// tables have no data. The merged read for clean tables efficiently
+	// copies prod data (shadow is empty, no filtering needed).
+	tableMap := make(map[string]string)
+	for _, table := range allTables {
 		// Build materialization query with pushed-down predicates if available.
 		selectSQL := rh.buildScopedMaterializationSQL(table, tablePredicates, tableToAlias)
 
@@ -264,7 +281,7 @@ func (rh *ReadHandler) handleJoinWithMaterialization(cl *core.Classification, qu
 	}
 
 	if len(tableMap) == 0 {
-		// No dirty tables — execute on shadow as-is.
+		// No tables to materialize — execute on shadow as-is.
 		return rh.shadowOnlyQuery(querySQL)
 	}
 
@@ -538,6 +555,72 @@ func deparsePredicateWithAlias(where *pg_query.Node, tableName, alias string) (s
 	return strings.TrimSpace(deparsed[whereIdx+len("WHERE "):]), nil
 }
 
+// collectSubLinkTablesFromSQL parses a SQL query and extracts table names
+// from SubLink nodes (correlated subqueries in SELECT list, WHERE, etc.).
+// These tables are not in the FROM clause and would be missed by extractTablesFromNodes.
+func collectSubLinkTablesFromSQL(querySQL string) []string {
+	result, err := pg_query.Parse(querySQL)
+	if err != nil {
+		return nil
+	}
+	stmts := result.GetStmts()
+	if len(stmts) == 0 {
+		return nil
+	}
+
+	var tables []string
+	seen := make(map[string]bool)
+	collectSubLinkTablesFromNode(stmts[0].GetStmt(), &tables, seen)
+	return tables
+}
+
+// collectSubLinkTablesFromNode recursively walks an AST node and extracts
+// table names from SubLink nodes (correlated subqueries).
+func collectSubLinkTablesFromNode(node *pg_query.Node, tables *[]string, seen map[string]bool) {
+	if node == nil {
+		return
+	}
+	if sl := node.GetSubLink(); sl != nil {
+		if subSel := sl.GetSubselect(); subSel != nil {
+			// Extract tables from the subquery's FROM clause.
+			if sel := subSel.GetSelectStmt(); sel != nil {
+				for _, from := range sel.GetFromClause() {
+					collectTablesFromNode(from, tables)
+				}
+				// Recurse into subquery's target list for nested SubLinks.
+				for _, target := range sel.GetTargetList() {
+					collectSubLinkTablesFromNode(target, tables, seen)
+				}
+			}
+		}
+		return
+	}
+	if sel := node.GetSelectStmt(); sel != nil {
+		// Walk target list (SELECT list) for SubLinks.
+		for _, target := range sel.GetTargetList() {
+			collectSubLinkTablesFromNode(target, tables, seen)
+		}
+		// Walk WHERE clause for SubLinks.
+		collectSubLinkTablesFromNode(sel.GetWhereClause(), tables, seen)
+		return
+	}
+	if rt := node.GetResTarget(); rt != nil {
+		collectSubLinkTablesFromNode(rt.GetVal(), tables, seen)
+		return
+	}
+	if be := node.GetBoolExpr(); be != nil {
+		for _, arg := range be.GetArgs() {
+			collectSubLinkTablesFromNode(arg, tables, seen)
+		}
+		return
+	}
+	if ae := node.GetAExpr(); ae != nil {
+		collectSubLinkTablesFromNode(ae.GetLexpr(), tables, seen)
+		collectSubLinkTablesFromNode(ae.GetRexpr(), tables, seen)
+		return
+	}
+}
+
 // anyTableSchemaModified reports whether any of the given tables have schema diffs.
 func (rh *ReadHandler) anyTableSchemaModified(tables []string) bool {
 	if rh.schemaRegistry != nil {
@@ -560,7 +643,7 @@ func (rh *ReadHandler) injectJoinPKs(sql string, deltaTables []string) (string, 
 
 	upper := strings.ToUpper(strings.TrimSpace(sql))
 	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndex(upper)
 	if selectIdx < 0 || fromIdx <= selectIdx {
 		return sql, nil
 	}
@@ -581,7 +664,13 @@ func (rh *ReadHandler) injectJoinPKs(sql string, deltaTables []string) (string, 
 			continue
 		}
 		pkCol := meta.PKColumns[0]
-		if containsColumn(selectList, pkCol) {
+
+		// Use table-alias-aware matching: c.id should NOT match users PK "id".
+		tableAlias := table
+		if a, ok := aliases[table]; ok && a != "" {
+			tableAlias = a
+		}
+		if containsColumnForTable(selectList, pkCol, tableAlias) {
 			continue
 		}
 
@@ -604,6 +693,62 @@ func (rh *ReadHandler) injectJoinPKs(sql string, deltaTables []string) (string, 
 		return sql, nil
 	}
 	return result, injected
+}
+
+// findOuterFromIndex finds the position of the first " FROM " at parenthesis
+// depth 0 (not inside a subquery). Returns -1 if not found.
+func findOuterFromIndex(upper string) int {
+	depth := 0
+	target := " FROM "
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+len(target) <= len(upper) && upper[i:i+len(target)] == target {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// containsColumnForTable checks if a SELECT list contains a specific column
+// for a given table alias. A qualified column (e.g., "u.id") only matches if
+// the qualifier matches the expected alias. An unqualified column matches any table.
+func containsColumnForTable(selectList, col, tableAlias string) bool {
+	lowerCol := strings.ToLower(col)
+	lowerAlias := strings.ToLower(tableAlias)
+
+	parts := strings.Split(selectList, ",")
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		// Handle aliases: "col AS alias"
+		if idx := strings.Index(strings.ToLower(name), " as "); idx >= 0 {
+			name = strings.TrimSpace(name[:idx])
+		}
+		name = strings.Trim(name, `"`)
+		lowerName := strings.ToLower(name)
+
+		if dotIdx := strings.LastIndex(lowerName, "."); dotIdx >= 0 {
+			// Qualified: only match if qualifier matches expected alias
+			qualifier := strings.Trim(lowerName[:dotIdx], `"`)
+			colPart := strings.Trim(lowerName[dotIdx+1:], `"`)
+			if colPart == lowerCol && qualifier == lowerAlias {
+				return true
+			}
+		} else {
+			// Unqualified: matches any table
+			if lowerName == lowerCol {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // findPKIndicesForJoin extends findPKIndicesForTables with injected PK columns

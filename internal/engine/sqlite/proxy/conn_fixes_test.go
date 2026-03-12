@@ -407,6 +407,322 @@ func TestDetectForeignKeys_CompositeFKAfterInit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Fix 5: findOuterFromIndex — paren-depth-aware " FROM " search
+// ---------------------------------------------------------------------------
+
+func TestFindOuterFromIndex(t *testing.T) {
+	tests := []struct {
+		name  string
+		sql   string
+		found bool
+	}{
+		{
+			name:  "simple query",
+			sql:   "SELECT id, name FROM users",
+			found: true,
+		},
+		{
+			name:  "subquery in SELECT list",
+			sql:   "SELECT c.id, (SELECT COUNT(*) FROM messages m WHERE m.cid = c.id) AS cnt FROM conversations c",
+			found: true,
+		},
+		{
+			name:  "no FROM",
+			sql:   "SELECT 1",
+			found: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upper := strings.ToUpper(tt.sql)
+			idx := findOuterFromIndex(upper)
+			if tt.found {
+				if idx < 0 {
+					t.Fatalf("expected to find outer FROM, got -1")
+				}
+				// Verify the found FROM is the outer one (not inside parens).
+				after := strings.TrimSpace(upper[idx+6:])
+				if strings.HasPrefix(after, "MESSAGES") {
+					t.Errorf("found subquery FROM instead of outer FROM at idx %d", idx)
+				}
+			} else if idx >= 0 {
+				t.Errorf("expected -1, got %d", idx)
+			}
+		})
+	}
+}
+
+func TestFindOuterFromIndex_SubquerySkipped(t *testing.T) {
+	// Key regression test: the first " FROM " is inside a subquery.
+	sql := "SELECT c.id, (SELECT COUNT(*) FROM messages m WHERE m.cid = c.id) AS cnt FROM conversations c LEFT JOIN users u ON c.uid = u.id"
+	upper := strings.ToUpper(sql)
+	idx := findOuterFromIndex(upper)
+	if idx < 0 {
+		t.Fatal("expected to find outer FROM")
+	}
+	// The outer FROM should be before "CONVERSATIONS", not before "MESSAGES".
+	after := strings.TrimSpace(upper[idx+6:])
+	if !strings.HasPrefix(after, "CONVERSATIONS") {
+		t.Errorf("expected outer FROM before CONVERSATIONS, got: %s", after[:min(40, len(after))])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix 6: containsColumnForTable — alias-aware column check
+// ---------------------------------------------------------------------------
+
+func TestContainsColumnForTable(t *testing.T) {
+	tests := []struct {
+		name       string
+		selectList string
+		col        string
+		alias      string
+		want       bool
+	}{
+		{
+			name:       "qualified match",
+			selectList: "u.id, u.name, o.total",
+			col:        "id",
+			alias:      "u",
+			want:       true,
+		},
+		{
+			name:       "qualified mismatch - different alias",
+			selectList: "c.id, u.name",
+			col:        "id",
+			alias:      "u",
+			want:       false,
+		},
+		{
+			name:       "unqualified match",
+			selectList: "id, name",
+			col:        "id",
+			alias:      "u",
+			want:       true,
+		},
+		{
+			name:       "no match",
+			selectList: "c.id, u.name, o.total",
+			col:        "email",
+			alias:      "u",
+			want:       false,
+		},
+		{
+			name:       "with AS alias",
+			selectList: "u.name AS user_name, c.id",
+			col:        "name",
+			alias:      "u",
+			want:       true,
+		},
+		{
+			name:       "subquery in list - qualified column not matching",
+			selectList: "c.id, c.user_id, (select count(*)",
+			col:        "id",
+			alias:      "u",
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := containsColumnForTable(tt.selectList, tt.col, tt.alias)
+			if got != tt.want {
+				t.Errorf("containsColumnForTable(%q, %q, %q) = %v, want %v",
+					tt.selectList, tt.col, tt.alias, got, tt.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix 7: needsPKInjection with subquery in SELECT list
+// ---------------------------------------------------------------------------
+
+func TestNeedsPKInjection_SubqueryInSelect(t *testing.T) {
+	// When a subquery has FROM messages, needsPKInjection should still find
+	// the outer FROM and correctly analyze the outer SELECT list.
+	sql := `SELECT c.id, (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS msg_count FROM conversations c`
+	// The PK "id" appears as c.id in the outer SELECT list — should NOT need injection.
+	if needsPKInjection(sql, "id") {
+		t.Error("expected needsPKInjection to return false when PK is in outer SELECT list")
+	}
+
+	// Now test a query where the PK is NOT in the outer SELECT list.
+	sql2 := `SELECT c.name, (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS msg_count FROM conversations c`
+	if !needsPKInjection(sql2, "id") {
+		t.Error("expected needsPKInjection to return true when PK is NOT in outer SELECT list")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix 8: materializeAndReexecute materializes ALL tables (not just dirty)
+// ---------------------------------------------------------------------------
+
+func TestMaterializeAndReexecute_AllTables(t *testing.T) {
+	// Set up prod with data in both tables. Shadow has only dirty data.
+	prodDB := createTestDB(t, `
+		CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL);
+		INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+		INSERT INTO orders VALUES (10, 1, 100.0), (20, 2, 200.0);
+	`)
+	// Shadow: only orders table has the dirty row (orders id=10 updated).
+	// Users table is EMPTY on shadow (clean table, no data).
+	shadowDB := createTestDB(t, `
+		CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+		CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL);
+		INSERT INTO orders VALUES (10, 1, 150.0);
+	`)
+
+	dm := delta.NewMap()
+	dm.Add("orders", "10") // Only orders is dirty
+
+	moriDir := t.TempDir()
+
+	p := &Proxy{
+		prodDB:     prodDB,
+		shadowDB:   shadowDB,
+		deltaMap:   dm,
+		tombstones: delta.NewTombstoneSet(),
+		tables: map[string]schema.TableMeta{
+			"users":  {PKColumns: []string{"id"}, PKType: "serial"},
+			"orders": {PKColumns: []string{"id"}, PKType: "serial"},
+		},
+		schemaRegistry: coreSchema.NewRegistry(),
+		moriDir:        moriDir,
+		logger:         nil,
+	}
+
+	// JOIN query: users JOIN orders. Users is clean but must be materialized
+	// because the rewritten query runs on shadow where users has no data.
+	sqlStr := `SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id`
+	cl := &core.Classification{
+		OpType:  core.OpRead,
+		SubType: core.SubSelect,
+		Tables:  []string{"users", "orders"},
+		IsJoin:  true,
+	}
+
+	resp := p.materializeAndReexecute(sqlStr, cl, 1)
+	respStr := string(resp)
+
+	// Should contain Alice (from users, materialized from prod even though clean).
+	if !strings.Contains(respStr, "Alice") {
+		t.Errorf("expected materialized result to contain 'Alice' from clean users table, got: %q", respStr)
+	}
+	// Should contain the updated order total (150 from merged read, not 100).
+	if !strings.Contains(respStr, "150") {
+		t.Errorf("expected materialized result to contain '150' from dirty orders table, got: %q", respStr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix 9: collectSubqueryTablesFromSQL
+// ---------------------------------------------------------------------------
+
+func TestCollectSubqueryTablesFromSQL(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "no subquery",
+			sql:  "SELECT id, name FROM users",
+			want: nil,
+		},
+		{
+			name: "correlated subquery in SELECT",
+			sql:  `SELECT c.id, (SELECT COUNT(*) FROM messages m WHERE m.cid = c.id) AS cnt FROM conversations c`,
+			want: []string{"messages"},
+		},
+		{
+			name: "multiple subqueries",
+			sql:  `SELECT c.id, (SELECT COUNT(*) FROM messages m WHERE m.cid = c.id) AS cnt, (SELECT MAX(ts) FROM events e WHERE e.cid = c.id) AS last_event FROM conversations c`,
+			want: []string{"messages", "events"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := collectSubqueryTablesFromSQL(tt.sql)
+			if len(got) != len(tt.want) {
+				t.Fatalf("collectSubqueryTablesFromSQL(%q) = %v, want %v", tt.sql, got, tt.want)
+			}
+			for i, g := range got {
+				if g != tt.want[i] {
+					t.Errorf("collectSubqueryTablesFromSQL(%q)[%d] = %q, want %q", tt.sql, i, g, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fix 10: materializeAndReexecute with subquery tables
+// ---------------------------------------------------------------------------
+
+func TestMaterializeAndReexecute_SubqueryTables(t *testing.T) {
+	// Set up prod with data in both tables.
+	prodDB := createTestDB(t, `
+		CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT);
+		CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER, body TEXT);
+		INSERT INTO conversations VALUES (1, 'Chat A'), (2, 'Chat B');
+		INSERT INTO messages VALUES (10, 1, 'Hello'), (20, 1, 'World'), (30, 2, 'Hi');
+	`)
+	// Shadow is empty (no dirty tables).
+	shadowDB := createTestDB(t, `
+		CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT);
+		CREATE TABLE messages (id INTEGER PRIMARY KEY, conversation_id INTEGER, body TEXT);
+	`)
+
+	// Add a delta so the query enters materializeAndReexecute (messages is dirty).
+	dm := delta.NewMap()
+	dm.Add("messages", "10")
+
+	// Re-insert the dirty row into shadow.
+	shadowDB.Exec("INSERT INTO messages VALUES (10, 1, 'Hello Updated')")
+
+	moriDir := t.TempDir()
+
+	p := &Proxy{
+		prodDB:     prodDB,
+		shadowDB:   shadowDB,
+		deltaMap:   dm,
+		tombstones: delta.NewTombstoneSet(),
+		tables: map[string]schema.TableMeta{
+			"conversations": {PKColumns: []string{"id"}, PKType: "serial"},
+			"messages":      {PKColumns: []string{"id"}, PKType: "serial"},
+		},
+		schemaRegistry: coreSchema.NewRegistry(),
+		moriDir:        moriDir,
+		logger:         nil,
+	}
+
+	// Query with a correlated subquery — messages is referenced in the subquery,
+	// conversations is in the main FROM. Both must be materialized.
+	sqlStr := `SELECT c.id, c.title, (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS msg_count FROM conversations c`
+	cl := &core.Classification{
+		OpType:        core.OpRead,
+		SubType:       core.SubSelect,
+		Tables:        []string{"conversations"},
+		IsComplexRead: true,
+	}
+
+	resp := p.materializeAndReexecute(sqlStr, cl, 1)
+	respStr := string(resp)
+
+	// Should contain conversation titles (conversations materialized from prod).
+	if !strings.Contains(respStr, "Chat A") {
+		t.Errorf("expected result to contain 'Chat A', got: %q", respStr)
+	}
+	if !strings.Contains(respStr, "Chat B") {
+		t.Errorf("expected result to contain 'Chat B', got: %q", respStr)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 

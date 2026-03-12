@@ -238,7 +238,8 @@ func (rh *ReadHandler) buildGroupBySpecMySQL(sql, table string) *groupBySpec {
 
 	// Extract FROM + WHERE portion.
 	upper := strings.ToUpper(sql)
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return nil
 	}
@@ -607,7 +608,8 @@ func (rh *ReadHandler) materializeAndAggregateMySQL(
 // from an aggregate query to get a base row-level SELECT.
 func buildMaterializationBaseQueryMySQL(sql string) string {
 	upper := strings.ToUpper(strings.TrimSpace(sql))
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return ""
 	}

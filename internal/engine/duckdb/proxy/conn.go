@@ -732,7 +732,7 @@ func (p *Proxy) executeAggregateRead(sqlStr string, cl *core.Classification, con
 func buildAggregateBaseSQL(sqlStr, table string) string {
 	upper := strings.ToUpper(strings.TrimSpace(sqlStr))
 
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return ""
 	}
@@ -1686,7 +1686,7 @@ func needsPKInjection(sqlStr, pkCol string) bool {
 	if strings.HasPrefix(afterSelect, "*") || strings.HasPrefix(afterSelect, "DISTINCT *") {
 		return false
 	}
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return false
 	}
@@ -1712,6 +1712,62 @@ func selectListContainsColumn(selectList, col string) bool {
 		name = strings.Trim(name, `"'`)
 		if strings.ToLower(name) == col {
 			return true
+		}
+	}
+	return false
+}
+
+// findOuterFromIndex finds the position of the first " FROM " at parenthesis
+// depth 0 (not inside a subquery). Returns -1 if not found.
+func findOuterFromIndex(upper string) int {
+	depth := 0
+	target := " FROM "
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+len(target) <= len(upper) && upper[i:i+len(target)] == target {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// containsColumnForTable checks if a SELECT list contains a specific column
+// for a given table alias. A qualified column (e.g., "u.id") only matches if
+// the qualifier matches the expected alias. An unqualified column matches any table.
+func containsColumnForTable(selectList, col, tableAlias string) bool {
+	lowerCol := strings.ToLower(col)
+	lowerAlias := strings.ToLower(tableAlias)
+
+	parts := strings.Split(selectList, ",")
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		// Handle aliases: "col AS alias"
+		if idx := strings.Index(strings.ToLower(name), " as "); idx >= 0 {
+			name = strings.TrimSpace(name[:idx])
+		}
+		name = strings.Trim(name, `"`)
+		lowerName := strings.ToLower(name)
+
+		if dotIdx := strings.LastIndex(lowerName, "."); dotIdx >= 0 {
+			// Qualified: only match if qualifier matches expected alias
+			qualifier := strings.Trim(lowerName[:dotIdx], `"`)
+			colPart := strings.Trim(lowerName[dotIdx+1:], `"`)
+			if colPart == lowerCol && qualifier == lowerAlias {
+				return true
+			}
+		} else {
+			// Unqualified: matches any table
+			if lowerName == lowerCol {
+				return true
+			}
 		}
 	}
 	return false

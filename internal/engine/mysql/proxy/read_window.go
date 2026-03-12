@@ -69,7 +69,8 @@ func (rh *ReadHandler) windowReadCore(cl *core.Classification, querySQL string) 
 // but without window functions, ORDER BY, LIMIT.
 func buildWindowBaseQueryMySQL(sql string) string {
 	upper := strings.ToUpper(strings.TrimSpace(sql))
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return ""
 	}

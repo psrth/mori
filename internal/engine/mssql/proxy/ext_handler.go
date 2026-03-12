@@ -1209,15 +1209,16 @@ func (eh *ExtHandler) handleCursorOpen(
 		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
 	}
 
-	// Check for dirty tables.
-	var dirtyTables []string
+	// Check if any table is dirty.
+	hasDirty := false
 	for _, table := range cl.Tables {
 		if eh.readHandler.isTableDirty(table) {
-			dirtyTables = append(dirtyTables, table)
+			hasDirty = true
+			break
 		}
 	}
 
-	if len(dirtyTables) == 0 {
+	if !hasDirty {
 		if eh.verbose {
 			log.Printf("[conn %d] ext: cursor open, no dirty tables, forwarding to prod: %s",
 				eh.connID, truncateSQL(sqlText, 80))
@@ -1225,15 +1226,33 @@ func (eh *ExtHandler) handleCursorOpen(
 		return forwardAndRelay(allRaw, eh.prodConn, clientConn)
 	}
 
-	if eh.verbose {
-		log.Printf("[conn %d] ext: cursor open, materializing %d dirty tables: %s",
-			eh.connID, len(dirtyTables), truncateSQL(sqlText, 80))
+	// Collect ALL tables including those in subqueries.
+	allTables := cl.Tables
+	subqueryTables := collectSubqueryTablesFromSQL(sqlText)
+	for _, t := range subqueryTables {
+		found := false
+		for _, existing := range allTables {
+			if existing == t {
+				found = true
+				break
+			}
+		}
+		if !found {
+			allTables = append(allTables, t)
+		}
 	}
 
-	// Materialize each dirty table into a temp table on Shadow.
+	if eh.verbose {
+		log.Printf("[conn %d] ext: cursor open, materializing %d tables: %s",
+			eh.connID, len(allTables), truncateSQL(sqlText, 80))
+	}
+
+	// Materialize ALL tables into temp tables on Shadow.
+	// Even clean tables must be materialized because the rewritten query
+	// runs on shadow, where clean tables have no data.
 	rewriteMap := make(map[string]string) // original → temp table
 	var tempNames []string
-	for _, table := range dirtyTables {
+	for _, table := range allTables {
 		baseSQL := "SELECT * FROM " + quoteIdentMSSQL(table)
 		baseCl := &core.Classification{
 			OpType:  core.OpRead,

@@ -88,8 +88,10 @@ func (rh *ReadHandler) HandleRead(
 }
 
 // handleJoinPatch implements the JOIN patch strategy (P2 §3.6).
-// For JOINs involving dirty tables, materializes them into temp tables
-// and rewrites the query to reference them.
+// For JOINs involving dirty tables, materializes ALL tables (not just dirty)
+// into temp tables and rewrites the query to reference them. Clean tables
+// must also be materialized because the rewritten query runs on shadow,
+// where clean tables have no data.
 func (rh *ReadHandler) handleJoinPatch(
 	clientConn net.Conn,
 	rawMsg []byte,
@@ -101,20 +103,111 @@ func (rh *ReadHandler) handleJoinPatch(
 	}
 
 	// Check if any joined tables are dirty.
-	var dirtyTables []string
+	hasDirty := false
 	for _, table := range cl.Tables {
 		if rh.isTableDirty(table) {
-			dirtyTables = append(dirtyTables, table)
+			hasDirty = true
+			break
 		}
 	}
 
-	if len(dirtyTables) == 0 {
+	if !hasDirty {
 		// No dirty tables — safe to forward to Prod.
 		return forwardAndRelay(rawMsg, rh.prodConn, clientConn)
 	}
 
-	// Materialize dirty tables and rewrite the query.
-	return rh.handleComplexRead(clientConn, fullPayload, cl)
+	// Materialize ALL tables and rewrite the query.
+	return rh.handleJoinWithMaterialization(clientConn, fullPayload, cl)
+}
+
+// handleJoinWithMaterialization materializes ALL tables (dirty and clean) into
+// temp tables on shadow and executes the rewritten query there. Clean tables
+// must be materialized because shadow has no data for them, and the rewritten
+// query runs entirely on shadow.
+//
+// Also collects tables from correlated subqueries in the SELECT list (e.g.,
+// SELECT (SELECT COUNT(*) FROM messages m WHERE m.cid = c.id) FROM conversations c)
+// since these tables are not in cl.Tables but need materialization too.
+func (rh *ReadHandler) handleJoinWithMaterialization(
+	clientConn net.Conn,
+	fullPayload []byte,
+	cl *core.Classification,
+) error {
+	// Collect ALL tables including those in subqueries.
+	allTables := cl.Tables
+	subqueryTables := collectSubqueryTablesFromSQL(cl.RawSQL)
+	for _, t := range subqueryTables {
+		found := false
+		for _, existing := range allTables {
+			if existing == t {
+				found = true
+				break
+			}
+		}
+		if !found {
+			allTables = append(allTables, t)
+		}
+	}
+
+	// Materialize ALL tables into temp tables.
+	rewriteMap := make(map[string]string) // original table -> temp table
+	for _, table := range allTables {
+		baseSQL := "SELECT * FROM " + quoteIdentMSSQL(table)
+		baseSQL = rh.capSQL(baseSQL)
+		baseCl := &core.Classification{
+			OpType:  core.OpRead,
+			SubType: core.SubSelect,
+			RawSQL:  baseSQL,
+			Tables:  []string{table},
+		}
+
+		columns, values, nulls, err := rh.mergedReadCore(baseCl, baseSQL)
+		if err != nil {
+			if rh.verbose {
+				log.Printf("[conn %d] join materialization: merge failed for %s: %v", rh.connID, table, err)
+			}
+			// Clean up already-created temp tables.
+			for _, tempName := range rewriteMap {
+				dropUtilTable(rh.shadowConn, tempName)
+			}
+			return rh.fallbackToProd(clientConn, fullPayload, cl.RawSQL)
+		}
+
+		tempName, err := materializeToTempTable(rh.shadowConn, "join_"+table, columns, values, nulls)
+		if err != nil {
+			if rh.verbose {
+				log.Printf("[conn %d] join materialization: materialize failed for %s: %v", rh.connID, table, err)
+			}
+			for _, tn := range rewriteMap {
+				dropUtilTable(rh.shadowConn, tn)
+			}
+			return rh.fallbackToProd(clientConn, fullPayload, cl.RawSQL)
+		}
+		rewriteMap[table] = tempName
+	}
+
+	// Clean up temp tables when done.
+	defer func() {
+		for _, tempName := range rewriteMap {
+			dropUtilTable(rh.shadowConn, tempName)
+		}
+	}()
+
+	// Rewrite the query to reference temp tables.
+	rewrittenSQL := cl.RawSQL
+	for original, temp := range rewriteMap {
+		rewrittenSQL = rewriteTableReference(rewrittenSQL, original, temp)
+	}
+
+	// Execute on Shadow.
+	allHeaders := extractAllHeaders(fullPayload)
+	var batchMsg []byte
+	if allHeaders != nil {
+		batchMsg = buildSQLBatchWithHeaders(allHeaders, rewrittenSQL)
+	} else {
+		batchMsg = buildSQLBatchMessage(rewrittenSQL)
+	}
+	return forwardAndRelay(batchMsg, rh.shadowConn, clientConn)
 }
 
 // handleMergedRead implements the merged read algorithm for MSSQL.
@@ -407,7 +500,7 @@ func (rh *ReadHandler) buildAggregateBaseQuery(sql, table string) string {
 	pkCol := meta.PKColumns[0]
 
 	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndexMSSQL(upper)
 	if selectIdx < 0 || fromIdx < 0 {
 		return ""
 	}
@@ -444,7 +537,7 @@ func (rh *ReadHandler) stripNewColumnsFromQuery(sql string, tables []string) str
 	if selectIdx < 0 {
 		return ""
 	}
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndexMSSQL(upper)
 	if fromIdx < 0 {
 		return ""
 	}
@@ -556,7 +649,7 @@ func removeColumnReferences(sql, colName string) string {
 	// Remove from SELECT list.
 	upper := strings.ToUpper(result)
 	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndexMSSQL(upper)
 	if selectIdx >= 0 && fromIdx > selectIdx {
 		selectPart := result[selectIdx+6 : fromIdx]
 		parts := strings.Split(selectPart, ",")
@@ -989,6 +1082,115 @@ func compareMSSQLValues(a, b string) int {
 	return 0
 }
 
+// findOuterFromIndexMSSQL finds the position of the first " FROM " at
+// parenthesis depth 0 (not inside a subquery). Returns -1 if not found.
+func findOuterFromIndexMSSQL(upper string) int {
+	depth := 0
+	target := " FROM "
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+len(target) <= len(upper) && upper[i:i+len(target)] == target {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// containsColumnForTableMSSQL checks if a SELECT list contains a specific column
+// for a given table alias. A qualified column (e.g., "u.id") only matches if
+// the qualifier matches the expected alias. An unqualified column matches any table.
+// This prevents false positives like c.id matching users' PK "id".
+func containsColumnForTableMSSQL(selectList, col, tableAlias string) bool {
+	lowerCol := strings.ToLower(col)
+	lowerAlias := strings.ToLower(tableAlias)
+
+	parts := strings.Split(selectList, ",")
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		// Handle aliases: "col AS alias"
+		if idx := strings.Index(strings.ToLower(name), " as "); idx >= 0 {
+			name = strings.TrimSpace(name[:idx])
+		}
+		name = strings.Trim(name, `"[]`)
+		lowerName := strings.ToLower(name)
+
+		if dotIdx := strings.LastIndex(lowerName, "."); dotIdx >= 0 {
+			// Qualified: only match if qualifier matches expected alias
+			qualifier := strings.Trim(lowerName[:dotIdx], `"[]`)
+			colPart := strings.Trim(lowerName[dotIdx+1:], `"[]`)
+			if colPart == lowerCol && qualifier == lowerAlias {
+				return true
+			}
+		} else {
+			// Unqualified: matches any table
+			if lowerName == lowerCol {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// collectSubqueryTablesFromSQL extracts table names from correlated subqueries
+// in a SQL query (e.g., SELECT list subqueries, WHERE subqueries).
+// Since MSSQL has no Go-native parser, this uses regex-based extraction.
+func collectSubqueryTablesFromSQL(sql string) []string {
+	upper := strings.ToUpper(sql)
+	var tables []string
+	seen := make(map[string]bool)
+
+	// Walk through the SQL and look for subquery FROM clauses inside parens.
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			// Look for FROM inside parenthesized subqueries.
+			if depth > 0 && i+6 <= len(upper) && upper[i:i+6] == " FROM " {
+				// Extract table name after FROM.
+				rest := strings.TrimSpace(upper[i+6:])
+				// Skip if it's another subquery.
+				if strings.HasPrefix(rest, "(") {
+					continue
+				}
+				// Extract the first word as the table name.
+				endIdx := 0
+				for endIdx < len(rest) && rest[endIdx] != ' ' && rest[endIdx] != '\t' &&
+					rest[endIdx] != '\n' && rest[endIdx] != ',' && rest[endIdx] != ')' &&
+					rest[endIdx] != ';' {
+					endIdx++
+				}
+				if endIdx > 0 {
+					tableName := rest[:endIdx]
+					tableName = strings.Trim(tableName, "[]`\"")
+					if dotIdx := strings.LastIndex(tableName, "."); dotIdx >= 0 {
+						tableName = tableName[dotIdx+1:]
+					}
+					tableName = strings.ToLower(tableName)
+					if tableName != "" && !seen[tableName] {
+						seen[tableName] = true
+						tables = append(tables, tableName)
+					}
+				}
+			}
+		}
+	}
+	return tables
+}
+
 // needsPKInjectionMSSQL checks if PK column needs to be injected for dedup.
 func needsPKInjectionMSSQL(sql, pkCol string) bool {
 	upper := strings.ToUpper(strings.TrimSpace(sql))
@@ -1025,7 +1227,7 @@ func needsPKInjectionMSSQL(sql, pkCol string) bool {
 		}
 	}
 
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndexMSSQL(upper)
 	if fromIdx < 0 {
 		return false
 	}

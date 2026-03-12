@@ -215,7 +215,8 @@ func (rh *ReadHandler) classifyForMaterialization(sql string) (*core.Classificat
 
 	// Extract tables from the SQL for delta/tombstone filtering.
 	upper := strings.ToUpper(strings.TrimSpace(sql))
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx >= 0 {
 		rest := upper[fromIdx+6:]
 		// Find the end of the FROM clause.

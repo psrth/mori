@@ -392,8 +392,9 @@ func (rh *ReadHandler) buildAggregateBaseQuery(sql, table string) string {
 	pkCol := meta.PKColumns[0]
 
 	// Find SELECT and FROM positions.
+	// Use paren-aware search to skip subqueries in SELECT list.
 	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndex(upper)
 	if selectIdx < 0 || fromIdx < 0 {
 		return ""
 	}
@@ -429,7 +430,8 @@ func needsPKInjection(sql, pkCol string) bool {
 		return false
 	}
 	// Check if the PK column appears in the SELECT list (before FROM).
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return false
 	}
@@ -489,7 +491,8 @@ func needsVirtualPKInjection(sql string, colName string) bool {
 		return false
 	}
 
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return false
 	}

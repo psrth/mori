@@ -8,8 +8,13 @@ import (
 )
 
 // handleComplexRead handles CTEs, derived tables, CROSS/OUTER APPLY, and other
-// complex read patterns by materializing dirty base tables into temp tables
-// and rewriting the query to reference them.
+// complex read patterns by materializing ALL base tables into temp tables
+// and rewriting the query to reference them. Even clean tables must be
+// materialized because the rewritten query runs on shadow, where clean
+// tables have no data.
+//
+// Also collects tables from correlated subqueries (e.g., in SELECT list)
+// since these tables may not appear in cl.Tables.
 func (rh *ReadHandler) handleComplexRead(
 	clientConn net.Conn,
 	fullPayload []byte,
@@ -19,22 +24,39 @@ func (rh *ReadHandler) handleComplexRead(
 		return rh.fallbackToProd(clientConn, fullPayload, cl.RawSQL)
 	}
 
-	// Identify tables that are "dirty" (have deltas or tombstones or schema diffs).
-	var dirtyTables []string
+	// Check if any table is dirty.
+	hasDirty := false
 	for _, table := range cl.Tables {
 		if rh.isTableDirty(table) {
-			dirtyTables = append(dirtyTables, table)
+			hasDirty = true
+			break
 		}
 	}
 
-	if len(dirtyTables) == 0 {
+	if !hasDirty {
 		// No dirty tables — safe to forward to Prod.
 		return rh.fallbackToProd(clientConn, fullPayload, cl.RawSQL)
 	}
 
-	// Materialize each dirty table's data into a temp table.
+	// Collect ALL tables including those in subqueries.
+	allTables := cl.Tables
+	subqueryTables := collectSubqueryTablesFromSQL(cl.RawSQL)
+	for _, t := range subqueryTables {
+		found := false
+		for _, existing := range allTables {
+			if existing == t {
+				found = true
+				break
+			}
+		}
+		if !found {
+			allTables = append(allTables, t)
+		}
+	}
+
+	// Materialize ALL tables' data into temp tables.
 	rewriteMap := make(map[string]string) // original table -> temp table
-	for _, table := range dirtyTables {
+	for _, table := range allTables {
 		baseSQL := "SELECT * FROM " + quoteIdentMSSQL(table)
 		baseSQL = rh.capSQL(baseSQL)
 		baseCl := &core.Classification{

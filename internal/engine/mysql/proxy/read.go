@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 
+	"vitess.io/vitess/go/vt/sqlparser"
+
 	"github.com/psrth/mori/internal/core"
 	"github.com/psrth/mori/internal/core/delta"
 	coreSchema "github.com/psrth/mori/internal/core/schema"
@@ -708,7 +710,8 @@ func needsPKInjection(sql, pkCol string) bool {
 	if strings.HasPrefix(afterSelect, "*") || strings.HasPrefix(afterSelect, "DISTINCT *") {
 		return false
 	}
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return false
 	}
@@ -735,6 +738,63 @@ func containsColumn(selectList, col string) bool {
 		name = strings.Trim(name, "`\"")
 		if name == col {
 			return true
+		}
+	}
+	return false
+}
+
+// findOuterFromIndex finds the position of the first " FROM " at parenthesis
+// depth 0 (not inside a subquery). Returns -1 if not found.
+// This avoids matching " FROM " inside correlated subqueries in the SELECT list.
+func findOuterFromIndex(upper string) int {
+	depth := 0
+	target := " FROM "
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+len(target) <= len(upper) && upper[i:i+len(target)] == target {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// containsColumnForTable checks if a SELECT list contains a specific column
+// for a given table alias. A qualified column (e.g., "u.id") only matches if
+// the qualifier matches the expected alias. An unqualified column matches any table.
+func containsColumnForTable(selectList, col, tableAlias string) bool {
+	lowerCol := strings.ToLower(col)
+	lowerAlias := strings.ToLower(tableAlias)
+
+	parts := strings.Split(selectList, ",")
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		// Handle aliases: "col AS alias"
+		if idx := strings.Index(strings.ToLower(name), " as "); idx >= 0 {
+			name = strings.TrimSpace(name[:idx])
+		}
+		name = strings.Trim(name, "`\"")
+		lowerName := strings.ToLower(name)
+
+		if dotIdx := strings.LastIndex(lowerName, "."); dotIdx >= 0 {
+			// Qualified: only match if qualifier matches expected alias
+			qualifier := strings.Trim(lowerName[:dotIdx], "`\"")
+			colPart := strings.Trim(lowerName[dotIdx+1:], "`\"")
+			if colPart == lowerCol && qualifier == lowerAlias {
+				return true
+			}
+		} else {
+			// Unqualified: matches any table
+			if lowerName == lowerCol {
+				return true
+			}
 		}
 	}
 	return false
@@ -829,7 +889,8 @@ func (rh *ReadHandler) rewriteForProd(sql, table string) (string, bool) {
 
 	upper := strings.ToUpper(strings.TrimSpace(result))
 	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	isSelectStar := false
 	if selectIdx >= 0 && fromIdx > selectIdx {
 		selectPart := strings.TrimSpace(upper[selectIdx+6 : fromIdx])
@@ -1530,47 +1591,32 @@ func (rh *ReadHandler) handleJoinWithMaterialization(clientConn net.Conn, cl *co
 	return err
 }
 
-// joinMaterializeCore materializes dirty tables into temp tables, rewrites
+// joinMaterializeCore materializes ALL tables into temp tables, rewrites
 // the JOIN query to use the temp tables, and executes on Shadow.
+// All tables (not just dirty ones) must be materialized because the rewritten
+// query runs on shadow, where clean tables have no data. The merged read for
+// clean tables efficiently copies prod data (shadow is empty, no filtering needed).
 func (rh *ReadHandler) joinMaterializeCore(cl *core.Classification, querySQL string) (
 	[]ColumnInfo, [][]string, [][]bool, error,
 ) {
-	// Collect dirty tables (tables with deltas, tombstones, or schema diffs).
-	var dirtyTables []string
+	// Collect ALL tables referenced in the query, including subquery tables
+	// (correlated subqueries in the SELECT list, WHERE, etc.). These need
+	// materialization too because the rewritten query runs on shadow,
+	// where clean tables are empty.
+	allTables := cl.Tables
+	subqueryTables := collectSubqueryTablesFromSQL(querySQL)
 	seen := make(map[string]bool)
-	for _, t := range cl.Tables {
-		if seen[t] {
-			continue
-		}
+	for _, t := range allTables {
 		seen[t] = true
-		isDirty := false
-		if rh.deltaMap != nil && rh.deltaMap.CountForTable(t) > 0 {
-			isDirty = true
-		}
-		if rh.tombstones != nil && rh.tombstones.CountForTable(t) > 0 {
-			isDirty = true
-		}
-		if rh.schemaRegistry != nil && rh.schemaRegistry.HasDiff(t) {
-			isDirty = true
-		}
-		if isDirty {
-			dirtyTables = append(dirtyTables, t)
+	}
+	for _, t := range subqueryTables {
+		if !seen[t] {
+			seen[t] = true
+			allTables = append(allTables, t)
 		}
 	}
 
-	if len(dirtyTables) == 0 {
-		// No dirty tables — execute on Shadow verbatim.
-		result, err := execMySQLQuery(rh.shadowConn, querySQL)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("shadow JOIN query: %w", err)
-		}
-		if result.Error != "" {
-			return nil, nil, nil, &mysqlRelayError{rawMsgs: result.RawMsgs, msg: result.Error}
-		}
-		return result.Columns, result.RowValues, result.RowNulls, nil
-	}
-
-	// Materialize each dirty table into a temp table via merged read.
+	// Materialize ALL tables into temp tables via merged read.
 	var utilTables []string
 	tableMap := make(map[string]string)
 	defer func() {
@@ -1579,7 +1625,7 @@ func (rh *ReadHandler) joinMaterializeCore(cl *core.Classification, querySQL str
 		}
 	}()
 
-	for _, table := range dirtyTables {
+	for _, table := range allTables {
 		selectSQL := "SELECT * FROM `" + table + "`"
 		utilName := utilTableName(selectSQL)
 
@@ -1600,14 +1646,22 @@ func (rh *ReadHandler) joinMaterializeCore(cl *core.Classification, querySQL str
 		utilTables = append(utilTables, utilName)
 	}
 
-	// Rewrite the original SQL, replacing table names with temp table names.
-	rewritten := querySQL
-	for origTable, utilName := range tableMap {
-		// Replace backtick-quoted table name.
-		rewritten = strings.Replace(rewritten, "`"+origTable+"`", "`"+utilName+"`", -1)
-		// Replace unquoted table name (word boundary aware).
-		rewritten = replaceColumnName(rewritten, origTable, "`"+utilName+"`")
+	if len(tableMap) == 0 {
+		// No tables to materialize — execute on shadow as-is.
+		result, err := execMySQLQuery(rh.shadowConn, querySQL)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("shadow JOIN query: %w", err)
+		}
+		if result.Error != "" {
+			return nil, nil, nil, &mysqlRelayError{rawMsgs: result.RawMsgs, msg: result.Error}
+		}
+		return result.Columns, result.RowValues, result.RowNulls, nil
 	}
+
+	// Parse the original SQL and rewrite table references to temp tables
+	// using the Vitess AST. This properly handles subquery table references
+	// in SELECT lists, WHERE clauses, etc.
+	rewritten := rewriteTableRefsInSQL(querySQL, tableMap)
 
 	// Execute rewritten query on Shadow.
 	result, err := execMySQLQuery(rh.shadowConn, rewritten)
@@ -1628,4 +1682,106 @@ func (rh *ReadHandler) joinMaterializeCore(cl *core.Classification, querySQL str
 	}
 
 	return result.Columns, result.RowValues, result.RowNulls, nil
+}
+
+// collectSubqueryTablesFromSQL parses a SQL query using Vitess and extracts
+// table names from subquery expressions (correlated subqueries in SELECT list,
+// WHERE clause, etc.). These tables are not in the outer FROM clause and would
+// be missed by cl.Tables.
+func collectSubqueryTablesFromSQL(querySQL string) []string {
+	parser, err := sqlparser.New(sqlparser.Options{MySQLServerVersion: "8.0.30"})
+	if err != nil {
+		return nil
+	}
+	stmt, err := parser.Parse(querySQL)
+	if err != nil {
+		return nil
+	}
+
+	var tables []string
+	seen := make(map[string]bool)
+
+	// Walk the AST and find Subquery nodes that are NOT in FROM clauses
+	// (those are derived tables, already handled). We look for subqueries
+	// in SELECT expressions, WHERE clause, etc.
+	sel, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		return nil
+	}
+
+	// Collect tables from SELECT list subqueries.
+	if sel.SelectExprs != nil {
+		for _, expr := range sel.SelectExprs.Exprs {
+			ae, ok := expr.(*sqlparser.AliasedExpr)
+			if !ok {
+				continue
+			}
+			collectSubqueryTablesFromExpr(ae.Expr, &tables, seen)
+		}
+	}
+
+	// Collect tables from WHERE clause subqueries.
+	if sel.Where != nil {
+		collectSubqueryTablesFromExpr(sel.Where.Expr, &tables, seen)
+	}
+
+	return tables
+}
+
+// collectSubqueryTablesFromExpr recursively walks a Vitess expression and
+// collects table names from any Subquery nodes found.
+func collectSubqueryTablesFromExpr(expr sqlparser.Expr, tables *[]string, seen map[string]bool) {
+	if expr == nil {
+		return
+	}
+	_ = sqlparser.Walk(func(node sqlparser.SQLNode) (kontinue bool, err error) {
+		sub, ok := node.(*sqlparser.Subquery)
+		if !ok {
+			return true, nil
+		}
+		// Extract table names from the subquery's AST.
+		subTables := collectTableNamesFromStmt(sub)
+		for _, t := range subTables {
+			if !seen[t] {
+				seen[t] = true
+				*tables = append(*tables, t)
+			}
+		}
+		return true, nil
+	}, expr)
+}
+
+// rewriteTableRefsInSQL parses a SQL query using Vitess and rewrites all
+// table references according to the provided mapping. This properly handles
+// subquery table references in SELECT lists, WHERE clauses, etc.
+// Falls back to string replacement if parsing fails.
+func rewriteTableRefsInSQL(querySQL string, tableMap map[string]string) string {
+	if len(tableMap) == 0 {
+		return querySQL
+	}
+
+	parser, err := sqlparser.New(sqlparser.Options{MySQLServerVersion: "8.0.30"})
+	if err != nil {
+		return rewriteTableRefsStringFallback(querySQL, tableMap)
+	}
+	stmt, err := parser.Parse(querySQL)
+	if err != nil {
+		return rewriteTableRefsStringFallback(querySQL, tableMap)
+	}
+
+	rewriteTableRefsInStmt(stmt, tableMap)
+	return sqlparser.String(stmt)
+}
+
+// rewriteTableRefsStringFallback rewrites table references using string
+// replacement when AST parsing is not available.
+func rewriteTableRefsStringFallback(querySQL string, tableMap map[string]string) string {
+	rewritten := querySQL
+	for origTable, utilName := range tableMap {
+		// Replace backtick-quoted table name.
+		rewritten = strings.Replace(rewritten, "`"+origTable+"`", "`"+utilName+"`", -1)
+		// Replace unquoted table name (word boundary aware).
+		rewritten = replaceColumnName(rewritten, origTable, "`"+utilName+"`")
+	}
+	return rewritten
 }

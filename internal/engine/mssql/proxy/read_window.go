@@ -81,7 +81,7 @@ func (rh *ReadHandler) handleWindowFunctionRead(
 // buildWindowBaseQuery strips window function expressions and builds a base SELECT.
 func (rh *ReadHandler) buildWindowBaseQuery(sql, table string) string {
 	upper := strings.ToUpper(sql)
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndexMSSQL(upper)
 	if fromIdx < 0 {
 		return ""
 	}

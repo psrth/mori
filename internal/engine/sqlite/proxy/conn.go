@@ -1537,31 +1537,41 @@ func (p *Proxy) executeAggregateRead(sqlStr string, cl *core.Classification, con
 	return buildMergedResponse(columns, rows, nulls)
 }
 
-// materializeAndReexecute materializes merged data for all dirty tables into temp
+// materializeAndReexecute materializes merged data for ALL tables into temp
 // tables and re-executes the original query on Shadow. Used for complex aggregates,
-// window functions, set operations, CTEs, and derived tables.
+// window functions, set operations, CTEs, derived tables, and JOINs.
+//
+// ALL tables are materialized (not just dirty ones) because the rewritten query
+// runs on Shadow, where clean tables have no data. The merged read for clean
+// tables efficiently copies prod data (shadow is empty, no filtering needed).
 func (p *Proxy) materializeAndReexecute(sqlStr string, cl *core.Classification, connID int64) []byte {
 	if len(cl.Tables) == 0 {
 		return p.safeProdExecQuery(sqlStr, connID)
 	}
 
-	// Identify which tables are dirty (have deltas, tombstones, or schema diffs).
-	var dirtyTables []string
-	for _, table := range cl.Tables {
-		if p.isTableDirty(table) {
-			dirtyTables = append(dirtyTables, table)
+	// Collect ALL tables referenced in the query, including subquery tables
+	// from correlated subqueries in the SELECT list. These need materialization
+	// too because the rewritten query runs on shadow, where clean tables are empty.
+	allTables := make([]string, len(cl.Tables))
+	copy(allTables, cl.Tables)
+	subqueryTables := collectSubqueryTablesFromSQL(sqlStr)
+	for _, t := range subqueryTables {
+		found := false
+		for _, existing := range allTables {
+			if existing == t {
+				found = true
+				break
+			}
+		}
+		if !found {
+			allTables = append(allTables, t)
 		}
 	}
 
-	// If no dirty tables, execute directly on Prod.
-	if len(dirtyTables) == 0 {
-		return p.safeProdExecQuery(sqlStr, connID)
-	}
-
-	// Materialize each dirty table into a temp table, rewrite the query.
+	// Materialize ALL tables into temp tables, rewrite the query.
 	rewritten := sqlStr
 	var utilNames []string
-	for _, table := range dirtyTables {
+	for _, table := range allTables {
 		baseSQL := fmt.Sprintf(`SELECT * FROM %q`, table)
 		baseSQL = p.capSQL(baseSQL)
 		utilName, err := p.materializeToUtilTable(baseSQL, table, connID, p.maxRowsHydrate)
@@ -1584,6 +1594,78 @@ func (p *Proxy) materializeAndReexecute(sqlStr string, cl *core.Classification, 
 	}()
 
 	return p.executeQuery(p.shadowDB, rewritten, connID)
+}
+
+// collectSubqueryTablesFromSQL extracts table names from correlated subqueries
+// in the SELECT list. Uses a simple regex-based approach since the SQLite proxy
+// does not use pg_query_go for AST parsing.
+// Matches patterns like "FROM tablename" inside parenthesized subqueries.
+func collectSubqueryTablesFromSQL(sqlStr string) []string {
+	upper := strings.ToUpper(sqlStr)
+	var tables []string
+	seen := make(map[string]bool)
+
+	// Walk through the SQL looking for "FROM" at depth > 0 (inside subqueries).
+	depth := 0
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth > 0 && i+6 <= len(upper) && upper[i:i+6] == " FROM " {
+				// Found a FROM inside a subquery. Extract the table name.
+				rest := strings.TrimSpace(sqlStr[i+6:])
+				// Skip if it starts with '(' (subselect, not a table).
+				if len(rest) > 0 && rest[0] == '(' {
+					continue
+				}
+				// Extract the table name (possibly quoted).
+				tableName := extractTableNameFromFrom(rest)
+				if tableName != "" && !seen[tableName] {
+					seen[tableName] = true
+					tables = append(tables, tableName)
+				}
+			}
+		}
+	}
+	return tables
+}
+
+// extractTableNameFromFrom extracts a table name from text after " FROM ".
+// Handles quoted and unquoted identifiers.
+func extractTableNameFromFrom(rest string) string {
+	rest = strings.TrimSpace(rest)
+	if len(rest) == 0 {
+		return ""
+	}
+	if rest[0] == '"' {
+		// Quoted identifier.
+		end := strings.Index(rest[1:], `"`)
+		if end >= 0 {
+			return rest[1 : end+1]
+		}
+		return ""
+	}
+	// Unquoted identifier: read until whitespace or special character.
+	var name strings.Builder
+	for _, c := range rest {
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' ||
+			c == ')' || c == '(' || c == ';' {
+			break
+		}
+		name.WriteRune(c)
+	}
+	result := name.String()
+	// Filter out SQL keywords that might follow FROM in unusual positions.
+	upperResult := strings.ToUpper(result)
+	if upperResult == "SELECT" || upperResult == "WHERE" || upperResult == "" {
+		return ""
+	}
+	return result
 }
 
 // isTableDirty returns true if a table has deltas, tombstones, or schema diffs.
@@ -1632,6 +1714,64 @@ func rewriteTableRef(sqlStr, oldTable, newTable string) string {
 	return re.ReplaceAllString(sqlStr, `"`+newTable+`"`)
 }
 
+// findOuterFromIndex finds the position of the first " FROM " at parenthesis
+// depth 0 (not inside a subquery). Returns -1 if not found.
+// This avoids matching FROM inside correlated subqueries in the SELECT list,
+// e.g., SELECT (SELECT COUNT(*) FROM messages m WHERE m.cid = c.id) FROM conversations c
+func findOuterFromIndex(upper string) int {
+	depth := 0
+	target := " FROM "
+	for i := 0; i < len(upper); i++ {
+		switch upper[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 && i+len(target) <= len(upper) && upper[i:i+len(target)] == target {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// containsColumnForTable checks if a SELECT list contains a specific column
+// for a given table alias. A qualified column (e.g., "u.id") only matches if
+// the qualifier matches the expected alias. An unqualified column matches any table.
+func containsColumnForTable(selectList, col, tableAlias string) bool {
+	lowerCol := strings.ToLower(col)
+	lowerAlias := strings.ToLower(tableAlias)
+
+	parts := strings.Split(selectList, ",")
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		// Handle aliases: "col AS alias"
+		if idx := strings.Index(strings.ToLower(name), " as "); idx >= 0 {
+			name = strings.TrimSpace(name[:idx])
+		}
+		name = strings.Trim(name, `"`)
+		lowerName := strings.ToLower(name)
+
+		if dotIdx := strings.LastIndex(lowerName, "."); dotIdx >= 0 {
+			// Qualified: only match if qualifier matches expected alias
+			qualifier := strings.Trim(lowerName[:dotIdx], `"`)
+			colPart := strings.Trim(lowerName[dotIdx+1:], `"`)
+			if colPart == lowerCol && qualifier == lowerAlias {
+				return true
+			}
+		} else {
+			// Unqualified: matches any table
+			if lowerName == lowerCol {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // buildAggregateBaseQuery converts a bare aggregate query (COUNT(*), COUNT(col))
 // to SELECT pk FROM table [WHERE ...] for in-memory counting.
 // Returns "" if the query is too complex for this approach.
@@ -1665,7 +1805,7 @@ func (p *Proxy) buildAggregateBaseQuery(sqlStr, table string) string {
 	}
 
 	selectIdx := strings.Index(upper, "SELECT")
-	fromIdx := strings.Index(upper, " FROM ")
+	fromIdx := findOuterFromIndex(upper)
 	if selectIdx < 0 || fromIdx < 0 {
 		return ""
 	}
@@ -2460,7 +2600,8 @@ func needsPKInjection(sqlStr, pkCol string) bool {
 	if strings.HasPrefix(afterSelect, "*") || strings.HasPrefix(afterSelect, "DISTINCT *") {
 		return false
 	}
-	fromIdx := strings.Index(upper, " FROM ")
+	// Use paren-aware search to skip subqueries in SELECT list.
+	fromIdx := findOuterFromIndex(upper)
 	if fromIdx < 0 {
 		return false
 	}

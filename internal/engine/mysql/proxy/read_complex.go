@@ -182,15 +182,17 @@ func (rh *ReadHandler) rewriteDerivedTablesMySQL(
 		if dt.Lateral {
 			// LATERAL subqueries reference columns from outer tables, so they
 			// cannot be executed as standalone queries. Instead, materialize
-			// the dirty base tables that the LATERAL references into temp tables,
+			// ALL base tables that the LATERAL references into temp tables,
 			// rewrite table references inside the subquery to point at the temp
 			// tables, and let MySQL handle the LATERAL join natively.
+			// All tables must be materialized (not just dirty) because the
+			// rewritten query runs on shadow, where clean tables have no data.
 			tables := collectTableNamesFromStmt(dt.Select)
 			seen := make(map[string]bool)
 			tableMap := make(map[string]string)
 
 			for _, table := range tables {
-				if seen[table] || !rh.isTableDirtyMySQL(table) {
+				if seen[table] {
 					continue
 				}
 				seen[table] = true
@@ -362,9 +364,11 @@ func rewriteTableRefsInStmt(stmt sqlparser.SQLNode, tableMap map[string]string) 
 	}, stmt)
 }
 
-// materializeDirtyBaseTablesMySQL collects all dirty base tables referenced in
+// materializeDirtyBaseTablesMySQL collects all base tables referenced in
 // the query AST (excluding CTE names), materializes each into a temp table via
 // merged read, and returns a mapping from original table name to temp table name.
+// ALL tables are materialized (not just dirty ones) because the rewritten query
+// runs on shadow, where clean tables have no data.
 // Returns (tableMap, utilTables, modified). modified is true if at least one
 // table was materialized.
 func (rh *ReadHandler) materializeDirtyBaseTablesMySQL(
@@ -394,14 +398,12 @@ func (rh *ReadHandler) materializeDirtyBaseTablesMySQL(
 		baseTables = append(baseTables, t)
 	}
 
-	// Materialize each dirty base table into a temp table.
+	// Materialize ALL base tables into temp tables. Even clean tables must
+	// be materialized because the rewritten query runs on shadow, where
+	// clean tables have no data.
 	tableMap := make(map[string]string)
 	var utilTables []string
 	for _, table := range baseTables {
-		if !rh.isTableDirtyMySQL(table) {
-			continue
-		}
-
 		selectSQL := fmt.Sprintf("SELECT * FROM `%s`", table)
 		utilName, err := rh.materializeSubqueryMySQL(selectSQL, table)
 		if err != nil {

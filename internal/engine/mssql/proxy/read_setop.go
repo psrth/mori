@@ -158,11 +158,11 @@ func splitSetOps(sql string) (leaves []string, ops []string) {
 // extractTablesFromSQL extracts table names from a SQL statement (simple regex).
 func extractTablesFromSQL(sql string) []string {
 	upper := strings.ToUpper(sql)
-	fromIdx := strings.Index(upper, "FROM ")
+	fromIdx := findOuterFromIndexMSSQL(upper)
 	if fromIdx < 0 {
 		return nil
 	}
-	rest := upper[fromIdx+5:]
+	rest := upper[fromIdx+6:] // skip " FROM "
 	// Cut at keywords.
 	for _, kw := range []string{"WHERE", "GROUP", "HAVING", "ORDER", "UNION", "INTERSECT", "EXCEPT", "JOIN"} {
 		if idx := strings.Index(rest, " "+kw+" "); idx >= 0 {

@@ -488,6 +488,10 @@ func rewriteTableRefsInNode(node *pg_query.Node, tableMap map[string]string) {
 		for _, from := range sel.GetFromClause() {
 			rewriteTableRefsInNode(from, tableMap)
 		}
+		// Walk target list (SELECT list) to rewrite SubLink table references.
+		for _, target := range sel.GetTargetList() {
+			rewriteTableRefsInNode(target, tableMap)
+		}
 		if where := sel.GetWhereClause(); where != nil {
 			rewriteTableRefsInNode(where, tableMap)
 		}
@@ -517,6 +521,18 @@ func rewriteTableRefsInNode(node *pg_query.Node, tableMap map[string]string) {
 
 	if rs := node.GetRangeSubselect(); rs != nil {
 		rewriteTableRefsInNode(rs.GetSubquery(), tableMap)
+	}
+
+	// Handle SubLink (correlated subqueries in SELECT, WHERE, etc.)
+	if sl := node.GetSubLink(); sl != nil {
+		if subSel := sl.GetSubselect(); subSel != nil {
+			rewriteTableRefsInNode(subSel, tableMap)
+		}
+	}
+
+	// Handle ResTarget (individual SELECT list items)
+	if rt := node.GetResTarget(); rt != nil {
+		rewriteTableRefsInNode(rt.GetVal(), tableMap)
 	}
 }
 
