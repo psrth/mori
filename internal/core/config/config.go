@@ -140,6 +140,7 @@ func ConnLogFilePath(projectRoot, connName string) string {
 	return filepath.Join(ConnDir(projectRoot, connName), LogDir, LogFile)
 }
 
+
 // IsConnInitialized checks whether config.json exists for a specific connection.
 func IsConnInitialized(projectRoot, connName string) bool {
 	_, err := os.Stat(ConnConfigFilePath(projectRoot, connName))

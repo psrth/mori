@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/psrth/mori/internal/core/config"
@@ -67,7 +71,17 @@ func runReset(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid prod connection in config: %w", err)
 	}
 
-	// 4. Connect to Shadow and truncate tables.
+	// 4. Ensure Shadow container is running (it may have been stopped by 'mori stop').
+	shadowStartedByUs := false
+	if cfg.ShadowContainer != "" {
+		wasRunning, ensureErr := ensureShadowRunningForReset(ctx, cfg.ShadowContainer, cfg.ShadowPort)
+		if ensureErr != nil {
+			return fmt.Errorf("failed to ensure Shadow container is running: %w", ensureErr)
+		}
+		shadowStartedByUs = !wasRunning
+	}
+
+	// 5. Connect to Shadow and truncate tables.
 	shadowConnStr := connstr.ShadowDSN(cfg.ShadowPort, dsn.DBName)
 
 	var shadowConn *pgx.Conn
@@ -77,7 +91,11 @@ func runReset(cmd *cobra.Command, args []string) error {
 		return e
 	})
 	if connErr != nil {
-		return fmt.Errorf("cannot connect to Shadow (is the container running?): %w", connErr)
+		// If we started the container, stop it before returning.
+		if shadowStartedByUs && cfg.ShadowContainer != "" {
+			stopShadowContainer(context.Background(), cfg.ShadowContainer)
+		}
+		return fmt.Errorf("cannot connect to Shadow: %w", connErr)
 	}
 	defer shadowConn.Close(ctx)
 	ui.StepDone("Connected")
@@ -236,6 +254,11 @@ func runReset(cmd *cobra.Command, args []string) error {
 		return nil
 	})
 
+	// Stop Shadow container if we started it for this reset.
+	if shadowStartedByUs && cfg.ShadowContainer != "" {
+		stopShadowContainer(context.Background(), cfg.ShadowContainer)
+	}
+
 	fmt.Println()
 	ui.StepDone("Reset complete.")
 	ui.Info("Next: run 'mori start' to begin fresh.")
@@ -261,4 +284,30 @@ func resolveInitializedConnection(projectRoot string, args []string) (string, er
 	}
 
 	return "", fmt.Errorf("multiple initialized connections (%v) — specify which one", initialized)
+}
+
+// ensureShadowRunningForReset ensures the Shadow container is running and reports
+// whether it was already running. This lets the caller stop the container after
+// reset if it was started solely for this operation.
+func ensureShadowRunningForReset(ctx context.Context, containerName string, shadowPort int) (wasRunning bool, err error) {
+	if isShadowContainerRunning(ctx, containerName) {
+		return true, nil
+	}
+	if err := ensureShadowRunning(ctx, containerName, shadowPort); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// isShadowContainerRunning checks whether a Docker container is currently running.
+func isShadowContainerRunning(ctx context.Context, containerName string) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(checkCtx, "docker", "inspect", containerName,
+		"--format", "{{.State.Running}}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == "true"
 }
