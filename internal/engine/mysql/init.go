@@ -9,10 +9,11 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine/connerr"
 	"github.com/psrth/mori/internal/engine/mysql/connstr"
-	"github.com/psrth/mori/internal/ui"
 	"github.com/psrth/mori/internal/engine/mysql/schema"
 	"github.com/psrth/mori/internal/engine/mysql/shadow"
+	"github.com/psrth/mori/internal/ui"
 )
 
 // InitOptions holds the options for initializing a MySQL Mori project.
@@ -49,7 +50,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		}
 		return prodDB.PingContext(ctx)
 	}); err != nil {
-		return nil, fmt.Errorf("cannot connect to production database at %s:%d: %w", dsn.Host, dsn.Port, err)
+		return nil, connerr.Wrap(dsn.Host, dsn.Port, err)
 	}
 	defer prodDB.Close()
 
