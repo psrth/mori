@@ -9,10 +9,11 @@ import (
 
 	_ "github.com/microsoft/go-mssqldb"
 	"github.com/psrth/mori/internal/core/config"
+	"github.com/psrth/mori/internal/engine/connerr"
 	"github.com/psrth/mori/internal/engine/mssql/connstr"
-	"github.com/psrth/mori/internal/ui"
 	"github.com/psrth/mori/internal/engine/mssql/schema"
 	"github.com/psrth/mori/internal/engine/mssql/shadow"
+	"github.com/psrth/mori/internal/ui"
 )
 
 // InitOptions holds the options for initializing an MSSQL Mori project.
@@ -47,7 +48,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		}
 		return prodDB.PingContext(ctx)
 	}); err != nil {
-		return nil, fmt.Errorf("cannot connect to production database at %s:%d: %w", dsn.Host, dsn.Port, err)
+		return nil, connerr.Wrap(dsn.Host, dsn.Port, err)
 	}
 	defer prodDB.Close()
 

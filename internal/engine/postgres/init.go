@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/psrth/mori/internal/core/config"
 	coreSchema "github.com/psrth/mori/internal/core/schema"
+	"github.com/psrth/mori/internal/engine/connerr"
 	"github.com/psrth/mori/internal/engine/postgres/connstr"
 	"github.com/psrth/mori/internal/engine/postgres/schema"
 	"github.com/psrth/mori/internal/engine/postgres/shadow"
@@ -45,7 +46,7 @@ func Init(ctx context.Context, opts InitOptions) (*InitResult, error) {
 		prodConn, e = pgx.Connect(ctx, dsn.ConnString())
 		return e
 	}); err != nil {
-		return nil, fmt.Errorf("cannot connect to production database at %s:%d: %w", dsn.Host, dsn.Port, err)
+		return nil, connerr.Wrap(dsn.Host, dsn.Port, err)
 	}
 	defer prodConn.Close(ctx)
 
